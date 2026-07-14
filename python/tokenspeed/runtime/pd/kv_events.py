@@ -34,7 +34,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from itertools import count
 from queue import Queue
-from typing import Any
+from typing import Any, Literal
 
 import msgspec
 import zmq
@@ -85,7 +85,7 @@ class KVEventBatch(EventBatch):
 
 def scheduler_kv_event_to_wire_event(
     event: Any,
-    hash_mode: str = "fnv",
+    hash_mode: Literal["fnv", "xxh3"] = "fnv",
 ) -> BlockStored | BlockRemoved:
     """Translate a scheduler-native KV event into the ZMQ wire struct."""
     kind = event.kind
@@ -114,7 +114,7 @@ def scheduler_kv_event_to_wire_event(
 
 def scheduler_kv_events_to_wire_events(
     events: Iterable[Any],
-    hash_mode: str = "fnv",
+    hash_mode: Literal["fnv", "xxh3"] = "fnv",
 ) -> list[BlockStored | BlockRemoved]:
     return [
         scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode) for event in events
