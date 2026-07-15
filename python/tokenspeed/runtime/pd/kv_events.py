@@ -357,7 +357,7 @@ def l3_storage_keys_to_disk_events(
         annotation. Empty input yields an empty list.
     """
     events: list[BlockStored] = []
-    parent: Optional[int] = None
+    parent: int | None = None
     for key in rolling_page_hashes:
         block_hash = _xxh3_64(key.encode("utf-8"))
         events.append(

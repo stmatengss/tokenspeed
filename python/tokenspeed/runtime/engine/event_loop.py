@@ -400,7 +400,6 @@ class EventLoop:
             self.memory_executor, "emits_loadback_acks", False
         )
 
-
         if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
                 f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
