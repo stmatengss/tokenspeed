@@ -243,7 +243,7 @@ def scheduler_kv_event_to_wire_event(
     raise TypeError(f"Unsupported scheduler KV event kind: {kind}")
 
 
-def _tier_to_medium(event: Any) -> Optional[str]:
+def _tier_to_medium(event: Any) -> str | None:
     """Map scheduler ``KvEventTier`` to RFC #1527 wire ``medium``.
 
     ``KvEventTier.kDevice`` / ``0`` / default → ``"gpu"``.
@@ -288,7 +288,7 @@ def scheduler_kv_events_to_wire_events(
             scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode)
             for event in events
         ]
-    wire_events: list[Union[BlockStored, BlockRemoved]] = []
+    wire_events: list[BlockStored | BlockRemoved] = []
     for raw in events:
         wire = scheduler_kv_event_to_wire_event(raw, hash_mode=hash_mode)
         event_medium = _tier_to_medium(raw) or medium
