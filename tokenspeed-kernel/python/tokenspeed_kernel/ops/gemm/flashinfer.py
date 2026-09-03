@@ -20,11 +20,17 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
+from collections.abc import Callable
+from typing import get_args
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
@@ -80,18 +86,62 @@ if platform.is_hopper_plus:
     try:
         from flashinfer.gemm import (
             gemm_fp8_nt_groupwise,
-            tinygemm_bf16,
         )
+        from flashinfer.gemm import tinygemm_bf16 as _tinygemm_bf16
     except ImportError:
         pass
+    else:
+
+        def tinygemm_bf16(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            out: torch.Tensor,
+            bias: torch.Tensor | None = None,
+            use_pdl: bool | None = None,
+        ) -> None:
+            """Run FlashInfer tiny GEMM using the platform PDL default.
+
+            Args:
+                input: Contiguous BF16 input matrix.
+                weight: Contiguous BF16 weight matrix.
+                out: Preallocated contiguous BF16 output matrix.
+                bias: Optional contiguous BF16 bias.
+                use_pdl: Whether to use PDL. Uses the platform default when omitted.
+
+            Returns:
+                None; ``out`` is updated in place.
+            """
+            _tinygemm_bf16(
+                input,
+                weight,
+                out,
+                bias,
+                use_pdl=pdl_enabled() if use_pdl is None else use_pdl,
+            )
 
 
 def has_flashinfer_fp8_blockscale() -> bool:
     """Return whether the native FlashInfer FP8 block-scale GEMM is usable."""
-    return (
-        gemm_fp8_nt_groupwise is not error_fn
-        and platform.arch_version == ArchVersion(10, 0)
-    )
+    # Every Blackwell datacenter part runs this kernel; GB300 reports 10.3.
+    return gemm_fp8_nt_groupwise is not error_fn and platform.is_blackwell
+
+
+# Past ~224 rows (GB300, K=7168) padding M costs more than the transpose it saves.
+_PREPACKED_PAD_TOKEN_LIMIT = 256
+
+
+def use_flashinfer_fp8_blockscale_prepacked(num_tokens: int) -> bool:
+    """Whether MN-major prepacked scales beat canonical scales for this M.
+
+    Args:
+        num_tokens: Row count ``M`` of the activation matrix.
+
+    Returns:
+        True when the prepared MN-major path avoids more work than it adds.
+        Row counts that are already a multiple of four need no padding at all,
+        so the quantizer's native output is used as-is.
+    """
+    return num_tokens % 4 == 0 or num_tokens <= _PREPACKED_PAD_TOKEN_LIMIT
 
 
 def prepare_flashinfer_fp8_blockscale_weight_scales(
@@ -114,32 +164,6 @@ def prepare_flashinfer_fp8_blockscale_weight_scales(
             f"got {scales.dtype}"
         )
     return scales.transpose(0, 1).contiguous()
-
-
-def _prepare_flashinfer_fp8_blockscale_inputs(
-    A: torch.Tensor,
-    A_scales: torch.Tensor,
-    B_scales: torch.Tensor,
-    original_m: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert canonical values and scales to FlashInfer's native layout."""
-    scale_m = A_scales.shape[0]
-    if original_m % 4 != 0 or scale_m != original_m:
-        padded_m = max(((original_m + 3) // 4) * 4, scale_m)
-        padded_A = A.new_zeros((padded_m, A.shape[1]))
-        padded_A[:original_m] = A
-        A = padded_A
-
-        if scale_m != padded_m:
-            padded_A_scales = A_scales.new_ones((padded_m, A_scales.shape[1]))
-            padded_A_scales[:scale_m] = A_scales
-            A_scales = padded_A_scales
-
-    return (
-        A,
-        A_scales.transpose(0, 1).contiguous(),
-        B_scales.transpose(0, 1).contiguous(),
-    )
 
 
 def _validate_flashinfer_fp8_blockscale_prepacked(
@@ -219,7 +243,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
 
         Set ``prepacked_scales`` only when ``A_scales`` and ``B_scales`` already
         use FlashInfer's contiguous MN-major layout. The default canonical path
-        performs the required padding and transposes for compatibility.
+        passes the native K-major layouts through without copies.
         """
         assert (
             A_scales is not None
@@ -235,23 +259,47 @@ if gemm_fp8_nt_groupwise is not error_fn:
                 orig_m,
                 block_size,
             )
-            gemm_a_scales = A_scales
-            gemm_b_scales = B_scales
-        else:
-            A, gemm_a_scales, gemm_b_scales = _prepare_flashinfer_fp8_blockscale_inputs(
-                A, A_scales, B_scales, orig_m
+            output = gemm_fp8_nt_groupwise(
+                A,
+                B,
+                A_scales,
+                B_scales,
+                scale_major_mode="MN",
+                out_dtype=out_dtype,
             )
+            output = output[:orig_m] if output.shape[0] != orig_m else output
+            if out is not None:
+                out.copy_(output)
+                return out
+            return output
 
+        # K-major mode reads the quant kernel's native (m, k//128) activation
+        # scales and the checkpoint's native (n//128, k//128) weight scales,
+        # so no padding, transposes, or scale copies are needed per call.
+        # FlashInfer defect: SM10x mis-reads these scales for 17 <= M <= 32.
+        if A_scales.shape[0] != orig_m:
+            A_scales = A_scales[:orig_m]
+        # The kernel reads raw row-major storage; normalize strided views
+        # (a no-op on the hot path, where quant output is contiguous).
+        if not A_scales.is_contiguous():
+            A_scales = A_scales.contiguous()
+        if not B_scales.is_contiguous():
+            B_scales = B_scales.contiguous()
+        direct_out = (
+            out is not None
+            and out.is_contiguous()
+            and out.shape == (orig_m, B.shape[0])
+        )
         output = gemm_fp8_nt_groupwise(
             A,
             B,
-            gemm_a_scales,
-            gemm_b_scales,
-            scale_major_mode="MN",
+            A_scales,
+            B_scales,
+            scale_major_mode="K",
+            out=out if direct_out else None,
             out_dtype=out_dtype,
         )
-        output = output[:orig_m] if output.shape[0] != orig_m else output
-        if out is not None:
+        if out is not None and not direct_out:
             out.copy_(output)
             return out
         return output
@@ -314,6 +362,7 @@ if mm_mxfp8 is not error_fn:
             "k_align_32": frozenset({True}),
             "n_min_128": frozenset({True}),
             "k_min_128": frozenset({True}),
+            "pdl_enabled": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
     )
@@ -441,3 +490,75 @@ if mm_fp4 is not error_fn:
             out.copy_(output)
             return out
         return output
+
+
+# ---- FlashInfer BF16 low-latency GEMM, cute-dsl backend ------------------
+
+_CUTE_DSL_BF16_BACKEND = "cute-dsl"
+_CUTE_DSL_BF16_ARCHS = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
+
+_mm_bf16 = error_fn
+
+if platform.is_nvidia and platform.arch_version in _CUTE_DSL_BF16_ARCHS:
+    try:
+        from flashinfer import mm_bf16 as _mm_bf16
+    except ImportError:
+        pass
+
+
+def _declares_cute_dsl_backend(mm_bf16: Callable[..., object]) -> bool:
+    """Whether this ``mm_bf16`` lists :data:`_CUTE_DSL_BF16_BACKEND`.
+
+    Args:
+        mm_bf16: FlashInfer's entry point, whose ``backend`` annotation is the
+            ``Literal`` of the backends that build it.
+
+    Returns:
+        True on wheels carrying the upstreamed kernels, False on earlier ones,
+        which name every other backend but not this one.
+    """
+    try:
+        # eval_str resolves the Literal even if FlashInfer postpones annotations.
+        backend = inspect.signature(mm_bf16, eval_str=True).parameters["backend"]
+    except (KeyError, NameError, TypeError, ValueError):
+        return False
+    return _CUTE_DSL_BF16_BACKEND in get_args(backend.annotation)
+
+
+@functools.lru_cache(maxsize=1)
+def has_flashinfer_cute_dsl_bf16() -> bool:
+    """Whether the flashinfer cute-dsl BF16 low-latency GEMM is usable here.
+
+    Returns:
+        True when running on an SM100 or SM103 GPU with a flashinfer build
+        whose ``mm_bf16`` declares the backend.
+    """
+    return _mm_bf16 is not error_fn and _declares_cute_dsl_backend(_mm_bf16)
+
+
+def flashinfer_cute_dsl_mm_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T (+ bias)`` through the cute-dsl ``mm_bf16`` backend.
+
+    Args:
+        x: ``[M, K]`` contiguous BF16 activation.
+        weight: ``[N, K]`` contiguous BF16 weight; its transpose is the
+            column-major ``(K, N)`` operand the backend wants, with no copy.
+        bias: Optional contiguous ``[N]`` BF16 bias, fused into the epilogue.
+        out: Optional ``[M, N]`` BF16 destination; allocated when omitted.
+
+    Returns:
+        ``[M, N]`` BF16 output, ``out`` when it was given.
+    """
+    return _mm_bf16(
+        x,
+        weight.t(),
+        bias=bias,
+        pdl=pdl_enabled(),
+        out=out,
+        backend=_CUTE_DSL_BF16_BACKEND,
+    )
