@@ -23,6 +23,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -175,7 +176,11 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(KVStoreStorage):
+    # Optional callback after store-wide clear; wired by StorageExecutor.
+    on_clear: Callable[[], None] | None = None
+
     def __init__(self, storage_config: KVStoreStorageConfig = None):
+        self.on_clear = None
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as exc:
@@ -700,6 +705,11 @@ class MooncakeStore(KVStoreStorage):
 
     def clear(self) -> None:
         self.store.remove_all()
+        if self.on_clear is not None:
+            try:
+                self.on_clear()
+            except Exception:
+                logger.exception("MooncakeStore on_clear callback failed")
 
     def _put_batch_zero_copy_impl(
         self, key_strs: list[str], buffer_ptrs: list[int], buffer_sizes: list[int]
