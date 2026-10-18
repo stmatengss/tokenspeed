@@ -34,13 +34,22 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from itertools import count
 from queue import Queue
-from typing import Any
+from typing import Any, Literal, Optional
 
 import msgspec
 import zmq
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+def _default_kv_events_backend_id() -> str:
+    # Lazy import: utils/__init__ pulls heavy runtime deps needed by env.py.
+    try:
+        from tokenspeed.runtime.utils.env import envs
+    except ImportError:
+        return "tokenspeed-worker"
+    return envs.TOKENSPEED_KV_EVENTS_BACKEND_ID.get()
 
 
 class EventBatch(
@@ -56,12 +65,16 @@ class EventBatch(
 
 class KVCacheEvent(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
-    """Base class for all KV cache-related events."""
+    """Base class for all KV cache-related events.
+
+    Events use map encoding (not ``array_like``) so ``omit_defaults`` can drop
+    unset RFC #1527 envelope fields while preserving Dynamo-compatible legacy
+    payloads when those fields are left at their defaults.
+    """
 
 
 class BlockStored(KVCacheEvent):
@@ -69,26 +82,150 @@ class BlockStored(KVCacheEvent):
     parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
+    backend_id: str | None = None
+    medium: str | None = None  # "gpu" | "cpu" | "disk"
+    dp_rank: int | None = None
+    model_name: str | None = None
+    tenant_id: str | None = None
+    event_id: int | None = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    backend_id: str | None = None
+    medium: str | None = None  # "gpu" | "cpu" | "disk"
+    dp_rank: int | None = None
+    model_name: str | None = None
+    tenant_id: str | None = None
+    event_id: int | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):
-    pass
+    backend_id: str | None = None
+    medium: str | None = None  # "gpu" | "cpu" | "disk"
+    dp_rank: int | None = None
+    model_name: str | None = None
+    tenant_id: str | None = None
+    event_id: int | None = None
 
 
 class KVEventBatch(EventBatch):
     events: list[BlockStored | BlockRemoved | AllBlocksCleared]
 
 
+class EventIdAllocator:
+    """Monotonic ``event_id`` counters keyed by RFC #1527 stream dimensions.
+
+    Each stream is identified by
+    ``(model_name, block_size, backend_id, medium, dp_rank)``. Counters start
+    at ``0`` (Dynamo sequence style) and increase by one per assignment.
+    """
+
+    def __init__(self) -> None:
+        self._counters: dict[tuple, int] = {}
+
+    def next(self, key: tuple) -> int:
+        """Return the next ``event_id`` for ``key``, starting at 0."""
+        value = self._counters.get(key, 0)
+        self._counters[key] = value + 1
+        return value
+
+
+def stream_key_for_event(
+    event: BlockStored | BlockRemoved | AllBlocksCleared,
+) -> tuple:
+    """Build the RFC #1527 stream key for an envelope-annotated event.
+
+    ``BlockRemoved`` / ``AllBlocksCleared`` have no ``block_size``; that
+    dimension is ``None`` so they do not share a stream with ``BlockStored``
+    events that carry a concrete block size.
+    """
+    return (
+        event.model_name,
+        getattr(event, "block_size", None),
+        event.backend_id,
+        event.medium,
+        event.dp_rank,
+    )
+
+
+def apply_envelope(
+    event: BlockStored | BlockRemoved | AllBlocksCleared,
+    config: "KVEventsConfig",
+    *,
+    medium: str | None = None,
+    dp_rank: int | None = None,
+) -> BlockStored | BlockRemoved | AllBlocksCleared:
+    """Apply RFC #1527 envelope fields from ``config`` when enabled.
+
+    When ``wire_format == "legacy"``, envelope fields are left unset (``None``)
+    so msgspec ``omit_defaults`` drops them from the wire payload.
+
+    When ``wire_format == "rfc1527"``, sets ``backend_id``, ``tenant_id``,
+    ``model_name``, and optionally ``medium`` / ``dp_rank`` from config and
+    call-site arguments.
+
+    Args:
+        event: Wire event struct to annotate (mutated in place).
+        config: Publisher KV events config.
+        medium: Storage tier label (``"gpu"`` | ``"cpu"`` | ``"disk"``). Used
+            only when ``config.publish_medium`` is true.
+        dp_rank: Optional data-parallel rank for the envelope.
+
+    Returns:
+        The same ``event`` instance after annotation.
+    """
+    if config.wire_format == "legacy":
+        return event
+
+    event.backend_id = config.backend_id
+    event.tenant_id = config.tenant_id
+    event.model_name = config.model_name
+    if config.publish_medium and medium is not None:
+        event.medium = medium
+    if dp_rank is not None:
+        event.dp_rank = dp_rank
+    return event
+
+
+def assign_event_ids(
+    events: list[BlockStored | BlockRemoved | AllBlocksCleared],
+    config: "KVEventsConfig",
+    allocator: EventIdAllocator,
+) -> list[BlockStored | BlockRemoved | AllBlocksCleared]:
+    """Assign monotonic ``event_id`` values when ``wire_format == "rfc1527"``.
+
+    Call after ``apply_envelope`` so stream-key dimensions are populated.
+    Under ``legacy``, events are returned unchanged and ``event_id`` stays
+    unset so msgspec omits it from the wire payload.
+
+    Args:
+        events: Envelope-annotated wire events (mutated in place).
+        config: Publisher KV events config.
+        allocator: Per-publisher stream counter store.
+
+    Returns:
+        The same ``events`` list after optional ``event_id`` assignment.
+    """
+    if config.wire_format != "rfc1527":
+        return events
+    for event in events:
+        event.event_id = allocator.next(stream_key_for_event(event))
+    return events
+
+
 def scheduler_kv_event_to_wire_event(
     event: Any,
+    hash_mode: Literal["fnv", "xxh3"] = "fnv",
 ) -> BlockStored | BlockRemoved:
     """Translate a scheduler-native KV event into the ZMQ wire struct."""
     kind = event.kind
     if kind == "BlockStored":
+        token_ids = event.token_ids
+        if hash_mode == "xxh3" and not token_ids:
+            raise ValueError(
+                "BlockStored events require non-empty token_ids when hash_mode=xxh3"
+            )
         return BlockStored(
             block_hashes=[int(block_hash) for block_hash in event.block_hashes],
             parent_block_hash=(
@@ -96,7 +233,7 @@ def scheduler_kv_event_to_wire_event(
                 if event.parent_block_hash is None
                 else int(event.parent_block_hash)
             ),
-            token_ids=[int(token_id) for token_id in event.token_ids],
+            token_ids=[int(token_id) for token_id in token_ids],
             block_size=int(event.block_size),
         )
     if kind == "BlockRemoved":
@@ -108,8 +245,35 @@ def scheduler_kv_event_to_wire_event(
 
 def scheduler_kv_events_to_wire_events(
     events: Iterable[Any],
+    hash_mode: Literal["fnv", "xxh3"] = "fnv",
+    config: Optional["KVEventsConfig"] = None,
+    medium: str | None = None,
+    dp_rank: int | None = None,
 ) -> list[BlockStored | BlockRemoved]:
-    return [scheduler_kv_event_to_wire_event(event) for event in events]
+    """Translate scheduler events and optionally apply the RFC #1527 envelope.
+
+    Args:
+        events: Scheduler-native KV events (e.g. from ``drain_kv_events``).
+        hash_mode: Block hash mode passed through to the translator.
+        config: When set, each wire event is annotated via ``apply_envelope``.
+        medium: Storage tier for the envelope (``"gpu"`` | ``"cpu"`` | ``"disk"``).
+            Callers must pass this explicitly for tiered events; default ``None``
+            leaves ``medium`` unset. Ignored when ``config`` is ``None`` or
+            ``wire_format=legacy``.
+        dp_rank: Optional data-parallel rank forwarded to ``apply_envelope``.
+
+    Returns:
+        Wire event structs ready for ``KVEventBatch`` publishing.
+    """
+    wire_events = [
+        scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode) for event in events
+    ]
+    if config is None:
+        return wire_events
+    return [
+        apply_envelope(event, config, medium=medium, dp_rank=dp_rank)
+        for event in wire_events
+    ]
 
 
 def drain_scheduler_kv_events(scheduler: Any, enabled: bool) -> list[Any]:
@@ -432,6 +596,26 @@ class KVEventsConfig(BaseModel):
     enable_kv_cache_events: bool = False
     """Whether to publish scheduler KV cache mutation events."""
 
+    hash_mode: Literal["fnv", "xxh3"] = "fnv"
+    """Block hash mode used by the scheduler. When ``xxh3``, BlockStored wire
+    events require non-empty ``token_ids`` so consumers can recompute hashes.
+    """
+
+    backend_id: str = Field(default_factory=_default_kv_events_backend_id)
+    """Backend identifier for RFC #1527 envelope fields."""
+
+    tenant_id: str = "default"
+    """Tenant identifier for multi-tenant KV event indexing."""
+
+    model_name: str | None = None
+    """Model name included in RFC #1527 envelope fields when set."""
+
+    wire_format: Literal["legacy", "rfc1527"] = "legacy"
+    """Wire encoding mode. ``legacy`` omits envelope fields for Dynamo compat."""
+
+    publish_medium: bool = True
+    """Whether to include ``medium`` in published RFC #1527 envelope fields."""
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -458,6 +642,15 @@ class EventPublisherFactory:
         config = KVEventsConfig.from_cli(config)
         config_dict = config.model_dump()
         enabled = bool(config_dict.pop("enable_kv_cache_events", False))
+        for config_only_field in (
+            "hash_mode",
+            "backend_id",
+            "tenant_id",
+            "model_name",
+            "wire_format",
+            "publish_medium",
+        ):
+            config_dict.pop(config_only_field, None)
         if not enabled:
             return NullEventPublisher(attn_dp_rank=attn_dp_rank)
 

@@ -83,9 +83,12 @@ from tokenspeed.runtime.pd.factory import (
     get_kv_args,
 )
 from tokenspeed.runtime.pd.kv_events import (
+    EventIdAllocator,
     EventPublisherFactory,
     KVEventBatch,
+    KVEventsConfig,
     NullEventPublisher,
+    assign_event_ids,
     drain_scheduler_kv_events,
     scheduler_kv_events_to_wire_events,
 )
@@ -357,6 +360,16 @@ class EventLoop:
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
         )
+        # Retain full config: EventPublisherFactory.create pops wire_format /
+        # hash_mode / envelope fields that the publish path still needs.
+        self._kv_events_config: KVEventsConfig | None = (
+            KVEventsConfig.from_cli(server_args.kv_events_config)
+            if server_args.kv_events_config
+            else None
+        )
+        # Per-stream RFC #1527 event_id counters (model, block_size, backend,
+        # medium, dp_rank). Unused under wire_format=legacy.
+        self._kv_event_id_allocator = EventIdAllocator()
 
         if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
@@ -743,9 +756,20 @@ class EventLoop:
         if not raw_events:
             return
 
-        events = scheduler_kv_events_to_wire_events(raw_events)
+        config = self._kv_events_config
+        hash_mode = config.hash_mode if config is not None else "fnv"
+        # Device-tier scheduler events are GPU; host/disk come in later phases.
+        events = scheduler_kv_events_to_wire_events(
+            raw_events,
+            hash_mode=hash_mode,
+            config=config,
+            medium="gpu",
+            dp_rank=self.dp_rank,
+        )
         if not events:
             return
+        if config is not None:
+            assign_event_ids(events, config, self._kv_event_id_allocator)
 
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
