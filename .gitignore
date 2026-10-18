@@ -200,3 +200,6 @@ Testing/
 AGENTS.local.md
 AGENTS.override.md
 outputs/
+
+# Git worktrees (local isolation)
+.worktrees/
