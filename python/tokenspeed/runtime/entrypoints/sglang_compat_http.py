@@ -18,23 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""SGLang-compatible weight-sync HTTP routes.
+"""SGLang-compatible HTTP control routes for RL rollout engines.
 
-A thin adapter exposing the SGLang HTTP weight-sync surface (the endpoint names,
-methods, and JSON field names RL trainers such as slime / miles -- and verl's
-SGLang rollout -- POST to), forwarding each call to ``AsyncLLM``'s existing
-weight-control methods. No new engine logic; only name/field translation.
+The endpoint names and JSON fields match the surface used by trainers such as
+slime. Handlers translate requests into TokenSpeed's native scheduler, memory,
+and weight-update operations. Heavy distributed weight payloads travel over the
+trainer-created process group; HTTP carries only metadata.
 
-These routes are mounted on the **same** in-engine RL control-plane app as the
-vLLM-compatible endpoints (``vllm_compat_http.py``) -- one app, one port. Mount
-``router`` onto an app whose ``state.async_llm`` is set, or use
-:func:`build_sglang_compat_app` for a standalone app (tests).
-
-Like the rest of the RL control plane, it must run on ``AsyncLLM``'s event loop:
-handlers toggle the loop-bound admission gate and await loop-bound scheduler
-communicators. Heavy weight payloads travel out-of-band (NCCL / CUDA-IPC); only
-metadata flows here, and the worker-side receive+load is the same deferred piece
-as the rest of the RL plumbing.
+The app must run on ``AsyncLLM``'s event loop because scheduler communicators are
+loop-bound. Use :func:`build_sglang_compat_app` to construct it.
 """
 
 from __future__ import annotations
@@ -46,6 +38,10 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -75,6 +71,14 @@ def _llm(request: Request) -> "AsyncLLM":
     if async_llm is None:
         raise RuntimeError("AsyncLLM is not configured on this server.")
     return async_llm
+
+
+def _stamp_weight_version(request: Request, version: str | None, message: str) -> str:
+    """Apply weight_version to server_args on success, return updated message."""
+    if version is not None:
+        _llm(request).server_args.weight_version = version
+        message += f" Weight version updated to {version}."
+    return message
 
 
 async def _guarded(
@@ -163,14 +167,34 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
         shapes = [list(s) for s in body["shapes"]]
         if not (len(names) == len(dtypes) == len(shapes)):
             raise ValueError("names, dtypes, shapes must have equal length")
+        flush_cache = bool(body.get("flush_cache", False))
+        llm = _llm(request)
+        requested_version = body.get("weight_version")
+        if requested_version is not None:
+            requested_version = str(requested_version)
+        storage_backend = getattr(llm.server_args, "kvstore_storage_backend", None)
+        if flush_cache and requested_version is None and storage_backend is not None:
+            return {
+                "success": False,
+                "message": L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+            }
+        weight_version = resolve_l3_weight_version(
+            llm.server_args.weight_version,
+            requested_version,
+            flush_cache=flush_cache,
+            storage_backend=storage_backend,
+        )
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,  # translate dtypes -> dtype_names
             shapes=shapes,
             group_name=str(body.get("group_name", "weight_update_group")),
-            flush_cache=bool(body.get("flush_cache", False)),
+            flush_cache=flush_cache,
+            weight_version=weight_version,
         )
-        success, message = await _llm(request).update_weights_from_distributed(obj)
+        success, message = await llm.update_weights_from_distributed(obj)
+        if success:
+            message = _stamp_weight_version(request, obj.weight_version, message)
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -185,8 +209,11 @@ async def update_weights_from_tensor(request: Request) -> JSONResponse:
             serialized_named_tensors=body["serialized_named_tensors"],
             load_format=body.get("load_format"),
             flush_cache=bool(body.get("flush_cache", False)),
+            weight_version=body.get("weight_version"),
         )
         success, message = await _llm(request).update_weights_from_tensor(obj)
+        if success:
+            message = _stamp_weight_version(request, obj.weight_version, message)
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -200,8 +227,11 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
         obj = UpdateWeightFromDiskReqInput(
             model_path=str(body["model_path"]),
             load_format=body.get("load_format"),
+            weight_version=body.get("weight_version"),
         )
         success, message, *_ = await _llm(request).update_weights_from_disk(obj)
+        if success:
+            message = _stamp_weight_version(request, obj.weight_version, message)
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -215,10 +245,16 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
 @router.post("/pause_generation")
 async def pause_generation(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
-        # Block new admission. In-flight requests are not aborted (matches
-        # SGLang's freeze intent); true KV-preserving freeze needs the C++
-        # scheduler (same keep-mode limitation as the rest of the plumbing).
-        _llm(request).weight_transfer_block_admission()
+        # Stop frontend admission before the native scheduler drain. Otherwise
+        # a newly buffered request could hold the model-update reader lock.
+        llm = _llm(request)
+        llm.block_generation_admission()
+        try:
+            if not await llm.pause_scheduler(mode="wait"):
+                raise RuntimeError("Failed to pause generation.")
+        except BaseException:
+            llm.allow_generation_admission()
+            raise
         return {"success": True, "message": "Paused generation."}
 
     return await _guarded(_do)
@@ -227,7 +263,10 @@ async def pause_generation(request: Request) -> JSONResponse:
 @router.post("/continue_generation")
 async def continue_generation(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
-        _llm(request).weight_transfer_allow_admission()
+        llm = _llm(request)
+        if not await llm.resume_scheduler():
+            raise RuntimeError("Failed to continue generation.")
+        llm.allow_generation_admission()
         return {"success": True, "message": "Continued generation."}
 
     return await _guarded(_do)
@@ -250,19 +289,29 @@ async def flush_cache(request: Request) -> JSONResponse:
 @router.post("/release_memory_occupation")
 async def release_memory_occupation(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
-        await _llm(request).release_memory_occupation(ReleaseMemoryOccupationReqInput())
-        return {"success": True}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = await _llm(request).release_memory_occupation(
+            ReleaseMemoryOccupationReqInput(tags=body.get("tags"))
+        )
+        return {"success": result.success, "message": result.message}
 
     return await _guarded(_do)
 
 
 @router.post("/resume_memory_occupation")
 async def resume_memory_occupation(request: Request) -> JSONResponse:
-    # SGLang's multi-stage `tags` (weights/kv_cache) is accepted and ignored;
-    # tokenspeed resumes the full occupation.
     async def _do() -> dict[str, Any]:
-        await _llm(request).resume_memory_occupation(ResumeMemoryOccupationReqInput())
-        return {"success": True}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = await _llm(request).resume_memory_occupation(
+            ResumeMemoryOccupationReqInput(tags=body.get("tags"))
+        )
+        return {"success": result.success, "message": result.message}
 
     return await _guarded(_do)
 
@@ -279,7 +328,19 @@ async def abort_request(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
         llm = _llm(request)
         if body.get("abort_all"):
-            llm.weight_transfer_abort_inflight()
+            # Native abort mode waits until scheduler state is drained. Resume
+            # immediately because SGLang's abort endpoint does not leave the
+            # server paused.
+            llm.block_generation_admission()
+            try:
+                if not await llm.pause_scheduler(mode="abort"):
+                    raise RuntimeError("Failed to abort all requests.")
+            except BaseException:
+                llm.allow_generation_admission()
+                raise
+            if not await llm.resume_scheduler():
+                raise RuntimeError("Failed to resume after aborting requests.")
+            llm.allow_generation_admission()
         elif body.get("rid"):
             llm.abort_request(str(body["rid"]))
         return {"success": True}
@@ -290,6 +351,66 @@ async def abort_request(request: Request) -> JSONResponse:
 @router.get("/health_generate")
 async def health_generate() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@router.get("/v1/loads")
+async def get_loads(request: Request) -> JSONResponse:
+    loads = await _llm(request).get_load()
+    return JSONResponse(
+        {
+            "loads": [
+                {
+                    "dp_rank": load.dp_rank,
+                    "num_reqs": load.num_reqs,
+                    "num_waiting_reqs": load.num_waiting_reqs,
+                    "num_pages": load.num_pages,
+                }
+                for load in loads
+            ]
+        }
+    )
+
+
+@router.get("/get_weight_version")
+async def get_weight_version(request: Request) -> JSONResponse:
+    llm = _llm(request)
+    return JSONResponse({"weight_version": llm.server_args.weight_version})
+
+
+@router.post("/update_weight_version")
+async def update_weight_version(request: Request) -> JSONResponse:
+    body = await request.json()
+
+    async def _do() -> dict[str, Any]:
+        new_version = body.get("new_version")
+        if new_version is None:
+            raise ValueError("Missing 'new_version' in request body")
+        llm = _llm(request)
+        if getattr(llm.server_args, "kvstore_storage_backend", None) is not None:
+            raise ValueError(
+                "Direct weight-version changes are not supported with L3 storage; "
+                "use /update_weights_from_distributed with an explicit "
+                "weight_version and flush_cache=True"
+            )
+        llm.server_args.weight_version = str(new_version)
+        return {
+            "success": True,
+            "message": f"Weight version updated to {new_version}",
+            "new_version": str(new_version),
+        }
+
+    return await _guarded(_do)
+
+
+@router.get("/model_info")
+async def model_info(request: Request) -> JSONResponse:
+    llm = _llm(request)
+    return JSONResponse(
+        {
+            "model_path": llm.server_args.model,
+            "weight_version": llm.server_args.weight_version,
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +424,7 @@ def build_sglang_compat_app(async_llm: "AsyncLLM") -> FastAPI:
     In production these routes are mounted on the shared RL control-plane app
     (see ``AsyncLLM._serve_rl_control_plane``). This helper is for isolated tests.
     """
-    app = FastAPI(title="tokenspeed sglang-compat weight sync")
+    app = FastAPI(title="tokenspeed SGLang-compatible RL control")
     app.state.async_llm = async_llm
     app.include_router(router)
     return app

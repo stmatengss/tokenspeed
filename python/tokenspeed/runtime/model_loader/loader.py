@@ -29,7 +29,7 @@ import dataclasses
 import glob
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -53,10 +53,13 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_names,
     get_quant_config,
     initialize_dummy_weights,
+    instanttensor_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
 )
 from tokenspeed.runtime.models.extensible import ExtensibleLM
@@ -66,7 +69,7 @@ from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_availabl
 @contextmanager
 def device_loading_context(
     module: torch.nn.Module, target_device: torch.device
-) -> Iterator[torch.nn.Module]:
+) -> Generator[torch.nn.Module]:
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
@@ -143,6 +146,10 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
+    if quant_config is not None:
+        replacements = getattr(model_class, "quant_module_name_replacements", None)
+        if replacements:
+            quant_config.apply_checkpoint_name_replacements(replacements)
     mapping = model_config.mapping
     # Only VLM wrappers accept these kwargs.
     extra_kwargs: dict = {}
@@ -251,7 +258,7 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format == LoadFormat.SAFETENSORS:
+        elif load_format in (LoadFormat.SAFETENSORS, LoadFormat.INSTANTTENSOR):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == LoadFormat.MISTRAL:
@@ -314,12 +321,35 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self,
+        source: "Source",
+        weight_name_filter: Callable[[str], bool] | None,
+        checkpoint_load_group: tuple[int, ...] | None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
+        """Get an iterator for the model weights based on the load format.
+
+        When ``weight_name_filter`` is given, safetensors shards whose index
+        entries contain no accepted weight name are skipped entirely (not
+        read or prefetched). The predicate sees names as yielded to the
+        consumer, i.e. with ``source.prefix`` applied. Distributed loaders
+        only synchronize ranks in ``checkpoint_load_group`` when one is
+        declared: pipeline stages can consume different checkpoint subsets.
+        """
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
+        if use_safetensors and weight_name_filter is not None:
+            index_file = (
+                "consolidated.safetensors.index.json"
+                if self.load_config.load_format == LoadFormat.MISTRAL
+                else SAFE_WEIGHTS_INDEX_NAME
+            )
+            hf_weights_files = filter_safetensors_files_by_weight_names(
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                lambda name: weight_name_filter(source.prefix + name),
+            )
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             if use_safetensors:
@@ -329,6 +359,31 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.download_dir,
                 hf_folder,
                 hf_weights_files,
+            )
+        elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
+            process_group = None
+            if checkpoint_load_group is not None:
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager as pg_manager,
+                )
+
+                process_group = pg_manager.get_process_group(
+                    "nccl", checkpoint_load_group
+                )
+            elif (
+                torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            ):
+                process_group = torch.distributed.group.WORLD
+            weights_iterator = instanttensor_weights_iterator(
+                hf_weights_files, process_group=process_group
+            )
+        elif use_safetensors and weight_name_filter is not None:
+            weights_iterator = safetensors_filtered_weights_iterator(
+                hf_weights_files,
+                lambda name: weight_name_filter(source.prefix + name),
+                prefetch=self.load_config.weight_loader_prefetch_checkpoints,
+                prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
             )
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(
@@ -347,6 +402,19 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # Draft (NextN/MTP) models embedded in the target checkpoint expose
+        # ``checkpoint_weight_name_filter`` so only the shards holding their
+        # weights are read instead of the whole checkpoint.
+        weight_name_filter = getattr(model, "checkpoint_weight_name_filter", None)
+        bind_checkpoint_dir = getattr(model, "bind_checkpoint_dir", None)
+        if callable(bind_checkpoint_dir):
+            hf_folder, _, _ = self._prepare_weights(
+                model_config.model_path,
+                model_config.revision,
+                getattr(model, "fall_back_to_pt_during_load", False),
+            )
+            bind_checkpoint_dir(hf_folder)
+        checkpoint_load_group = getattr(model, "checkpoint_load_group", None)
 
         primary_weights = DefaultModelLoader.Source(
             model_config.model_path,
@@ -354,13 +422,17 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(
+            primary_weights, weight_name_filter, checkpoint_load_group
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(
+                source, weight_name_filter, checkpoint_load_group
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -600,11 +672,8 @@ class ShardedStateLoader(BaseModelLoader):
                                 param_data = param_data.narrow(dim, 0, size)
                         if tensor.shape != param_shape:
                             logger.warning(
-                                "loading tensor of shape %s into "
-                                "parameter '%s' of shape %s",
-                                tensor.shape,
-                                key,
-                                param_shape,
+                                f"loading tensor of shape {tensor.shape!s} into "
+                                f"parameter '{key!s}' of shape {param_shape!s}",
                             )
                         param_data.copy_(tensor)
                         state_dict.pop(key)

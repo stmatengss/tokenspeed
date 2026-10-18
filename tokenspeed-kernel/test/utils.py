@@ -23,11 +23,107 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    PlatformInfo,
+    current_platform,
+)
 from tokenspeed_kernel.registry import KernelRegistry, register_kernel
 from tokenspeed_kernel.signature import FormatSignature, format_signatures
 
 SampleRegistration = tuple[dict, Callable]
+
+
+def detected_platform() -> PlatformInfo | None:
+    """Return the current platform, or ``None`` when none is usable.
+
+    ``current_platform()`` raises when PyTorch sees no GPU or unsupported
+    architecture that. Tests gate themselves at import time, so turn that into
+    a value they can branch on instead of a collection error.
+    """
+    try:
+        return current_platform()
+    except RuntimeError:
+        return None
+
+
+def is_amd() -> bool:
+    platform = detected_platform()
+    return platform is not None and platform.is_amd
+
+
+def is_nvidia() -> bool:
+    platform = detected_platform()
+    return platform is not None and platform.is_nvidia
+
+
+def is_cdna4() -> bool:
+    platform = detected_platform()
+    return platform is not None and platform.is_cdna4
+
+
+def is_cdna5() -> bool:
+    platform = detected_platform()
+    return platform is not None and platform.is_cdna5
+
+
+def make_mxfp4_moe_weights(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    generator: torch.Generator,
+    *,
+    device: str = "cuda",
+    scale_range: tuple[int, int] = (120, 121),
+) -> dict[str, torch.Tensor]:
+    def scales(*shape: int) -> torch.Tensor:
+        return torch.randint(
+            *scale_range,
+            shape,
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+
+    return {
+        "w13_weight": torch.randint(
+            0,
+            256,
+            (num_experts, 2 * intermediate_size, hidden_size // 2),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
+        "w13_scale": scales(num_experts, 2 * intermediate_size, hidden_size // 32),
+        "w2_weight": torch.randint(
+            0,
+            256,
+            (num_experts, hidden_size, intermediate_size // 2),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
+        "w2_scale": scales(num_experts, hidden_size, intermediate_size // 32),
+    }
+
+
+def make_round_robin_topk(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    *,
+    device: str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = (
+        torch.arange(num_tokens, device=device)[:, None]
+        + torch.arange(top_k, device=device)
+    ) % num_experts
+    weights = torch.arange(1, top_k + 1, device=device, dtype=torch.float32)
+    return (
+        (weights / weights.sum()).expand(num_tokens, -1).contiguous(),
+        ids.to(torch.int32),
+    )
 
 
 def dummy_impl(name: str) -> Callable:
@@ -48,7 +144,6 @@ def _sample_registration(
     features: frozenset[str] | None = None,
     capability: CapabilityRequirement | None = None,
     priority: int = 10,
-    tags: frozenset[str] | None = None,
 ) -> SampleRegistration:
     return (
         {
@@ -60,7 +155,6 @@ def _sample_registration(
             "capability": capability,
             "signatures": signatures,
             "priority": priority,
-            "tags": tags,
         },
         dummy_impl(name),
     )
@@ -82,7 +176,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(8, 0),
             ),
             priority=18,
-            tags=frozenset({"latency"}),
         ),
         "triton_decode": _sample_registration(
             "triton_decode",
@@ -94,7 +187,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             ),
             features=frozenset({"paged"}),
             priority=10,
-            tags=frozenset({"portability"}),
         ),
         "cutlass_prefill": _sample_registration(
             "cutlass_prefill",
@@ -109,7 +201,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(9, 0),
             ),
             priority=16,
-            tags=frozenset({"throughput"}),
         ),
         "reference_decode": _sample_registration(
             "reference_decode",
@@ -124,7 +215,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             features=frozenset({"paged"}),
             capability=CapabilityRequirement(),
             priority=10,
-            tags=frozenset({"determinism", "portability"}),
         ),
         "aiter_decode": _sample_registration(
             "aiter_decode",
@@ -137,7 +227,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             features=frozenset({"paged"}),
             capability=CapabilityRequirement(vendors=frozenset({"amd"})),
             priority=16,
-            tags=frozenset({"latency", "portability"}),
         ),
         "cutlass_gemm": _sample_registration(
             "cutlass_gemm",
@@ -150,7 +239,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(8, 0),
             ),
             priority=15,
-            tags=frozenset({"throughput", "latency"}),
         ),
         "triton_gemm": _sample_registration(
             "triton_gemm",
@@ -159,7 +247,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             "triton",
             format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             priority=10,
-            tags=frozenset({"portability"}),
         ),
         "cutlass_grouped_gemm": _sample_registration(
             "cutlass_grouped_gemm",
@@ -172,7 +259,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(9, 0),
             ),
             priority=16,
-            tags=frozenset({"throughput"}),
         ),
         "triton_grouped_gemm": _sample_registration(
             "triton_grouped_gemm",
@@ -181,7 +267,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             "triton",
             format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             priority=10,
-            tags=frozenset({"portability"}),
         ),
         "triton_fused_moe": _sample_registration(
             "triton_fused_moe",
@@ -192,7 +277,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 ("x", "weight"), "dense", {torch.float16, torch.bfloat16}
             ),
             priority=12,
-            tags=frozenset({"throughput", "portability"}),
         ),
         "cutlass_fused_moe": _sample_registration(
             "cutlass_fused_moe",
@@ -207,7 +291,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(9, 0),
             ),
             priority=15,
-            tags=frozenset({"latency", "throughput"}),
         ),
         "triton_modular_moe": _sample_registration(
             "triton_modular_moe",
@@ -216,7 +299,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             "triton",
             format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
             priority=10,
-            tags=frozenset({"determinism", "portability"}),
         ),
         "cutlass_modular_moe": _sample_registration(
             "cutlass_modular_moe",
@@ -229,7 +311,6 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
                 min_arch_version=ArchVersion(8, 0),
             ),
             priority=14,
-            tags=frozenset({"throughput"}),
         ),
     }
 

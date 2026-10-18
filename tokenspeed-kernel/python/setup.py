@@ -19,15 +19,43 @@
 # SOFTWARE.
 
 """
-tokenspeed_kernel build script.
+Build and package tokenspeed_kernel.
+
+This script will automatically detect the CUDA or ROCm backend and install the
+appropriate dependencies, and compile the native kernels for the selected
+backend.
+
+Dependency handling
+===================
+
+Dependencies are split by purpose:
+
+* requirements/<backend>.txt contains core build and runtime dependencies.
+* requirements/<backend>-thirdparty.txt contains external kernel packages.
+
+Both files are combined into install_requires and recorded in wheel
+metadata. During a source or editable build, the native build step also
+installs the core backend file before compiling. Third-party dependencies are
+installed by the outer package installer from the generated metadata. They are
+not optional despite being kept in a separate file.
+
+TOKENSPEED_KERNEL_CUDA_VARIANT=cu129 selects CUDA 12 CuTe metadata and omits
+CUDA-13-only KDA AOT. The outer installer supplies these dependencies, so the
+cu129 build skips the nested pip install.
+
+Kernel compilation
+==================
 
 Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
 On systems without an NVIDIA CUDA build target, the build is skipped and the
-package installs as a pure-Python stub.
+package installs as a pure-Python stub. Cached CUDA binaries carry a toolchain
+identity, so CUDA 12/13 and architecture changes invalidate them in either
+direction. The cu129 source recipe always rebuilds its in-tree CUDA kernels.
 """
 
 import ctypes
 import importlib
+import json
 import os
 import shutil
 import site
@@ -46,7 +74,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.0"
+BASE_VERSION = "0.1.3"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
@@ -208,9 +236,19 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        include = None
         if line.startswith("-r ") or line.startswith("--requirement "):
             include = line.split(maxsplit=1)[1]
+        elif line.startswith("-r") and len(line) > 2:
+            include = line[2:].strip()
+        elif line.startswith("--requirement="):
+            include = line.split("=", maxsplit=1)[1].strip()
+        if include:
             requirements.extend(_read_requirements(path.parent / include, seen))
+            continue
+        if line.startswith("-"):
+            # Installer options such as --extra-index-url are not valid
+            # project dependency metadata.
             continue
         requirements.append(line)
     return requirements
@@ -218,10 +256,24 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
 
 def _selected_install_requires() -> list[str]:
     backend = _selected_backend()
-    requirements = []
+    requirements = _read_requirements(REQUIREMENTS_DIR / f"{backend}.txt")
     requirements.extend(
         _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
     )
+
+    # The cu129 source recipe supplies CUDA 12 dependencies before building.
+    # Keep all checkout pins, replacing only the CUDA-specific CuTe runtime.
+    if (
+        backend == "cuda"
+        and os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") == "cu129"
+    ):
+        requirements = [
+            requirement.replace(
+                "nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl"
+            ).replace("nvidia-cutlass-dsl-libs-cu13", "nvidia-cutlass-dsl-libs-cu12")
+            for requirement in requirements
+            if not requirement.startswith("tokenspeed-cutedsl-kda==")
+        ]
 
     deduped = []
     seen = set()
@@ -256,8 +308,15 @@ def _refresh_python_install_paths() -> None:
     importlib.invalidate_caches()
 
 
-def _install_backend_build_requirements(verbose=False) -> None:
+def _install_backend_build_requirements(verbose) -> None:
     backend = _selected_backend()
+    if (
+        backend == "cuda"
+        and os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") == "cu129"
+    ):
+        # Nested pip would read the default CUDA 13 requirements. The cu129
+        # installer already resolved the adjusted metadata into this venv.
+        return
     print(f"Installing {backend} build requirements before native build")
     subprocess.check_call(
         [
@@ -298,11 +357,18 @@ KERNEL_GROUPS = [
         [],
     ),
     (
-        "deepseek_v4_attention",
+        "dsv4_attention",
         [
-            CUDA_CSRC_DIR / "deepseek_v4_attention.cu",
-            CUDA_CSRC_DIR / "deepseek_v4_topk.cu",
-            CUDA_CSRC_DIR / "deepseek_v4_attention_binding.cu",
+            CUDA_CSRC_DIR / "dsv4_attention.cu",
+            CUDA_CSRC_DIR / "dsv4_topk.cu",
+            CUDA_CSRC_DIR / "dsv4_attention_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "minimax_m3_fused",
+        [
+            CUDA_CSRC_DIR / "fused_minimax_m3_qknorm_rope_kv_insert.cu",
         ],
         [],
     ),
@@ -316,21 +382,28 @@ KERNEL_GROUPS = [
         ["-lcublas", "-lcublasLt"],
     ),
     (
-        "fp32_router_gemm",
-        [
-            CUDA_CSRC_DIR / "fp32_router_gemm.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_entry.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_binding.cu",
-        ],
-        ["-lcublas", "-lcublasLt"],
-    ),
-    (
         "marlin",
         [
             CUDA_CSRC_DIR / "gptq_marlin_repack.cu",
             CUDA_CSRC_DIR / "flashinfer_marlin_binding.cu",
         ],
         [],
+    ),
+    (
+        "marlin_moe",
+        [
+            CUDA_CSRC_DIR / "marlin_moe" / "marlin_moe_binding.cu",
+        ],
+        [],
+        # -I marlin_moe/include first: the vendored Marlin GEMM only needs a
+        # tiny scalar_type.hpp + dtype-alias prelude (a trimmed drop-in), not
+        # the full sgl_kernel stack. -std=c++20 for scalar_type's constexpr;
+        # nvcc keeps the last -std, overriding the global c++17.
+        [
+            f"-I{CUDA_CSRC_DIR / 'marlin_moe' / 'include'}",
+            "-std=c++20",
+            "-Wno-deprecated-gpu-targets",
+        ],
     ),
     (
         "routing",
@@ -369,6 +442,13 @@ KERNEL_GROUPS = [
         "merge_state",
         [
             CUDA_CSRC_DIR / "merge_state.cu",
+        ],
+        [],
+    ),
+    (
+        "mhc_big_fuse",
+        [
+            CUDA_CSRC_DIR / "mhc_big_fuse.cu",
         ],
         [],
     ),
@@ -422,9 +502,17 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
-            CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
+        ],
+        [],
+    ),
+    (
+        "attn_res",
+        [
+            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_online_v2.cu",
+            CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],
     ),
@@ -466,8 +554,10 @@ class CudaKernelBuilder:
             archs.add(self._normalize_cuda_arch(direct))
             return archs
 
-        if not archs:
-            archs.update(DEFAULT_CUDA_ARCHS)
+        archs.update(DEFAULT_CUDA_ARCHS)
+        nvcc_version = self._nvcc_toolkit_version()
+        if nvcc_version is not None and nvcc_version >= (13, 4):
+            archs.add("107a")
         return archs
 
     def _site_paths(self):
@@ -487,6 +577,48 @@ class CudaKernelBuilder:
             if path.exists() and path_str not in seen:
                 seen.add(path_str)
                 yield path
+
+    def _read_cuda_header_version(self, include_dir: Path):
+        header = include_dir / "cuda_runtime_api.h"
+        if not header.exists():
+            return None
+
+        try:
+            for line in header.read_text(
+                encoding="utf-8", errors="ignore"
+            ).splitlines():
+                if line.startswith("#define CUDART_VERSION"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        version = int(parts[2])
+                        return version // 1000, (version % 1000) // 10
+        except (OSError, ValueError):
+            return None
+
+        return None
+
+    def _nvcc_toolkit_version(self):
+        try:
+            output = subprocess.check_output(
+                [NVCC, "--version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+        marker = "release "
+        for line in output.splitlines():
+            if marker not in line:
+                continue
+            version_text = line.split(marker, 1)[1].split(",", 1)[0].strip()
+            parts = version_text.split(".")
+            if len(parts) >= 2:
+                try:
+                    return int(parts[0]), int(parts[1])
+                except ValueError:
+                    return None
+        return None
 
     def _cuda_toolkit_roots(self):
         roots = [Path(CUDA_HOME)]
@@ -526,12 +658,30 @@ class CudaKernelBuilder:
 
         # Do not mix wheel CUDA headers with an available toolkit.
         if not found_toolkit_headers:
+            nvcc_version = self._nvcc_toolkit_version()
             found_wheel_headers = False
             for base_path in self._site_paths():
                 for candidate in sorted(
                     base_path.glob("nvidia/cu*/include"), reverse=True
                 ):
                     if not _is_complete_cuda_include(candidate):
+                        continue
+                    # The nvidia-cuda-runtime wheels may lag the nvcc minor
+                    # version. Mixing them trips CCCL's toolkit compatibility
+                    # check, so only use matching fallback headers.
+                    header_version = self._read_cuda_header_version(candidate)
+                    if (
+                        nvcc_version
+                        and header_version
+                        and header_version != nvcc_version
+                    ):
+                        if self.verbose:
+                            print(
+                                "Skipping CUDA include with mismatched toolkit "
+                                f"version: {candidate} "
+                                f"({header_version[0]}.{header_version[1]} != nvcc "
+                                f"{nvcc_version[0]}.{nvcc_version[1]})"
+                            )
                         continue
                     _add_dir(candidate)
                     if (candidate / "cccl").exists():
@@ -663,6 +813,33 @@ class CudaKernelBuilder:
         subprocess.check_call(cmd)
         return obj
 
+    def _build_identity(self, compile_flags, include_dirs, link_flags):
+        """Identify the compiler/ABI inputs that source mtimes cannot describe."""
+        version = self._nvcc_toolkit_version()
+        if version is None:
+            # An unusual compiler wrapper may still build successfully; never
+            # trust an old artifact when its CUDA toolkit cannot be identified.
+            return None
+        return {
+            "format": 1,
+            "cuda_version": list(version),
+            "nvcc": str(Path(shutil.which(NVCC) or NVCC).resolve()),
+            "cxx": str(Path(shutil.which(CXX) or CXX).resolve()),
+            "cuda_home": str(Path(CUDA_HOME).resolve()),
+            "compile_flags": list(compile_flags),
+            "include_dirs": list(include_dirs),
+            "link_flags": list(link_flags),
+        }
+
+    @staticmethod
+    def _matches_build_identity(path: Path, identity) -> bool:
+        if identity is None:
+            return False
+        try:
+            return json.loads(path.read_text()) == identity
+        except (OSError, ValueError):
+            return False
+
     def run(self):
         self._prepare_cuda_toolchain_env()
         max_jobs = int(os.environ.get("MAX_JOBS", min(os.cpu_count() or 1, 16)))
@@ -686,6 +863,7 @@ class CudaKernelBuilder:
         ] + gencode_flags
         include_dirs = self._resolve_include_dirs()
         ldflags = ["-shared"] + self._resolve_cuda_lib_flags()
+        build_identity = self._build_identity(nvcc_flags, include_dirs, ldflags)
 
         # Ensure output directory exists
         CUDA_OBJS_DIR.mkdir(parents=True, exist_ok=True)
@@ -698,14 +876,37 @@ class CudaKernelBuilder:
             out_dir = CUDA_OBJS_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
             so_path = out_dir / f"{name}.so"
-            if so_path.exists() and all(
-                so_path.stat().st_mtime > src.stat().st_mtime for src in sources
+            identity_path = out_dir / "build-identity.json"
+            group_identity = (
+                build_identity
+                | {
+                    "extra_cflags": list(extra_cflags),
+                    "extra_ldflags": list(extra_ldflags or []),
+                }
+                if build_identity is not None
+                else None
+            )
+            # The opt-in recipe deliberately rebuilds every time. Other CUDA
+            # installs may use mtimes only after matching the actual toolchain:
+            # returning from cu129 to cu130 must not reuse the cu129 binary.
+            if (
+                os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") != "cu129"
+                and so_path.exists()
+                and self._matches_build_identity(identity_path, group_identity)
+                and all(
+                    so_path.stat().st_mtime > src.stat().st_mtime for src in sources
+                )
             ):
                 skipped_groups += 1
                 continue
-            stale_groups.append((name, sources, extra_ldflags, extra_cflags, so_path))
+            # A failed rebuild must invalidate the previous identity, even if
+            # its old .so remains. Only a successful link publishes a new one.
+            identity_path.unlink(missing_ok=True)
+            stale_groups.append(
+                (name, sources, extra_ldflags, extra_cflags, so_path, group_identity)
+            )
 
-        stale_sources = sum(len(srcs) for _, srcs, _, _, _ in stale_groups)
+        stale_sources = sum(len(srcs) for _, srcs, _, _, _, _ in stale_groups)
         print(
             f"Building {len(stale_groups)}/{len(self.kernel_groups)} kernel group(s) "
             f"({stale_sources}/{total_sources} files, {max_jobs} parallel jobs)..."
@@ -719,7 +920,14 @@ class CudaKernelBuilder:
         with ThreadPoolExecutor(max_workers=max_jobs) as executor:
             group_meta = []
             futures = []
-            for name, sources, extra_ldflags, extra_cflags, so_path in stale_groups:
+            for (
+                name,
+                sources,
+                extra_ldflags,
+                extra_cflags,
+                so_path,
+                identity,
+            ) in stale_groups:
                 out_dir = so_path.parent
                 objects = []
                 for src in sources:
@@ -735,12 +943,12 @@ class CudaKernelBuilder:
                             extra_cflags,
                         )
                     )
-                group_meta.append((name, objects, extra_ldflags, so_path))
+                group_meta.append((name, objects, extra_ldflags, so_path, identity))
 
             for future in as_completed(futures):
                 future.result()
 
-        for name, objects, extra_ldflags, so_path in group_meta:
+        for name, objects, extra_ldflags, so_path, identity in group_meta:
             extra_ldflags = [
                 self._resolve_library_ldflag(ldflag) for ldflag in (extra_ldflags or [])
             ]
@@ -752,6 +960,11 @@ class CudaKernelBuilder:
                 + ["-o", str(so_path)]
             )
             subprocess.check_call(link_cmd)
+            if identity is not None:
+                identity_path = so_path.parent / "build-identity.json"
+                temporary = identity_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
+                temporary.replace(identity_path)
 
 
 class BuildKernels(build_ext):
@@ -820,7 +1033,25 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
+        "tokenspeed_kernel.ops.communication": ["_cuda/*.cu", "README.md"],
+        # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
+        "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
+        # loaded via the upstream sys.path bootstrap), so ship it as data.
+        "tokenspeed_kernel.thirdparty.msa": [
+            "README.md",
+            "cute/**/*.py",
+            "cute/**/*.cu",
+            "cute/README.md",
+            "cute/requirements.txt",
+            # nvcc-JIT FMHA sources: compiled at runtime by jit.py, so the
+            # kernel sources and headers must ship with the wheel.
+            "csrc/*.cu",
+            "csrc/*.h",
+            "csrc/*.jinja",
+            "csrc/include/*",
+        ],
     },
     cmdclass={
         "build_native": BuildNative,

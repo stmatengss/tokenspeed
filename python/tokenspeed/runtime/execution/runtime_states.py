@@ -19,15 +19,14 @@
 # SOFTWARE.
 """Runtime state tensors shared by the model executor."""
 
+from __future__ import annotations
+
+import itertools
+
 import torch
 
-from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
-    fused_mamba_state_copy,
-    fused_mamba_state_zero,
-)
-from tokenspeed.runtime.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
+from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
+from tokenspeed.runtime.execution.types import RequestHistorySeeds
 
 
 class RuntimeStates:
@@ -36,14 +35,17 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
-        context_len: int,
         vocab_size: int,
         output_length: int,
         device: str = "cuda",
-        mamba_pool=None,
     ):
         self.device = device
         self.vocab_size = vocab_size
+        self.ngram_accepted_tokens: torch.Tensor | None = None
+        self.ngram_needs_seed: torch.Tensor | None = None
+        self.ngram_request_ids: list[str | None] = []
+        self.request_token_history_ids: torch.Tensor | None = None
+        self.draft_request_token_history_ids: torch.Tensor | None = None
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device
@@ -55,18 +57,161 @@ class RuntimeStates:
         self.remote_spec_candidate_ready = torch.zeros(
             req_pool_size + 1, dtype=torch.bool, device=device
         )
-        self.linear_penalties = torch.zeros(
-            (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
-        )
-        self.scaling_penalties = torch.ones(
-            (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
-        )
-        self.mamba_pool = mamba_pool
 
-    def update_valid_cache_length(
-        self, req_pool_indices: torch.Tensor, increment_lengths: torch.Tensor
-    ) -> None:
-        self.valid_cache_lengths.index_add_(0, req_pool_indices, increment_lengths)
+    def init_ngram_state(self, context_len: int) -> None:
+        """Allocate a bounded, newest-first accepted input tail per pool slot.
+
+        ``context_len`` is zero without Engram, three for V4.1. This executor
+        state follows valid_cache_lengths, not sampled output or model KV. It
+        is reseeded from host snapshots on admission/recovery, never transferred
+        or prefix-matched as a backend cache. Returns None.
+        """
+        if context_len == 0:
+            return
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.ngram_accepted_tokens = torch.full(
+            (pool_size, context_len), -1, dtype=torch.int64, device=self.device
+        )
+        self.ngram_needs_seed = torch.ones(
+            pool_size, dtype=torch.bool, device=self.device
+        )
+        self.ngram_request_ids = [None] * pool_size
+
+    def init_request_token_history(self, capacity: int) -> None:
+        """Allocate each slot's committed-token history row.
+
+        ``capacity`` is zero for a model that reads no history, else the
+        physical context length. Row ``s`` holds ``[0, valid_cache_lengths[s])``
+        committed tokens; the model's kernels append every forward's inputs
+        past that frontier, and resuming extends are reseeded from host
+        snapshots (:meth:`seed_request_token_history`). Like the n-gram tail,
+        this is executor state that follows ``valid_cache_lengths``; it is
+        never transferred or prefix-matched as a cache. Returns None.
+        """
+        if capacity < 0:
+            raise ValueError(
+                f"request token history capacity must be non-negative, got {capacity}"
+            )
+        if capacity == 0:
+            return
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.request_token_history_ids = torch.zeros(
+            (pool_size, capacity), dtype=torch.int32, device=self.device
+        )
+
+    @property
+    def has_request_token_history(self) -> bool:
+        """Whether this executor keeps request-token history."""
+        return self.request_token_history_ids is not None
+
+    def init_draft_request_token_history(self, capacity: int) -> None:
+        """Allocate the draft model's own committed-token history rows.
+
+        A draft stream is the request stream shifted one token left, so it can
+        never append into the target's rows: the shifted ids would overwrite
+        the verify window right before the target commits it. Row ``s`` holds
+        the shifted stream at the target's positions; the drafter supplies the
+        per-slot write frontier explicitly (it advances through the
+        speculative chain, unlike ``valid_cache_lengths``). Idempotent per
+        capacity; returns None.
+        """
+        if capacity <= 0:
+            raise ValueError(
+                f"draft request token history capacity must be positive, got "
+                f"{capacity}"
+            )
+        if self.draft_request_token_history_ids is not None:
+            return
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.draft_request_token_history_ids = torch.zeros(
+            (pool_size, capacity), dtype=torch.int32, device=self.device
+        )
+
+    def draft_request_token_history_view(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        input_start_offsets: torch.Tensor,
+        active_request_mask: torch.Tensor,
+        committed_lengths: torch.Tensor,
+    ) -> RequestTokenHistoryView:
+        """Combine the draft history with one packed-batch layout.
+
+        Args:
+            req_pool_indices: ``[bs]`` slot of every request row.
+            input_start_offsets: ``[bs + 1]`` packed offsets of the draft
+                forward's inputs.
+            active_request_mask: ``[bs]`` False rows are graph padding.
+            committed_lengths: ``[pool + 1]`` per-slot write frontier for this
+                draft step; the drafter owns and advances it.
+        """
+        if self.draft_request_token_history_ids is None:
+            raise RuntimeError("draft request token history is not enabled")
+        return RequestTokenHistoryView(
+            history_token_ids=self.draft_request_token_history_ids,
+            committed_lengths=committed_lengths,
+            req_pool_indices=req_pool_indices,
+            input_start_offsets=input_start_offsets,
+            active_request_mask=active_request_mask,
+        )
+
+    def request_token_history_view(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        input_start_offsets: torch.Tensor,
+        active_request_mask: torch.Tensor,
+    ) -> RequestTokenHistoryView:
+        """Combine the persistent history with one packed-batch layout."""
+        if self.request_token_history_ids is None:
+            raise RuntimeError("request token history is not enabled")
+        return RequestTokenHistoryView(
+            history_token_ids=self.request_token_history_ids,
+            committed_lengths=self.valid_cache_lengths,
+            req_pool_indices=req_pool_indices,
+            input_start_offsets=input_start_offsets,
+            active_request_mask=active_request_mask,
+        )
+
+    def seed_request_token_history(self, seeds: RequestHistorySeeds) -> None:
+        """Restore the committed prefix of each seeded slot.
+
+        One pinned upload carries every seed; each row is then written from
+        its device slice on the current stream. Returns None.
+        """
+        history = self.request_token_history_ids
+        if history is None:
+            raise RuntimeError("request token history is not enabled")
+        pool_size, capacity = history.shape
+        for slot, prefix_length in zip(seeds.slots, seeds.prefix_lengths):
+            # The last row is graph padding and never belongs to a request.
+            if not 0 <= slot < pool_size - 1:
+                raise ValueError(f"request token history slot {slot} is out of range")
+            if prefix_length > capacity:
+                raise ValueError(
+                    f"request token history prefix {prefix_length} exceeds "
+                    f"capacity {capacity}"
+                )
+        if sum(seeds.prefix_lengths) == 0:
+            return
+        device_tokens = torch.tensor(
+            list(itertools.chain.from_iterable(seeds.tokens)),
+            dtype=torch.int32,
+            pin_memory=torch.device(self.device).type != "cpu",
+        ).to(self.device, non_blocking=True)
+        offset = 0
+        draft = self.draft_request_token_history_ids
+        for slot, prefix_length in zip(seeds.slots, seeds.prefix_lengths):
+            history[slot, :prefix_length].copy_(
+                device_tokens[offset : offset + prefix_length]
+            )
+            if draft is not None and prefix_length > 1:
+                # The draft stream is the request stream shifted one token
+                # left, at the same positions.
+                draft[slot, : prefix_length - 1].copy_(
+                    device_tokens[offset + 1 : offset + prefix_length]
+                )
+            offset += prefix_length
 
     def reset_states(
         self,
@@ -74,9 +219,15 @@ class RuntimeStates:
         extend_prefix_lens: torch.Tensor,
     ) -> None:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
-        self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
-        self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
-        self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+        # Scalar indexed assignment stages a CPU tensor and synchronizes CUDA.
+        # Keep the reset ordered on the execution stream without a host wait.
+        self.remote_spec_candidate_ready.index_fill_(
+            0, extend_request_pool_indices, False
+        )
+        if self.ngram_accepted_tokens is not None:
+            assert self.ngram_needs_seed is not None
+            self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
+            self.ngram_needs_seed.index_fill_(0, extend_request_pool_indices, True)
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]
@@ -94,86 +245,3 @@ class RuntimeStates:
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
         self.remote_spec_candidate_ready[req_pool_idx] = True
-
-    def copy_mamba_states(
-        self,
-        mamba_pool_indices: torch.Tensor,
-        mamba_cow_src_indices: torch.Tensor,
-        bs: int,
-    ) -> None:
-        """Copy Mamba states for copy-on-write requests."""
-        if self.mamba_pool is None:
-            return
-        if mamba_cow_src_indices is None:
-            return
-        src_indices = mamba_cow_src_indices[:bs].long()
-        dst_indices = mamba_pool_indices[:bs].long()
-        # page_size=0 disables page-boundary filtering
-        fused_mamba_state_copy(
-            self.mamba_pool.conv_state,
-            src_indices,
-            dst_indices,
-        )
-        fused_mamba_state_copy(
-            self.mamba_pool.ssm_state,
-            src_indices,
-            dst_indices,
-        )
-
-    def snapshot_mamba_checkpoints(
-        self,
-        src_indices: torch.Tensor,
-        dst_indices: torch.Tensor,
-        cache_lengths: torch.Tensor,
-        page_size: int,
-        num_valid: int,
-    ) -> None:
-        """Copy current working Mamba states into checkpoint slots.
-
-        src_indices/dst_indices are pre-filtered on CPU (only valid entries).
-        The page_size condition is checked inside the Triton kernel.
-        """
-        if self.mamba_pool is None or num_valid == 0:
-            return
-        fused_mamba_state_copy(
-            self.mamba_pool.conv_state,
-            src_indices,
-            dst_indices,
-            cache_lengths=cache_lengths,
-            page_size=page_size,
-        )
-        fused_mamba_state_copy(
-            self.mamba_pool.ssm_state,
-            src_indices,
-            dst_indices,
-            cache_lengths=cache_lengths,
-            page_size=page_size,
-        )
-
-    def zero_mamba_states(
-        self,
-        mamba_pool_indices: torch.Tensor,
-        mamba_cow_src_indices: torch.Tensor | None,
-        extend_prefix_lens: torch.Tensor | None,
-        bs: int,
-    ) -> None:
-        """Clear Mamba states for newly allocated slots without prefix state."""
-        if self.mamba_pool is None:
-            return
-        pool_indices = mamba_pool_indices[:bs]
-        # Compute condition mask purely on GPU (no sync)
-        valid_pool = pool_indices != -1
-        no_cow = (
-            (mamba_cow_src_indices[:bs] == -1)
-            if mamba_cow_src_indices is not None
-            else torch.ones(bs, dtype=torch.bool, device=mamba_pool_indices.device)
-        )
-        no_prefix = (
-            (extend_prefix_lens[:bs] == 0)
-            if extend_prefix_lens is not None
-            else torch.ones(bs, dtype=torch.bool, device=mamba_pool_indices.device)
-        )
-        zero_mask = valid_pool & no_cow & no_prefix
-        indices = torch.where(zero_mask, pool_indices, -1).long()
-        fused_mamba_state_zero(self.mamba_pool.conv_state, indices)
-        fused_mamba_state_zero(self.mamba_pool.ssm_state, indices)

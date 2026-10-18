@@ -25,78 +25,51 @@ from dataclasses import dataclass
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    STATE_LAYER_TYPES,
-    scheduler_ext_flat_kvcache,
-)
 from tokenspeed.runtime.layers.attention.configs.base import (
-    BaseAttnConfig,
+    AttnConfig,
+    SoftmaxAttnConfig,
+    is_block_drafter,
+    model_wide_kwargs,
+    resolve_cache_layer_types,
     resolve_dtype,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-@dataclass
-class MHAConfig(BaseAttnConfig):
-    # Per-layer attention-type labels + window, forwarded to the KV pool for
-    # paged_cache_group_specs publication (empty -> single full-history group).
-    layer_types: tuple[str, ...] = ()
-    sliding_window_tokens: int | tuple[int | None, ...] | None = None
-    max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; the pool's slab
-    # guards consume it.
-    pd_disaggregation_enabled: bool = False
-    # Mamba2/GDN per-state-layer shapes and dtypes (the configs'
-    # mamba2_cache_params), forwarded to the pool's state slabs. Populated
-    # only on a flat-built scheduler ext — the radix path keeps its
-    # SimpleMambaPool state ownership byte-identical (None here means the
-    # pool neither allocates state slabs nor runs the page-geometry check).
-    conv_state_shape: tuple[int, ...] | None = None
-    temporal_state_shape: tuple[int, ...] | None = None
-    conv_dtype: torch.dtype | None = None
-    ssm_dtype: torch.dtype | None = None
+@dataclass(kw_only=True)
+class MHAConfig(SoftmaxAttnConfig):
+    # Mixed full+sliding models are ONE component carrying the inherited
+    # per-layer cache_layer_types/window vectors; the per-layer kv-head counts
+    # live on the cache-pool spec (``CachePoolSpec.layer_kv_head_counts``).
+
+    # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950); see
+    # ServerArgs.skip_softmax_threshold.
+    skip_softmax_threshold: float = 0.0
 
     @classmethod
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
-    ):
-        kwargs = {}
-        if server_args.speculative_algorithm is not None:
-            kwargs.update(
-                speculative_num_steps=server_args.speculative_num_steps,
-                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            )
+    ) -> AttnConfig:
         kv_cache_dtype = server_args.kv_cache_dtype
-        draft_block_decode = bool(
-            is_draft and server_args.speculative_algorithm == "DFLASH"
+        draft_block_decode = is_block_drafter(
+            server_args.speculative_algorithm, is_draft
         )
-        if draft_block_decode:
+        if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"
 
-        hf_config = getattr(model_config, "hf_config", None)
-        layer_types = tuple(getattr(hf_config, "layer_types", None) or ())
-        sliding_window_tokens = getattr(hf_config, "sliding_window", None)
-        conv_state_shape = temporal_state_shape = None
-        conv_dtype = ssm_dtype = None
-        if (
-            any(label in STATE_LAYER_TYPES for label in layer_types)
-            and scheduler_ext_flat_kvcache()
-        ):
-            # GDN hybrid on the flat ext: the KV pool owns the recurrent
-            # state (state slabs), so it needs the mamba2 shapes/dtypes.
-            # Radix branch untouched: SimpleMambaPool owns the state there.
-            text_config = getattr(hf_config, "text_config", hf_config)
-            (
-                conv_state_shape,
-                temporal_state_shape,
-                conv_dtype,
-                ssm_dtype,
-                _,
-            ) = text_config.mamba2_cache_params
-        return cls(
-            device=server_args.device,
-            context_len=model_config.context_len,
+        hf_config = model_config.hf_config
+        cache_layer_types = resolve_cache_layer_types(
+            hf_config,
+            num_layers=model_config.num_attention_layers,
+            is_draft=is_draft,
+            draft_block_decode=draft_block_decode,
+        )
+        # The retention window belongs to the storage labels: a block drafter
+        # has none of its own (its window is a compute mask on its layers).
+        sliding_window_tokens = (
+            None if draft_block_decode else getattr(hf_config, "sliding_window", None)
+        )
+        spec = cls(
             backend_name=(
                 server_args.attention_backend
                 if not is_draft
@@ -106,64 +79,30 @@ class MHAConfig(BaseAttnConfig):
             num_kv_heads=model_config.num_key_value_heads,
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
-            dtype=model_config.dtype,
-            kv_cache_dtype=resolve_dtype(kv_cache_dtype),
-            page_size=server_args.block_size,
-            max_bs=server_args.max_num_seqs
-            // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
-            max_graph_bs=server_args.max_cudagraph_capture_size,
-            kv_cache_quant_method=server_args.kv_cache_quant_method,
-            is_draft=is_draft,
-            draft_block_decode=draft_block_decode,
-            layer_types=layer_types,
+            cache_layer_types=cache_layer_types,
             sliding_window_tokens=sliding_window_tokens,
-            max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
-            pd_disaggregation_enabled=getattr(
-                server_args, "disaggregation_mode", "null"
-            )
-            != "null",
-            conv_state_shape=conv_state_shape,
-            temporal_state_shape=temporal_state_shape,
-            conv_dtype=conv_dtype,
-            ssm_dtype=ssm_dtype,
-            **kwargs,
+            skip_softmax_threshold=server_args.skip_softmax_threshold,
+        )
+        return AttnConfig(
+            components=(spec,),
+            **model_wide_kwargs(
+                server_args,
+                model_config,
+                is_draft,
+                kv_cache_dtype=resolve_dtype(kv_cache_dtype),
+                kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
+                draft_block_decode=draft_block_decode,
+            ),
         )
 
-    def cache_cell_size(self) -> int:
-        return (
+    def cache_cell_size(self, config: AttnConfig) -> int:
+        cell = (
             max(self.num_kv_heads // self.attn_tp_size, 1)
             * self.head_dim
             * 2
-            * torch._utils._element_size(self.kv_cache_dtype)
+            * torch._utils._element_size(config.kv_cache_dtype)
         )
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
-
-        return MHATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            head_num=max(self.num_kv_heads // self.attn_tp_size, 1),
-            head_dim=self.head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            layer_types=self.layer_types,
-            sliding_window_tokens=self.sliding_window_tokens,
-            max_scheduled_tokens=self.max_scheduled_tokens,
-            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
-            conv_state_shape=self.conv_state_shape,
-            temporal_state_shape=self.temporal_state_shape,
-            conv_dtype=self.conv_dtype,
-            ssm_dtype=self.ssm_dtype,
-        )
+        if config.kv_cache_mxfp8:
+            # One UE8M0 byte per 32 fp8 data bytes.
+            cell += cell // 32
+        return cell

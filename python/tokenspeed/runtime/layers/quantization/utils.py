@@ -32,6 +32,16 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.scalar_type impor
     ScalarType as ScalarType,
 )
 
+# Fused projections are absent from ModelOpt ignore lists, which name the
+# constituent shards instead (e.g. ``...ple.key_proj``/``...ple.value_proj``).
+# A fused module is excluded only when every member is excluded.
+_EXCLUDED_FUSED_MEMBERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "gate_up_proj": ("gate_proj", "up_proj"),
+        "kv_proj": ("key_proj", "value_proj"),
+    }
+)
+
 
 def should_exclude_quant_module(prefix: str, exclude_modules: list[str]) -> bool:
     """Whether ``prefix`` matches a ModelOpt-style glob in ``exclude_modules``."""
@@ -41,6 +51,14 @@ def should_exclude_quant_module(prefix: str, exclude_modules: list[str]) -> bool
         regex_str = pattern.replace(".", r"\.").replace("*", ".*")
         if re.fullmatch(regex_str, prefix):
             return True
+    proj_name = prefix.rsplit(".", 1)[-1]
+    members = _EXCLUDED_FUSED_MEMBERS.get(proj_name)
+    if members is not None:
+        base = prefix.removesuffix(proj_name)
+        return all(
+            should_exclude_quant_module(base + member, exclude_modules)
+            for member in members
+        )
     return False
 
 
@@ -417,3 +435,16 @@ def block_dequant(
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
     return x_dq_block
+
+
+def modelopt_block_scale_to_2d(scale: torch.Tensor) -> torch.Tensor:
+    """Normalize ModelOpt's 4-D block-scale layout to the 2-D block grid.
+
+    ModelOpt MIXED_PRECISION checkpoints store per-block FP8 dequant scales as
+    ``[ceil(N/block_n), 1, ceil(K/block_k), 1]``; runtime consumers use the
+    plain 2-D ``[ceil(N/block_n), ceil(K/block_k)]`` grid. 2-D inputs pass
+    through unchanged.
+    """
+    if scale.dim() == 4 and scale.shape[1] == 1 and scale.shape[3] == 1:
+        return scale.reshape(scale.shape[0], scale.shape[2])
+    return scale

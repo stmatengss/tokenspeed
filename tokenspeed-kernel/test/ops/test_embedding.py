@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
+    apply_k_rope,
     apply_rope,
     apply_rope_mla,
 )
@@ -393,6 +394,69 @@ def test_rope_fused_set_kv_buffer(
     )
 
 
+def test_rope_fused_set_kv_buffer_large_strides_use_i64_offsets(
+    device: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("embedding", "rope", "triton", dtype, "q")
+
+    from tokenspeed_kernel.ops.embedding.triton import _rope_apply_kernel
+
+    head_size = 16
+    positions = torch.zeros(1, device=device, dtype=torch.int64)
+    query = torch.zeros(1, head_size, device=device, dtype=dtype)
+    key = torch.zeros_like(query)
+    value = torch.zeros(1, 1, head_size, device=device, dtype=dtype)
+    cos_sin_cache = torch.cat(
+        (
+            torch.ones(1, head_size // 2, device=device),
+            torch.zeros(1, head_size // 2, device=device),
+        ),
+        dim=-1,
+    )
+    cache_loc = torch.ones(1, device=device, dtype=torch.int32)
+    k_buffer = torch.zeros(2, head_size, device=device, dtype=dtype)
+    v_buffer = torch.zeros_like(k_buffer)
+
+    apply_rope(
+        positions=positions,
+        q=query,
+        k=key,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
+            value=value,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            k_scale=None,
+            v_scale=None,
+            cache_loc=cache_loc,
+        ),
+        solution="triton",
+    )
+
+    # A cache slot fits in int32, but multiplying it by a large KV row stride
+    # can produce an offset outside the int32 range. Inspect TTIR because a
+    # runtime reproduction would require multi-GB cache buffers.
+    device_cache = _rope_apply_kernel.device_caches[torch.cuda.current_device()][0]
+    int32_fused_ttirs = [
+        compiled.asm["ttir"]
+        for compiled in device_cache.values()
+        if "%cache_loc_ptr: !tt.ptr<i32>" in compiled.asm["ttir"]
+        and "arith.muli %cache_loc" in compiled.asm["ttir"]
+    ]
+    assert int32_fused_ttirs
+    for ttir in int32_fused_ttirs:
+        cache_loc_muls = [
+            line for line in ttir.splitlines() if "arith.muli %cache_loc" in line
+        ]
+        assert "arith.extsi %cache_loc" in ttir
+        assert len(cache_loc_muls) == 2
+        assert all(": i64" in line for line in cache_loc_muls)
+
+
 @pytest.mark.parametrize("solution", [None, "triton", "flashinfer"])
 @pytest.mark.parametrize("is_neox", [True, False])
 def test_rope_mla_quantize(
@@ -482,3 +546,182 @@ def test_rope_mla_quantize(
     assert key_fp8.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.5)
     torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.5)
+
+
+def test_fused_mla_entry_points_are_exported():
+    """The fused MLA write is the supported dispatch path for a cross-package
+    caller, so it has to be reachable through the module's export list."""
+    import tokenspeed_kernel.ops.embedding as embedding
+
+    for name in ("apply_rope_mla_set_kv", "supports_fused_mla_kv_write"):
+        assert name in embedding.__all__, name
+        assert hasattr(embedding, name)
+
+
+@pytest.mark.parametrize("solution", ["triton", "cuda"])
+@pytest.mark.parametrize("is_neox", [True, False])
+def test_k_only_rope_matches_a_paired_call(
+    device: str, solution: str, is_neox: bool, require
+) -> None:
+    """Dropping the scratch query must not change what the key becomes."""
+    torch.manual_seed(0)
+    num_tokens, head_size, max_position = 13, 64, 512
+    dtype = torch.bfloat16
+    require("embedding", "rope", solution, dtype, "q")
+
+    inv_freq = 1.0 / (
+        10000.0
+        ** (
+            torch.arange(0, head_size, 2, device=device, dtype=torch.float32)
+            / head_size
+        )
+    )
+    freqs = torch.outer(
+        torch.arange(max_position, device=device, dtype=torch.float32), inv_freq
+    )
+    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
+    positions = torch.randint(max_position, (num_tokens,), device=device)
+    key = torch.randn(num_tokens, head_size, device=device, dtype=dtype)
+
+    paired = key.clone()
+    apply_rope(
+        positions,
+        paired.new_empty(paired.shape),
+        paired,
+        head_size,
+        cos_sin_cache,
+        is_neox=is_neox,
+        solution=solution,
+    )
+    k_only = key.clone()
+    apply_k_rope(
+        positions,
+        k_only,
+        head_size,
+        cos_sin_cache,
+        is_neox=is_neox,
+        solution=solution,
+    )
+    torch.testing.assert_close(k_only, paired, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_vocab_shard_embedding_masks_other_shards(
+    dtype: torch.dtype, index_dtype: torch.dtype, device: str
+) -> None:
+    """One gather reproduces the mask-then-lookup vocabulary-parallel path."""
+    from tokenspeed_kernel.ops.embedding import vocab_shard_embedding
+
+    torch.manual_seed(3)
+    org_start, org_end, padding, added_start, added_end = 500, 1000, 24, 2000, 2016
+    weight = torch.randn(
+        org_end - org_start + padding + added_end - added_start + 8,
+        96,
+        device=device,
+        dtype=dtype,
+    )
+    ids = torch.tensor(
+        [0, 499, 500, 777, 999, 1000, 1999, 2000, 2015, 2016, 5000],
+        device=device,
+        dtype=index_dtype,
+    ).view(1, -1)
+
+    original = (ids >= org_start) & (ids < org_end)
+    added = (ids >= added_start) & (ids < added_end)
+    added_offset = added_start - (org_end - org_start) - padding
+    local = (original | added) * (ids - org_start * original - added_offset * added)
+    expected = torch.nn.functional.embedding(local, weight)
+    expected.masked_fill_(~(original | added).unsqueeze(-1), 0)
+
+    out = vocab_shard_embedding(
+        weight, ids, (org_start, org_end), padding, (added_start, added_end)
+    )
+    assert out.shape == (1, ids.shape[1], 96) and out.dtype == dtype
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert out[0, [0, 1, 5, 6, 9, 10]].eq(0).all()
+    assert vocab_shard_embedding(
+        weight, ids[:, :0], (org_start, org_end), padding, (added_start, added_end)
+    ).shape == (1, 0, 96)
+    with pytest.raises(ValueError):
+        vocab_shard_embedding(
+            weight, ids, (org_start, org_end), padding, (added_start, added_end + 100)
+        )
+    with pytest.raises(ValueError):
+        vocab_shard_embedding(
+            weight, ids[:, ::2], (org_start, org_end), padding, (added_start, added_end)
+        )
+
+
+def _engram_hash_reference(
+    ids, previous, mask, token_map, multipliers, primes, offsets, pad_id
+):
+    """The eager op chain of ``EngramHashState.forward``."""
+    raw = torch.cat((ids.unsqueeze(-1), previous), dim=-1).long()
+    dead = raw == -1
+    dead[..., 0] |= ~mask
+    mapped = token_map[raw.masked_fill(dead, 0)]
+    blocked = dead.long().cumsum(-1) > 0
+    tokens = mapped.masked_fill(blocked, pad_id)
+    products = tokens.unsqueeze(-2) * multipliers
+    rolling, hashes = products[..., 0], []
+    for shift in range(1, 4):
+        rolling = torch.bitwise_xor(rolling, products[..., shift])
+        hashes.append(rolling.unsqueeze(-1) % primes[:, shift - 1])
+    return torch.cat(hashes, dim=-1) + offsets
+
+
+@pytest.mark.parametrize(
+    ("layers", "heads", "tokens"), ((2, 8, 300), (1, 5, 1), (3, 2, 1025))
+)
+def test_engram_hash_matches_the_eager_chain(
+    layers: int, heads: int, tokens: int, device: str
+) -> None:
+    """One launch hashes every token's 2/3/4-gram windows like the op chain."""
+    from tokenspeed_kernel.ops.embedding import engram_hash
+
+    torch.manual_seed(layers * 31 + heads)
+    vocab, compressed = 4096, 1200
+    token_map = torch.randint(0, compressed, (vocab,), device=device)
+    bound = (torch.iinfo(torch.int64).max // vocab) // 2
+    multipliers = torch.randint(0, bound, (layers, 4), device=device) * 2 + 1
+    primes = (
+        torch.tensor(
+            [
+                [
+                    [1201 + 6 * (l * 3 + s) * heads + 6 * h for h in range(heads)]
+                    for s in range(3)
+                ]
+                for l in range(layers)
+            ],
+            device=device,
+        )
+        | 1
+    )
+    offsets = primes.flatten(1).cumsum(-1) - primes.flatten(1)
+    ids = torch.randint(0, vocab, (tokens,), device=device, dtype=torch.int32)
+    previous = torch.randint(-1, vocab, (tokens, 3), device=device)
+    mask = torch.rand(tokens, device=device) > 0.2
+    # Masked-out current ids may lie outside the vocabulary (image placeholders).
+    ids[~mask] = 999_999
+
+    out = engram_hash(
+        ids, previous, mask, token_map, multipliers, primes, offsets, 7, -1
+    )
+
+    expected = _engram_hash_reference(
+        ids, previous, mask, token_map, multipliers, primes, offsets, 7
+    )
+    assert out.shape == (tokens, layers, 3 * heads) and out.dtype == torch.int64
+    assert torch.equal(out, expected)
+    assert engram_hash(
+        ids[:0], previous[:0], mask[:0], token_map, multipliers, primes, offsets, 7, -1
+    ).shape == (0, layers, 3 * heads)
+    with pytest.raises(ValueError, match="shapes disagree"):
+        engram_hash(
+            ids, previous[:, :2], mask, token_map, multipliers, primes, offsets, 7, -1
+        )
+    with pytest.raises(TypeError, match="int64"):
+        engram_hash(
+            ids, previous, mask, token_map.int(), multipliers, primes, offsets, 7, -1
+        )

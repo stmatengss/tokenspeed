@@ -22,31 +22,64 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.attention import (
-    GdnCheckpointLayout,
-    GdnChunkPrefillResult,
-    attn_merge_state,
-    dsa_decode,
-    dsa_decode_topk,
-    dsa_plan,
-    dsa_prefill,
-    dsa_prefill_topk,
-    gdn_chunk_prefill,
-    mha_decode_with_kvcache,
-    mha_extend_with_kvcache,
-    mha_plan,
-    mha_prefill,
-    mla_decode_with_kvcache,
-    mla_prefill,
+from tokenspeed_kernel.ops.activation import (
+    add3,
+    prepare_fp8_linear_activation,
+    silu_and_mul,
+    situ_and_mul,
 )
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
+from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.gemm import (
+    bmm,
+    dsv4_grouped_output_projection,
+    dsv4_grouped_output_projection_plan,
+    dsv4_grouped_output_projection_process_weights,
+    dsv4_grouped_output_projection_warmup,
+    dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
+    fp8_linear,
+    has_flashinfer_cute_dsl_nvfp4_a16,
+    kimi3_latent_projection,
+    kimi3_latent_projection_add3,
+    kimi3_mla_qkv_gate_projection,
+    kimi3_qkvfab_projection,
+    kimi3_router_projection,
+    kimi3_shared_down_projection,
+    kimi3_shared_situ_projection,
+    mm,
+    prepare_fp8_linear,
+    prepare_nvfp4_a16_weights,
+    prepare_trtllm_cutedsl_fp8_linear,
+    warmup_prepared_fp8_linears,
+)
+from tokenspeed_kernel.ops.layernorm import (
+    gated_residual_combine_norm,
+    grouped_gemma_rmsnorm,
+)
+from tokenspeed_kernel.ops.moe import (
+    moe_apply,
+    moe_plan,
+    moe_process_weights,
+    moe_topk,
+    native_latent_moe_available,
+)
 from tokenspeed_kernel.ops.quantization import (
+    fp8_quantize_dequantize,
     quantize_fp8,
     quantize_fp8_with_scale,
     quantize_mxfp4,
     quantize_mxfp8,
     quantize_nvfp4,
+)
+from tokenspeed_kernel.ops.residual import (
+    attn_res_fwd,
+    attn_res_fwd_available,
+    gated_residual_combine,
+    gated_residual_mix,
+    mhc_fused_hc,
+    mhc_mixes,
+    mhc_post,
+    mhc_pre,
 )
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.transform import hadamard_transform
@@ -56,28 +89,54 @@ __all__ = [
     # exceptions
     "NoKernelFoundError",
     # gemm
+    "bmm",
+    "dsv4_grouped_output_projection",
+    "dsv4_grouped_output_projection_plan",
+    "dsv4_grouped_output_projection_process_weights",
+    "dsv4_grouped_output_projection_warmup",
+    "dsv4_grouped_output_projection_warmup_model",
+    "dsv4_linear_fp32",
+    "fp8_linear",
+    "has_flashinfer_cute_dsl_nvfp4_a16",
+    "kimi3_latent_projection",
+    "kimi3_mla_qkv_gate_projection",
+    "kimi3_latent_projection_add3",
+    "kimi3_qkvfab_projection",
+    "kimi3_router_projection",
+    "kimi3_shared_down_projection",
+    "kimi3_shared_situ_projection",
     "mm",
+    "prepare_fp8_linear",
+    "prepare_trtllm_cutedsl_fp8_linear",
+    "prepare_nvfp4_a16_weights",
+    "warmup_prepared_fp8_linears",
+    # residual
+    "attn_res_fwd",
+    "attn_res_fwd_available",
+    "gated_residual_combine",
+    "gated_residual_combine_norm",
+    "gated_residual_mix",
+    "mhc_fused_hc",
+    "mhc_mixes",
+    "mhc_post",
+    "mhc_pre",
+    # layernorm
+    "grouped_gemma_rmsnorm",
     # attention
-    "mha_plan",
-    "mha_prefill",
-    "mha_extend_with_kvcache",
-    "mha_decode_with_kvcache",
-    "mla_prefill",
-    "mla_decode_with_kvcache",
-    "dsa_prefill",
-    "dsa_decode",
-    "dsa_prefill_topk",
-    "dsa_decode_topk",
-    "dsa_plan",
     "attn_merge_state",
-    "gdn_chunk_prefill",
-    "GdnCheckpointLayout",
-    "GdnChunkPrefillResult",
+    # activation
+    "add3",
+    "prepare_fp8_linear_activation",
+    "silu_and_mul",
+    "situ_and_mul",
     # moe
+    "native_latent_moe_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
+    "moe_topk",
     # quantization
+    "fp8_quantize_dequantize",
     "quantize_fp8",
     "quantize_fp8_with_scale",
     "quantize_mxfp8",

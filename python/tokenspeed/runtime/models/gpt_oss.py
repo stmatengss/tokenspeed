@@ -51,7 +51,10 @@ from tokenspeed.runtime.layers.moe import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -66,7 +69,6 @@ from tokenspeed.runtime.models.utils import (
 )
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -108,7 +110,7 @@ class TinyGemmLinear(ReplicatedLinear):
             and x.dtype == torch.bfloat16
         ):
             out = x.new_empty((x.shape[0], self.output_size))
-            tinygemm_bf16(x, self.weight, out, self.bias, use_pdl=pdl_enabled())
+            tinygemm_bf16(x, self.weight, out, self.bias)
             return out, None
 
         return super().forward(x)
@@ -211,7 +213,6 @@ class GptOssAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
-            group_id=layer_type,
         )
         self.layer_id = layer_id
 
@@ -220,11 +221,10 @@ class GptOssAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ):
 
         if hidden_states.shape[0] == 0:
-            return hidden_states, ctx, out_cache_loc, None
+            return hidden_states, ctx, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -235,9 +235,10 @@ class GptOssAttention(nn.Module):
             fused_kv_arg = create_fused_set_kv_buffer_arg(
                 value=v_3d,
                 layer=self.attn,
-                # Flat path: prewrite at this layer's group locations.
-                out_cache_loc=ctx.attn_backend.select_out_cache_loc(
-                    self.attn, out_cache_loc, ctx.forward_mode
+                # Prewrite at this layer's group locations, fetched from the
+                # backend (the one owner of KV write slots).
+                out_cache_loc=ctx.attn_backend.write_locations(
+                    self.attn, ctx.forward_mode
                 ),
                 token_to_kv_pool=ctx.token_to_kv_pool,
             )
@@ -251,17 +252,16 @@ class GptOssAttention(nn.Module):
                 k,
                 fused_set_kv_buffer_arg=fused_kv_arg,
                 output_q_rope=q_rope,
-                enable_pdl=pdl_enabled(),
             )
             inner_state = q_rope, None, None
         else:
             q, k = self.rotary_emb(positions, q, k)
             inner_state = q, k, v
-        return None, ctx, out_cache_loc, inner_state
+        return None, ctx, inner_state
 
     def forward_core(self, intermediate_state):
 
-        hidden_states, ctx, out_cache_loc, inner_state = intermediate_state
+        hidden_states, ctx, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
         # Cache was already written by the fused RoPE+KV kernel iff we took that path,
@@ -271,7 +271,6 @@ class GptOssAttention(nn.Module):
             *inner_state,
             save_kv_cache=save_kv_cache,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             sinks=self.sinks,
         )
         output, _ = self.o_proj(attn_output)
@@ -282,26 +281,14 @@ class GptOssAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
 
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         return self.forward_core(s)
-
-
-def routing_function(hidden_states, gating_output, topk, renormalize):
-
-    experts = torch.topk(gating_output, k=topk, dim=-1, sorted=True)
-    expert_weights = torch.nn.functional.softmax(
-        experts.values.to(torch.float32), dim=1
-    )
-    expert_indices = experts.indices.to(torch.int32)
-    return expert_weights, expert_indices
 
 
 class GptOssSparseMoeBlock(nn.Module):
@@ -369,9 +356,12 @@ class GptOssSparseMoeBlock(nn.Module):
             params_dtype=config.dtype,
         )
 
+        # Declare model semantics only; the kernel package selects the
+        # platform- and shape-specific softmax top-k implementation.
         self.topk = TopK(
             top_k=top_k,
-            custom_routing_function=routing_function,
+            renormalize=True,
+            custom_routing_function=None,
             output_format=self.experts.topk_output_format,
             topk_indices_dtype=(
                 torch.int64 if get_all2all_backend().is_deepep() else torch.int32
@@ -438,9 +428,7 @@ class GptOssConfig(PretrainedConfig):
 
 
 def get_attention_sliding_window_size(config):
-    # Aligned with HF's implementation, using sliding window inclusive with the last token
-    # TokenSpeed assumes exclusive
-    return config.sliding_window - 1
+    return hf_sliding_window_to_window_left(config.sliding_window)
 
 
 class GptOssDecoderLayer(CompiledMoEDecoderLayer):
@@ -725,17 +713,18 @@ class GptOssForCausalLM(BaseCausalLM):
         }
 
     def _load_mxfp4_weights(self, weights, weight_name_mapping: dict):
-
-        mxfp4_weights = []
+        # Stream experts; buffering them pins most of the checkpoint on the GPU.
         normal_weights = []
 
-        for name, weight in weights:
-            if ".experts" in name:
-                mxfp4_weights.append((name, weight))
-            else:
-                normal_weights.append((name, weight))
+        def expert_weights():
+            for name, weight in weights:
+                if ".experts" in name:
+                    yield name, weight
+                else:
+                    normal_weights.append((name, weight))
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        # Draining the generator is what fills ``normal_weights``.
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(expert_weights())
         self._load_normal_weights(
             normal_weights,
             weight_name_mapping=weight_name_mapping,
@@ -781,27 +770,23 @@ class GptOssForCausalLM(BaseCausalLM):
                 )
                 param.data[slices].copy_(narrow_weight[slices])
 
-        # Detect AMD-Quark per-expert checkpoints (e.g.
-        # ``amd/gpt-oss-120b-w-mxfp4-a-fp8``). These store one set of tensors
-        # per expert (``...experts.{e}.gate_up_proj.{weight,...}``) plus a
-        # scalar ``input_scale`` for static FP8 activation quantization.
-        if any(
-            re.search(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.", n)
-            for n, _ in weights
-        ):
-            return self._load_mxfp4_per_expert_weights(
-                weights,
-                params_dict=params_dict,
-                moe_tp_rank_start=moe_tp_rank_start,
-                moe_tp_rank_end=moe_tp_rank_end,
-                moe_ep_rank_start=moe_ep_rank_start,
-                moe_ep_rank_end=moe_ep_rank_end,
-                moe_tp_rank=moe_tp_rank,
-                copy_into_param=_copy_into_param,
-                mxfp4_block=mxfp4_block,
-            )
+        # Route per name: probing would consume the stream and drop a layout.
+        per_expert_re = re.compile(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.")
 
         for name, weight in weights:
+            if per_expert_re.search(name):
+                loaded_params |= self._load_mxfp4_per_expert_weights(
+                    [(name, weight)],
+                    params_dict=params_dict,
+                    moe_tp_rank_start=moe_tp_rank_start,
+                    moe_tp_rank_end=moe_tp_rank_end,
+                    moe_ep_rank_start=moe_ep_rank_start,
+                    moe_ep_rank_end=moe_ep_rank_end,
+                    moe_tp_rank=moe_tp_rank,
+                    copy_into_param=_copy_into_param,
+                    mxfp4_block=mxfp4_block,
+                )
+                continue
             weight = _WeightCreator.maybe_materialize(weight)
 
             if "gate_up_proj_blocks" in name:

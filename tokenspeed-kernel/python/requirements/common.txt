@@ -1,8 +1,0 @@
-apache-tvm-ffi==0.1.12
-numpy
-packaging
-PyYAML>=6.0
-tokenspeed-proton>=3.8.10.post20260709
-tokenspeed-triton>=3.8.10.post20260709
-wheel
-psutil

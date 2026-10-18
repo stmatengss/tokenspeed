@@ -19,41 +19,29 @@
 # SOFTWARE.
 
 
-import numpy as np
-import torch
 from tokenspeed_scheduler import PD, Forward
 
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.cache_protocol import build_cache_block_manifest
 from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
-from tokenspeed.runtime.pd.utils import (
-    TransferBackend,
-    poll_and_all_reduce,
-)
+from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 
 logger = get_colorful_logger(__name__)
 
 
 class DisaggDecodeExecutor:
-    def __init__(
-        self, backend: TransferBackend, args, kv_args, gloo_group, page_size: int
-    ):
-        self.transfer_backend = backend
-        self.bootstrap_port = args.bootstrap_port
-        self.page_size = page_size
-        self._dispatcher = TypeBasedDispatcher(
-            [
-                (Forward.FlatForwardOp, self._prefill),
-            ]
-        )
-        self.receivers: dict[int, MooncakeKVReceiver] = {}
+    def __init__(self, args, kv_args, gloo_group):
+        self.cache_layout = kv_args.cache_layout
+        self.receivers: dict[str, MooncakeKVReceiver] = {}
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
-        self._request_pool_indices: dict[str, int] = {}
+        self._admissions: dict[str, tuple[int, int]] = {}
+        self._remote_cache_slots: dict[str, int] = {}
+        self._remote_cached_tokens: dict[str, int] = {}
         self._remote_spec_candidate_ids: dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
@@ -63,83 +51,61 @@ class DisaggDecodeExecutor:
             bootstrap_room=info.bootstrap_room,
         )
 
-    @staticmethod
-    def _mamba_indices(op, index: int):
-        indices = getattr(op, "mamba_pool_indices", None)
-        if indices is None or index >= len(indices):
-            return None
-        slot = int(indices[index])
-        if slot < 0:
-            return None
-        return np.array([slot], dtype=np.int64)
-
-    @staticmethod
-    def _mamba_checkpoint_indices(op, index: int):
-        indices = getattr(op, "mamba_checkpoint_dst_indices", None)
-        if indices is None or index >= len(indices):
-            return None
-        slot = int(indices[index])
-        if slot < 0:
-            return None
-        return np.array([slot], dtype=np.int64)
-
-    @classmethod
-    def _mamba_transfer_indices(cls, op, index: int):
-        working = cls._mamba_indices(op, index)
-        if working is None:
-            return None
-        checkpoint = cls._mamba_checkpoint_indices(op, index)
-        if checkpoint is None:
-            return working
-
-        slots = [int(x) for x in working.tolist()]
-        for slot in checkpoint.tolist():
-            slot = int(slot)
-            if slot >= 0 and slot not in slots:
-                slots.append(slot)
-        return np.array(slots, dtype=np.int64)
-
-    def _prefill(self, op):
-        logger.debug(
-            "[decode][_prefill] op: request_ids=%s occupied_pages=%s "
-            "begins=%s sizes=%s request_pool_indices=%s extend_prefix_lens=%s",
-            list(op.request_ids),
-            [list(p) for p in op.occupied_pages],
-            list(op.begins),
-            list(op.sizes),
-            list(op.request_pool_indices),
-            list(op.extend_prefix_lens),
-        )
-
-        for i, request_id in enumerate(op.request_ids):
-            if request_id not in self.receivers:
-                # Request failed and its receiver was cleaned up in generate_events;
-                # the scheduler may still dispatch its forward op one last time.
+    def _cache_prefill(self, op) -> None:
+        pending = []
+        num_extends = op.num_extends()
+        if num_extends != len(op.request_ids):
+            raise RuntimeError(
+                "CachePD Decode admission does not support mixed batches"
+            )
+        for index, request_id in enumerate(op.request_ids[:num_extends]):
+            receiver = self.receivers.get(request_id)
+            if receiver is None:
                 continue
-            extend_prefix_len = op.extend_prefix_lens[i]
-            kv_indices = np.array(
-                op.occupied_pages[i][extend_prefix_len // self.page_size :],
-                dtype=np.int64,
+            prefix_len = int(op.extend_prefix_lens[index])
+            block_manifest = build_cache_block_manifest(
+                op,
+                layout=self.cache_layout,
+                request_row=index,
+                prefix_len=prefix_len,
+                prompt_len=int(op.prefill_lengths[index]),
             )
-            aux_index = op.request_pool_indices[i]
-            mamba_indices = self._mamba_transfer_indices(op, i)
-            self._request_pool_indices[request_id] = aux_index
-            self.receivers[request_id].prefill(
-                kv_indices,
-                aux_index,
-                extend_prefix_len,
-                None,  # mla_l1_5_args
-                mamba_indices,
+            pending.append(
+                (
+                    request_id,
+                    receiver,
+                    op.request_pool_indices[index],
+                    block_manifest,
+                )
             )
 
-    def register(self, request_id: str, bootstrap_info: BootstrapInfo):
+        # Validate every row before publishing any destination manifest. A later
+        # invalid row must not leave an earlier Prefill sender waiting forever.
+        for request_id, receiver, request_pool_index, block_manifest in pending:
+            self._admissions[request_id] = (
+                request_pool_index,
+                block_manifest.prefix_len,
+            )
+            receiver.prefill(block_manifest=block_manifest)
+
+    def register(
+        self,
+        request_id: str,
+        bootstrap_info: BootstrapInfo,
+    ):
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 
     def execute(self, op):
-        if not isinstance(op, Forward.FlatForwardOp):
-            raise TypeError(f"Expected FlatForwardOp, got {type(op).__name__}.")
-        self._dispatcher(op)
+        """Pull this admitted prompt's KV from the prefill node.
+
+        The D-role half of the plan's remote streams, submitted on the
+        forward thread like any forward; completion arrives as a transfer
+        event, not from here.
+        """
+        if not isinstance(op, Forward.Batch):
+            raise TypeError(f"Expected Batch, got {type(op).__name__}.")
+        self._cache_prefill(op)
 
     def generate_events(self):
         if not self.receivers:
@@ -154,13 +120,13 @@ class DisaggDecodeExecutor:
                 and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
-                    "[decode][generate_events] rid=%s -> BootstrappedEvent", req_id
+                    f"[decode][generate_events] rid={req_id!s} -> BootstrappedEvent",
                 )
                 events.append(PD.BootstrappedEvent(req_id))
                 self._local_states[req_id] = TransferPoll.Bootstrapped
             elif poll == TransferPoll.Failed:
                 logger.warning(
-                    "[decode][generate_events] rid=%s -> FailedEvent", req_id
+                    f"[decode][generate_events] rid={req_id!s} -> FailedEvent",
                 )
                 events.append(PD.FailedEvent(req_id))
                 # Drop the failed receiver so it is not polled again. Without this
@@ -177,52 +143,38 @@ class DisaggDecodeExecutor:
                 # which is the key used in MooncakeKVReceiver.
                 self._local_states[req_id] = TransferPoll.Success
                 bootstrap_room = self.receivers[req_id].bootstrap_room
-                bootstrap_token, spec_candidate_ids = (
+                bootstrap_token, spec_candidate_ids, cached_tokens = (
                     self.kv_manager.pop_prefill_metadata(bootstrap_room)
                 )
-                receiver = self.receivers[req_id]
-                if (
-                    spec_candidate_ids is not None
-                    and req_id in self._request_pool_indices
-                    and getattr(
-                        receiver,
-                        "supports_remote_spec_candidates",
-                        True,
-                    )
-                ):
+                request_pool_index, local_cached_tokens = self._admissions[req_id]
+                self._remote_cache_slots[req_id] = request_pool_index
+                self._remote_cached_tokens[req_id] = max(
+                    local_cached_tokens, cached_tokens
+                )
+                if spec_candidate_ids is not None:
                     self._remote_spec_candidate_ids[req_id] = (
-                        self._request_pool_indices[req_id],
+                        request_pool_index,
                         spec_candidate_ids,
                     )
                 logger.debug(
-                    "[decode][generate_events] rid=%s -> RemotePrefillDoneEvent bootstrap_token=%s",
-                    req_id,
-                    bootstrap_token,
+                    f"[decode][generate_events] rid={req_id!s} -> "
+                    f"RemotePrefillDoneEvent bootstrap_token={bootstrap_token!s}",
                 )
-                # Use RemotePrefillDoneEvent to carry the bootstrap_token to event_loop;
-                # the C++ FSM will extend it into the TokenContainer via
-                # fsm::RemotePrefillDoneEvent::operator()(Prefilling&&).
-                event = PD.RemotePrefillDoneEvent(
-                    req_id, bootstrap_token if bootstrap_token != -1 else -1
-                )
-                events.append(event)
+                # The C++ FSM extends the token into the TokenContainer as it
+                # applies this event (RemotePrefilling -> PrefillDone).
+                events.append(PD.RemotePrefillDoneEvent(req_id, bootstrap_token))
                 to_remove.append(req_id)
             else:
                 pass
         for req_id in to_remove:
             # Best-effort cleanup mirroring prefill side; request_id is stable
             # so without explicit pop these dicts would grow unbounded across
-            # failed requests. NOTE: _remote_spec_candidate_ids must NOT be
-            # popped here — its consumer pop_remote_spec_candidate_ids runs
-            # later inside event_loop._process_kv_transfer_events, after we return.
-            # That dict is small (one tuple per Success request, between
-            # generate_events emitting RemotePrefillDoneEvent and event_loop
-            # consuming it) and is naturally drained by the pop path; an
-            # eager pop here drops the spec candidates on the floor and the
-            # next decode forward reads uninitialized future_input_map tail,
-            # causing CUDA illegal memory access on embedding lookup.
-            self.receivers.pop(req_id, None)
-            self._request_pool_indices.pop(req_id, None)
+            # failed requests. The completed result survives until the hooks
+            # consume the event after this returns.
+            receiver = self.receivers.pop(req_id, None)
+            if receiver is not None:
+                receiver.clear()
+            self._admissions.pop(req_id, None)
             self._local_states.pop(req_id, None)
 
         return events
@@ -230,27 +182,8 @@ class DisaggDecodeExecutor:
     def pop_remote_spec_candidate_ids(self, request_id: str):
         return self._remote_spec_candidate_ids.pop(request_id, None)
 
-    def reset_valid_cache_length(
-        self, forward_op, runtime_states, execution_stream, device
-    ):
-        num_extends = forward_op.num_extends()
-        extend_request_pool_indices = torch.tensor(
-            forward_op.request_pool_indices[:num_extends],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        ).to(device, non_blocking=True)
-        extend_prefix_lens = torch.tensor(
-            forward_op.prefill_lengths[:num_extends],
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        ).to(device, non_blocking=True)
-        # HostTodevice segment ends
+    def pop_remote_cached_tokens(self, request_id: str) -> int:
+        return self._remote_cached_tokens.pop(request_id)
 
-        execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(execution_stream):
-            if num_extends > 0:
-                runtime_states.reset_states(
-                    extend_request_pool_indices, extend_prefix_lens
-                )
+    def pop_remote_cache_slot(self, request_id: str) -> int | None:
+        return self._remote_cache_slots.pop(request_id, None)

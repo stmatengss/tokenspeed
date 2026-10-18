@@ -22,13 +22,23 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.embedding import (
+        FusedMLASetKVBufferArg,
+        FusedSetKVBufferArg,
+    )
 
 
 def _next_power_of_2(n: int) -> int:
@@ -78,7 +88,6 @@ def _rope_apply_kernel(
     HAS_FUSED_KV: tl.constexpr,
     IS_NEOX: tl.constexpr,
     POSITION_INT64: tl.constexpr,
-    CACHE_LOC_INT64: tl.constexpr,
 ):
     """Apply rotary embedding to one (token, head) pair in-place.
 
@@ -167,10 +176,8 @@ def _rope_apply_kernel(
         tl.store(out_ptr + head_offs, tail, mask=tail_mask)
 
     if HAS_FUSED_KV and not is_query:
-        if CACHE_LOC_INT64:
-            cache_loc = tl.load(cache_loc_ptr + token_idx).to(tl.int64)
-        else:
-            cache_loc = tl.load(cache_loc_ptr + token_idx).to(tl.int32)
+        # Slot IDs fit in int32, but slot * row stride may not.
+        cache_loc = tl.load(cache_loc_ptr + token_idx).to(tl.int64)
         head_mask = head_offs < head_size
         k_value = tl.load(out_ptr + head_offs, mask=head_mask, other=0.0)
         v_value = tl.load(
@@ -200,6 +207,15 @@ def _rope_apply_kernel(
 
 
 @triton.jit
+def _sanitize_for_store(x, MAX_FINITE: tl.constexpr):
+    """NaN -> 0, +-inf -> +-MAX_FINITE, matching set_mla_kv_buffer_triton."""
+    x = x.to(tl.float32)
+    x = tl.where(x != x, 0.0, x)
+    x = tl.where(x == float("inf"), MAX_FINITE, x)
+    return tl.where(x == -float("inf"), -MAX_FINITE, x)
+
+
+@triton.jit
 def _mla_rope_set_kv_buffer_kernel(
     q_rope_ptr,
     k_nope_ptr,
@@ -209,6 +225,9 @@ def _mla_rope_set_kv_buffer_kernel(
     loc_ptr,
     cos_sin_cache_ptr,
     positions_ptr,
+    q_nope_ptr,
+    num_tokens,
+    loc_stride: tl.constexpr,
     q_rope_stride_t: tl.constexpr,
     q_rope_stride_h: tl.constexpr,
     k_nope_stride_t: tl.constexpr,
@@ -217,6 +236,8 @@ def _mla_rope_set_kv_buffer_kernel(
     q_out_rope_stride_h: tl.constexpr,
     kv_buffer_stride_t: tl.constexpr,
     cos_sin_stride_p: tl.constexpr,
+    q_nope_stride_t: tl.constexpr,
+    q_nope_stride_h: tl.constexpr,
     num_q_heads: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
@@ -224,124 +245,248 @@ def _mla_rope_set_kv_buffer_kernel(
     HALF_BLOCK: tl.constexpr,
     IS_NEOX: tl.constexpr,
     POSITION_INT64: tl.constexpr,
+    ASSEMBLE_FULL_QUERY: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INDEX_INT64: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    """One launch for the MLA query assembly and the latent KV write.
+
+    Programs with ``head_idx < num_q_heads`` build one query head; the extra
+    program per token writes that token's latent row into the cache. Stores
+    convert, so an FP8 destination needs no pre-cast. ``APPLY_ROPE=False``
+    serves NoPE models, where the same halves are copied without rotation.
+    ``SANITIZE`` folds the split path's NaN/inf clamp into the latent store --
+    the query is never sanitized, matching ``set_mla_kv_buffer_triton``.
+    """
+    block_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     half = rope_dim // 2
     half_offsets = tl.arange(0, HALF_BLOCK)
     half_mask = half_offsets < half
-
-    if POSITION_INT64:
-        pos = tl.load(positions_ptr + token_idx).to(tl.int64)
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < nope_dim
+    if IS_NEOX:
+        pair_lo = half_offsets
+        pair_hi = half + half_offsets
     else:
-        pos = tl.load(positions_ptr + token_idx).to(tl.int32)
+        pair_lo = half_offsets * 2
+        pair_hi = half_offsets * 2 + 1
 
-    cos = tl.load(
-        cos_sin_cache_ptr + pos * cos_sin_stride_p + half_offsets,
-        mask=half_mask,
-        other=0.0,
-    ).to(tl.float32)
-    sin = tl.load(
-        cos_sin_cache_ptr + pos * cos_sin_stride_p + half + half_offsets,
-        mask=half_mask,
-        other=0.0,
-    ).to(tl.float32)
+    # Wait only after the address-independent index math, so the producer's
+    # tail overlaps work that touches no global memory.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
-    if head_idx < num_q_heads:
-        q_base = q_rope_ptr + token_idx * q_rope_stride_t + head_idx * q_rope_stride_h
-        q_out_base = (
-            q_out_rope_ptr
-            + token_idx * q_out_rope_stride_t
-            + head_idx * q_out_rope_stride_h
-        )
-        if IS_NEOX:
-            q1_offsets = half_offsets
-            q2_offsets = half + half_offsets
+    # One program covers BLOCK_N tokens. The token grid dimension is what sets
+    # the CTA count, and PDL costs a fixed amount per CTA, so widening this is
+    # what stops the wait from outgrowing the overlap it buys.
+    for tok in tl.static_range(BLOCK_N):
+        # The query destination spans nope+rope per head, so token_idx times
+        # its row stride passes 2**31 at token counts a public caller can
+        # reach, and the wrap is an out-of-bounds write. Widen only when the
+        # shape can actually reach it -- the wider arithmetic costs up to 9%
+        # at large token counts.
+        if INDEX_INT64:
+            token_idx = (block_idx * BLOCK_N + tok).to(tl.int64)
         else:
-            q1_offsets = half_offsets * 2
-            q2_offsets = half_offsets * 2 + 1
+            token_idx = block_idx * BLOCK_N + tok
+        if token_idx < num_tokens:
+            if APPLY_ROPE:
+                if POSITION_INT64:
+                    pos = tl.load(positions_ptr + token_idx).to(tl.int64)
+                else:
+                    pos = tl.load(positions_ptr + token_idx).to(tl.int32)
+                cos = tl.load(
+                    cos_sin_cache_ptr + pos * cos_sin_stride_p + half_offsets,
+                    mask=half_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                sin = tl.load(
+                    cos_sin_cache_ptr + pos * cos_sin_stride_p + half + half_offsets,
+                    mask=half_mask,
+                    other=0.0,
+                ).to(tl.float32)
 
-        q1 = tl.load(q_base + q1_offsets, mask=half_mask, other=0.0)
-        q2 = tl.load(q_base + q2_offsets, mask=half_mask, other=0.0)
-        q1_f = q1.to(tl.float32)
-        q2_f = q2.to(tl.float32)
-        q_out_1 = q1_f * cos - q2_f * sin
-        q_out_2 = q2_f * cos + q1_f * sin
-        tl.store(q_out_base + q1_offsets, q_out_1, mask=half_mask)
-        tl.store(q_out_base + q2_offsets, q_out_2, mask=half_mask)
-    else:
-        loc = tl.load(loc_ptr + token_idx).to(tl.int64)
-        kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
+            if head_idx < num_q_heads:
+                q_base = (
+                    q_rope_ptr
+                    + token_idx * q_rope_stride_t
+                    + head_idx * q_rope_stride_h
+                )
+                q_out_base = (
+                    q_out_rope_ptr
+                    + token_idx * q_out_rope_stride_t
+                    + head_idx * q_out_rope_stride_h
+                )
+                if ASSEMBLE_FULL_QUERY:
+                    q_nope = tl.load(
+                        q_nope_ptr
+                        + token_idx * q_nope_stride_t
+                        + head_idx * q_nope_stride_h
+                        + nope_offsets,
+                        mask=nope_mask,
+                        other=0.0,
+                    )
+                    tl.store(q_out_base + nope_offsets, q_nope, mask=nope_mask)
+                    q_out_base = q_out_base + nope_dim
 
-        nope_offsets = tl.arange(0, NOPE_BLOCK)
-        nope_mask = nope_offsets < nope_dim
-        k_nope = tl.load(
-            k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
-            mask=nope_mask,
-            other=0.0,
-        )
-        tl.store(kv_base + nope_offsets, k_nope, mask=nope_mask)
+                q1 = tl.load(q_base + pair_lo, mask=half_mask, other=0.0)
+                q2 = tl.load(q_base + pair_hi, mask=half_mask, other=0.0)
+                if APPLY_ROPE:
+                    q1_f = q1.to(tl.float32)
+                    q2_f = q2.to(tl.float32)
+                    tl.store(
+                        q_out_base + pair_lo, q1_f * cos - q2_f * sin, mask=half_mask
+                    )
+                    tl.store(
+                        q_out_base + pair_hi, q2_f * cos + q1_f * sin, mask=half_mask
+                    )
+                else:
+                    tl.store(q_out_base + pair_lo, q1, mask=half_mask)
+                    tl.store(q_out_base + pair_hi, q2, mask=half_mask)
+            else:
+                loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
+                kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
+                k_nope = tl.load(
+                    k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
+                    mask=nope_mask,
+                    other=0.0,
+                )
+                if SANITIZE:
+                    k_nope = _sanitize_for_store(k_nope, MAX_FINITE)
+                tl.store(kv_base + nope_offsets, k_nope, mask=nope_mask)
 
-        k_base = k_rope_ptr + token_idx * k_rope_stride_t
-        if IS_NEOX:
-            k1_offsets = half_offsets
-            k2_offsets = half + half_offsets
-        else:
-            k1_offsets = half_offsets * 2
-            k2_offsets = half_offsets * 2 + 1
+                k_base = k_rope_ptr + token_idx * k_rope_stride_t
+                k1 = tl.load(k_base + pair_lo, mask=half_mask, other=0.0)
+                k2 = tl.load(k_base + pair_hi, mask=half_mask, other=0.0)
+                if APPLY_ROPE:
+                    k1_f = k1.to(tl.float32)
+                    k2_f = k2.to(tl.float32)
+                    k1_out = k1_f * cos - k2_f * sin
+                    k2_out = k2_f * cos + k1_f * sin
+                else:
+                    k1_out = k1
+                    k2_out = k2
+                if SANITIZE:
+                    # After the rotation: it mixes the halves, so a NaN cleared
+                    # on input returns through its partner, and inf becomes one.
+                    k1_out = _sanitize_for_store(k1_out, MAX_FINITE)
+                    k2_out = _sanitize_for_store(k2_out, MAX_FINITE)
+                tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_mask)
+                tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_mask)
 
-        k1 = tl.load(k_base + k1_offsets, mask=half_mask, other=0.0)
-        k2 = tl.load(k_base + k2_offsets, mask=half_mask, other=0.0)
-        k1_f = k1.to(tl.float32)
-        k2_f = k2.to(tl.float32)
-        k_out_1 = k1_f * cos - k2_f * sin
-        k_out_2 = k2_f * cos + k1_f * sin
-        tl.store(kv_base + nope_dim + k1_offsets, k_out_1, mask=half_mask)
-        tl.store(kv_base + nope_dim + k2_offsets, k_out_2, mask=half_mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def select_mla_kv_block_n(num_tokens: int, num_q_heads: int) -> int:
+    """Tokens per program for the fused MLA write.
+
+    PDL's cost is a fixed amount per CTA (measured ~0.57us per 1000 CTAs on
+    B200) while the overlap it buys is roughly constant, so the grid has to
+    stay near the point where the two meet. Capped at 6: past that the wider
+    per-program footprint costs more than the CTA reduction returns.
+    """
+    ctas_per_token = num_q_heads + 1
+    return max(1, min(6, -(-num_tokens * ctas_per_token // 1100)))
 
 
 def apply_rope_mla_set_kv_buffer_triton(
     positions: torch.Tensor,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
     is_neox: bool,
-    fused_mla_set_kv_buffer_arg,
+    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg,
     q_rope_out: torch.Tensor | None,
+    enable_pdl: bool = False,
 ) -> None:
-    """Apply MLA RoPE while writing Q rope and dense MLA KV cache outputs."""
+    """Apply MLA RoPE and write the query and KV cache with store conversion.
+
+    A ``cos_sin_cache`` of ``None`` selects the NoPE form: the same halves are
+    assembled without rotation, which is what a model with no rotary embedding
+    needs.
+
+    Contract the caller owns, unchecked here because the decode scheduler
+    already guarantees it: ``fused_mla_set_kv_buffer_arg.cache_loc`` holds one
+    write destination per token and every entry is in range and unique for
+    the duration of this call. A duplicate tears the row between whichever
+    programs race for it; an out-of-range entry writes outside the pool. The
+    split path this replaces relies on the same guarantee. Every tensor's
+    last dimension must be contiguous (stride 1) -- true for a fresh
+    allocation and for the ``Q[..., a:b]`` / ``K[..., a:b]`` slices every
+    caller in this tree passes.
+    """
     q_rope_out = q_rope if q_rope_out is None else q_rope_out
     k_nope = fused_mla_set_kv_buffer_arg.k_nope
     kv_buffer = fused_mla_set_kv_buffer_arg.kv_buffer
     loc = fused_mla_set_kv_buffer_arg.cache_loc
+    q_nope = fused_mla_set_kv_buffer_arg.q_nope
 
     num_tokens = q_rope.shape[0]
     if num_tokens == 0:
         return
 
+    nope_dim = k_nope.shape[2]
     assert q_rope.ndim == 3
     assert k_nope.ndim == 3 and k_nope.shape[1] == 1
     assert k_rope.ndim == 3 and k_rope.shape[1] == 1
-    assert q_rope_out.shape == q_rope.shape
     assert kv_buffer.ndim == 2
     assert loc.numel() == num_tokens
     assert positions.numel() == num_tokens
-    assert q_rope.dtype == k_nope.dtype == k_rope.dtype == q_rope_out.dtype
-    assert kv_buffer.dtype == q_rope.dtype
+    assert q_rope.dtype == k_nope.dtype == k_rope.dtype
+    if q_nope is None:
+        assert q_rope_out.shape == q_rope.shape
+    else:
+        assert q_nope.shape[:2] == q_rope.shape[:2]
+        assert q_nope.shape[2] == nope_dim
+        assert q_nope.dtype == q_rope.dtype
+        assert q_rope_out.shape[:2] == q_rope.shape[:2]
+        assert q_rope_out.shape[2] == nope_dim + q_rope.shape[2]
 
     num_q_heads = q_rope.shape[1]
     rope_dim = q_rope.shape[2]
-    nope_dim = k_nope.shape[2]
     assert k_rope.shape == (num_tokens, 1, rope_dim)
     assert kv_buffer.shape[1] == nope_dim + rope_dim
     assert rope_dim % 2 == 0
-    assert cos_sin_cache.shape[-1] == rope_dim
     assert loc.dtype in (torch.int32, torch.int64)
-    assert positions.dtype in (torch.int32, torch.int64)
+    # Spec-decode passes one draft step's column of a per-step table.
+    assert loc.ndim == 1
+    apply_rope = cos_sin_cache is not None
+    if apply_rope:
+        assert cos_sin_cache.shape[-1] == rope_dim
+        assert positions.dtype in (torch.int32, torch.int64)
+        assert positions.ndim == 1 and positions.stride(-1) == 1
+
+    # Every token-indexed term the kernel forms, so the widening turns on
+    # before any of them can wrap rather than only for the largest.
+    max_token_offset = num_tokens * max(
+        q_rope_out.stride(0),
+        q_rope.stride(0),
+        k_nope.stride(0),
+        k_rope.stride(0),
+        0 if q_nope is None else q_nope.stride(0),
+    )
+    index_int64 = max_token_offset >= 2**31
+
+    # Bound both source and destination: a bf16-only bound would overflow back
+    # to a non-finite fp8 encoding on store. As set_mla_kv_buffer_triton does.
+    sanitize = fused_mla_set_kv_buffer_arg.sanitize
+    float_maxes = [
+        torch.finfo(t.dtype).max
+        for t in (k_nope, kv_buffer)
+        if t.dtype.is_floating_point
+    ]
+    max_finite = min(float_maxes) if float_maxes else float("inf")
 
     half_block = max(_next_power_of_2(rope_dim // 2), 16)
     nope_block = max(_next_power_of_2(nope_dim), 16)
-    grid = (num_tokens, num_q_heads + 1)
+    block_n = select_mla_kv_block_n(num_tokens, num_q_heads)
+    grid = (triton.cdiv(num_tokens, block_n), num_q_heads + 1)
     _mla_rope_set_kv_buffer_kernel[grid](
         q_rope,
         k_nope,
@@ -351,6 +496,9 @@ def apply_rope_mla_set_kv_buffer_triton(
         loc,
         cos_sin_cache,
         positions,
+        q_nope,
+        num_tokens,
+        loc.stride(0),
         q_rope.stride(0),
         q_rope.stride(1),
         k_nope.stride(0),
@@ -358,7 +506,9 @@ def apply_rope_mla_set_kv_buffer_triton(
         q_rope_out.stride(0),
         q_rope_out.stride(1),
         kv_buffer.stride(0),
-        cos_sin_cache.stride(0),
+        0 if cos_sin_cache is None else cos_sin_cache.stride(0),
+        0 if q_nope is None else q_nope.stride(0),
+        0 if q_nope is None else q_nope.stride(1),
         num_q_heads,
         nope_dim,
         rope_dim,
@@ -366,7 +516,15 @@ def apply_rope_mla_set_kv_buffer_triton(
         HALF_BLOCK=half_block,
         IS_NEOX=bool(is_neox),
         POSITION_INT64=positions.dtype == torch.int64,
+        ASSEMBLE_FULL_QUERY=q_nope is not None,
+        ENABLE_PDL=enable_pdl,
+        APPLY_ROPE=apply_rope,
+        BLOCK_N=block_n,
+        INDEX_INT64=index_int64,
+        SANITIZE=sanitize,
+        MAX_FINITE=max_finite,
         num_warps=4,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -379,10 +537,11 @@ def apply_rope_triton(
     is_neox: bool = True,
     offsets: torch.Tensor | None = None,
     rotary_dim: int | None = None,
-    fused_set_kv_buffer_arg=None,
-    fused_mla_set_kv_buffer_arg=None,
+    fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
+    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
     output_q_rope: torch.Tensor | None = None,
     output_k_rope: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> None:
     """Apply rotary positional embedding to query and key in-place.
 
@@ -441,6 +600,7 @@ def apply_rope_triton(
             is_neox=is_neox,
             fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=output_q_rope,
+            enable_pdl=enable_pdl,
         )
         return
 
@@ -540,7 +700,6 @@ def apply_rope_triton(
         HAS_FUSED_KV=fused_set_kv_buffer_arg is not None,
         IS_NEOX=bool(is_neox),
         POSITION_INT64=positions.dtype == torch.int64,
-        CACHE_LOC_INT64=cache_loc.dtype == torch.int64,
     )
 
 
@@ -557,11 +716,17 @@ def _fp8_quantize_kernel(
     n_cols: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HAS_SCALE_TENSOR: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     offsets = tl.arange(0, BLOCK_N)
     mask = offsets < n_cols
+    # PDL: this kernel is launched with launch_pdl and may start while the
+    # producer (the projection GEMM) is still writing x; its stores are only
+    # guaranteed visible after griddepcontrol.wait.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     values = tl.load(
         x + token * x_stride_t + head * x_stride_h + offsets,
         mask=mask,
@@ -576,6 +741,8 @@ def _fp8_quantize_kernel(
         values_fp8,
         mask=(head < num_heads) & mask,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _fp8_quantize(
@@ -609,8 +776,220 @@ def _fp8_quantize(
         n_cols=x.shape[2],
         BLOCK_N=block_n,
         HAS_SCALE_TENSOR=isinstance(scale, torch.Tensor),
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         num_stages=1,
+        **extra_kwargs,
+    )
+
+
+@triton.jit
+def _mla_nope_quantize_fp8_kernel(
+    q_nope,
+    q_rope,
+    k_nope,
+    k_rope,
+    q_nope_out,
+    q_rope_out,
+    k_nope_out,
+    k_rope_out,
+    scale_q,
+    scale_kv,
+    qn_stride_t,
+    qn_stride_h,
+    qr_stride_t,
+    qr_stride_h,
+    kn_stride_t,
+    kn_stride_h,
+    kr_stride_t,
+    kr_stride_h,
+    qno_stride_t,
+    qno_stride_h,
+    qro_stride_t,
+    qro_stride_h,
+    kno_stride_t,
+    kno_stride_h,
+    kro_stride_t,
+    kro_stride_h,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    HAS_SCALE_Q_TENSOR: tl.constexpr,
+    HAS_SCALE_KV_TENSOR: tl.constexpr,
+    BROADCAST_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    # PDL: launched with launch_pdl; the q/k inputs may still be in flight from
+    # the producer until griddepcontrol.wait orders them.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    if HAS_SCALE_Q_TENSOR:
+        scale_q = tl.load(scale_q)
+    if HAS_SCALE_KV_TENSOR:
+        scale_kv = tl.load(scale_kv)
+
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_n = offs_n < nope_dim
+    offs_r = tl.arange(0, BLOCK_R)
+    mask_r = offs_r < rope_dim
+
+    qn = tl.load(
+        q_nope + token * qn_stride_t + head * qn_stride_h + offs_n,
+        mask=mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        q_nope_out + token * qno_stride_t + head * qno_stride_h + offs_n,
+        (qn * scale_q).to(tl.float8e4nv),
+        mask=mask_n,
+    )
+    qr = tl.load(
+        q_rope + token * qr_stride_t + head * qr_stride_h + offs_r,
+        mask=mask_r,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        q_rope_out + token * qro_stride_t + head * qro_stride_h + offs_r,
+        (qr * scale_q).to(tl.float8e4nv),
+        mask=mask_r,
+    )
+
+    if BROADCAST_K:
+        store_k = head == 0
+    else:
+        store_k = True
+
+    kn = tl.load(
+        k_nope + token * kn_stride_t + head * kn_stride_h + offs_n,
+        mask=mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    if store_k:
+        tl.store(
+            k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
+            (kn * scale_kv).to(tl.float8e4nv),
+            mask=mask_n,
+        )
+    kr = tl.load(
+        k_rope + token * kr_stride_t + head * kr_stride_h + offs_r,
+        mask=mask_r,
+        other=0.0,
+    ).to(tl.float32)
+    if store_k:
+        tl.store(
+            k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
+            (kr * scale_kv).to(tl.float8e4nv),
+            mask=mask_r,
+        )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def mla_nope_quantize_fp8_triton(
+    *,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+) -> None:
+    """The no-RoPE tail of apply_rope_mla: quantize the four query/key parts
+    straight into their FP8 output slices in one launch. ``k_rope`` may carry
+    a single head; it broadcasts across the output heads via a zero stride."""
+    num_tokens, num_heads, nope_dim = q_nope.shape
+    rope_dim = q_rope.shape[-1]
+    kv_heads = k_nope.shape[1]
+    if (k_nope.shape[0], k_nope.shape[2]) != (num_tokens, nope_dim) or kv_heads not in (
+        1,
+        num_heads,
+    ):
+        raise ValueError(
+            f"k_nope {tuple(k_nope.shape)} must be [{num_tokens}, 1 or {num_heads}, "
+            f"{nope_dim}] to match q_nope {tuple(q_nope.shape)}"
+        )
+    if k_rope.shape[1] not in (1, num_heads):
+        raise ValueError(
+            f"k_rope heads must be 1 or {num_heads}, got {k_rope.shape[1]}"
+        )
+    broadcast_k = kv_heads == 1 and num_heads > 1
+    if broadcast_k and k_rope.shape[1] != 1:
+        raise ValueError(
+            f"k_nope is single-head so k_rope must be too, got {k_rope.shape[1]}"
+        )
+    expected_outputs = (
+        ("q_nope_out", q_nope_out, q_nope.shape, q_nope.device),
+        ("q_rope_out", q_rope_out, q_rope.shape, q_rope.device),
+        ("k_nope_out", k_nope_out, k_nope.shape, k_nope.device),
+        (
+            "k_rope_out",
+            k_rope_out,
+            (num_tokens, kv_heads, rope_dim),
+            k_rope.device,
+        ),
+    )
+    for name, output, expected_shape, expected_device in expected_outputs:
+        if output.shape != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {tuple(expected_shape)}, got {tuple(output.shape)}"
+            )
+        if output.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"{name} must have dtype {torch.float8_e4m3fn}, got {output.dtype}"
+            )
+        if output.device != expected_device:
+            raise ValueError(
+                f"{name} must be on device {expected_device}, got {output.device}"
+            )
+    if isinstance(quant_scale_q, torch.Tensor):
+        quant_scale_q = quant_scale_q.contiguous()
+    if isinstance(quant_scale_kv, torch.Tensor):
+        quant_scale_kv = quant_scale_kv.contiguous()
+
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    _mla_nope_quantize_fp8_kernel[(num_tokens, num_heads)](
+        q_nope,
+        q_rope,
+        k_nope,
+        k_rope,
+        q_nope_out,
+        q_rope_out,
+        k_nope_out,
+        k_rope_out,
+        quant_scale_q,
+        quant_scale_kv,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_rope.stride(0),
+        q_rope.stride(1),
+        k_nope.stride(0),
+        0 if broadcast_k else k_nope.stride(1),
+        k_rope.stride(0),
+        0 if k_rope.shape[1] == 1 else k_rope.stride(1),
+        q_nope_out.stride(0),
+        q_nope_out.stride(1),
+        q_rope_out.stride(0),
+        q_rope_out.stride(1),
+        k_nope_out.stride(0),
+        k_nope_out.stride(1),
+        k_rope_out.stride(0),
+        k_rope_out.stride(1),
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        BLOCK_N=max(16, _next_power_of_2(nope_dim)),
+        BLOCK_R=max(16, _next_power_of_2(rope_dim)),
+        HAS_SCALE_Q_TENSOR=isinstance(quant_scale_q, torch.Tensor),
+        HAS_SCALE_KV_TENSOR=isinstance(quant_scale_kv, torch.Tensor),
+        BROADCAST_K=broadcast_k,
+        ENABLE_PDL=enable_pdl,
         **extra_kwargs,
     )
 
@@ -675,10 +1054,10 @@ def mla_rope_quantize_fp8_triton(
         "is_neox": frozenset({True, False}),
         "has_fused_kv": frozenset({True, False}),
         "has_fused_mla_kv": frozenset({True, False}),
+        "fused_mla_full_query": frozenset({True, False}),
         "has_q_out": frozenset({True, False}),
         "has_k_out": frozenset({True, False}),
     },
-    tags={"portability"},
 )
 def triton_embedding_rope(
     *,
@@ -705,6 +1084,100 @@ def triton_embedding_rope(
         fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
         output_q_rope=q_rope_out,
         output_k_rope=k_rope_out,
+        enable_pdl=enable_pdl,
+    )
+
+
+@register_kernel(
+    "embedding",
+    "rope_mla_set_kv",
+    name="triton_embedding_rope_mla_set_kv",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        ("q_rope", "k_rope"),
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "has_rope": frozenset({True, False}),
+        "is_neox": frozenset({True, False}),
+        "fused_mla_full_query": frozenset({True, False}),
+    },
+)
+def triton_embedding_rope_mla_set_kv(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    is_neox: bool,
+    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg,
+    q_rope_out: torch.Tensor,
+    enable_pdl: bool = False,
+) -> None:
+    apply_rope_mla_set_kv_buffer_triton(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
+        q_rope_out=q_rope_out,
+        enable_pdl=enable_pdl,
+    )
+
+
+@register_kernel(
+    "embedding",
+    "rope_mla",
+    name="triton_embedding_nope_mla",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        ("q_rope", "k_rope", "q_nope", "k_nope"),
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "has_rope": frozenset({False}),
+        "is_neox": frozenset({True, False}),
+        "quantize_dtype": frozenset({torch.float8_e4m3fn}),
+        "has_scale_q_tensor": frozenset({True, False}),
+        "has_scale_kv_tensor": frozenset({True, False}),
+    },
+)
+def triton_embedding_nope_mla(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    is_neox: bool = True,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+) -> None:
+    mla_nope_quantize_fp8_triton(
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        q_rope_out=q_rope_out,
+        k_rope_out=k_rope_out,
+        q_nope_out=q_nope_out,
+        k_nope_out=k_nope_out,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -721,12 +1194,12 @@ def triton_embedding_rope(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "has_rope": frozenset({True}),
         "is_neox": frozenset({True, False}),
         "quantize_dtype": frozenset({torch.float8_e4m3fn}),
         "has_scale_q_tensor": frozenset({True, False}),
         "has_scale_kv_tensor": frozenset({True, False}),
     },
-    tags={"portability"},
 )
 def triton_embedding_rope_mla(
     *,
@@ -761,3 +1234,247 @@ def triton_embedding_rope_mla(
         quant_scale_kv=quant_scale_kv,
         enable_pdl=enable_pdl,
     )
+
+
+@triton.jit
+def _mxfp8_embedding_kernel(
+    W,
+    S,
+    I,
+    O,
+    D: tl.constexpr,
+    START: tl.constexpr,
+    END: tl.constexpr,
+    WS: tl.constexpr,
+    SS: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d = tl.arange(0, B)
+    index = tl.load(I + row)
+    local = (index >= START) & (index < END)
+    code = tl.load(W + (index - START) * WS + d, local & (d < D), 0.0).to(tl.float32)
+    exponent = tl.load(S + (index - START) * SS + d // 32, local & (d < D), 127).to(
+        tl.int32
+    )
+    scale = tl.where(
+        exponent == 0, 2.0**-127, (exponent << 23).to(tl.float32, bitcast=True)
+    )
+    scale = tl.where(exponent == 255, float("nan"), scale)
+    value = tl.where(local, code * scale, 0.0)
+    tl.store(O + row * D + d, value, d < D)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "ORG_START",
+        "ORG_END",
+        "ADDED_START",
+        "ADDED_END",
+        "ADDED_OFFSET",
+    ]
+)
+def _vocab_shard_embedding_kernel(
+    W,
+    I,
+    O,
+    WS,
+    ORG_START,
+    ORG_END,
+    ADDED_START,
+    ADDED_END,
+    ADDED_OFFSET,
+    D: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, B)
+    index = tl.load(I + row).to(tl.int64)
+    original = (index >= ORG_START) & (index < ORG_END)
+    added = (index >= ADDED_START) & (index < ADDED_END)
+    local = tl.where(original, index - ORG_START, index - ADDED_OFFSET)
+    value = tl.load(W + local * WS + d, (original | added) & (d < D), 0.0)
+    tl.store(O + row * D + d, value, d < D)
+
+
+@register_kernel(
+    "embedding",
+    "vocab_shard_embedding",
+    name="triton_vocab_shard_embedding",
+    solution="triton",
+    signatures=[
+        format_signature(weight=dense_tensor_format(dtype))
+        for dtype in (torch.bfloat16, torch.float16, torch.float32)
+    ],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def vocab_shard_embedding(weight, indices, org_range, num_org_padding, added_range):
+    """Gather this shard's rows for global IDs and zero every other row."""
+    out = torch.empty(
+        (*indices.shape, weight.shape[1]), dtype=weight.dtype, device=indices.device
+    )
+    org_start, org_end = org_range
+    added_start, added_end = added_range
+    if indices.numel():
+        _vocab_shard_embedding_kernel[(indices.numel(),)](
+            weight,
+            indices,
+            out,
+            weight.stride(0),
+            org_start,
+            org_end,
+            added_start,
+            added_end,
+            added_start - (org_end - org_start) - num_org_padding,
+            weight.shape[1],
+            triton.next_power_of_2(weight.shape[1]),
+            num_warps=4,
+        )
+    return out
+
+
+@triton.jit
+def _engram_hash_kernel(
+    I,
+    P,
+    M,
+    TOKEN_MAP,
+    MULTIPLIERS,
+    PRIMES,
+    OFFSETS,
+    O,
+    num_tokens,
+    pad_id,
+    dead_id,
+    LAYERS: tl.constexpr,
+    HEADS: tl.constexpr,
+    HEADS_PAD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    live = rows < num_tokens
+    heads = tl.arange(0, HEADS_PAD)
+    head_ok = heads < HEADS
+    # The current token and its three predecessors, newest first. A token is
+    # dead when missing (barrier) or, for the current one, masked out; every
+    # lookback at or beyond a dead token hashes as padding.
+    raw0 = tl.load(I + rows, live, dead_id).to(tl.int64)
+    raw1 = tl.load(P + rows * 3, live, dead_id).to(tl.int64)
+    raw2 = tl.load(P + rows * 3 + 1, live, dead_id).to(tl.int64)
+    raw3 = tl.load(P + rows * 3 + 2, live, dead_id).to(tl.int64)
+    blocked0 = (raw0 == dead_id) | (tl.load(M + rows, live, 0) == 0)
+    blocked1 = blocked0 | (raw1 == dead_id)
+    blocked2 = blocked1 | (raw2 == dead_id)
+    blocked3 = blocked2 | (raw3 == dead_id)
+    # Dead ids may lie outside the tokenizer vocabulary: map row 0 instead.
+    token0 = tl.load(TOKEN_MAP + tl.where(blocked0, 0, raw0), live, 0)
+    token1 = tl.load(TOKEN_MAP + tl.where(blocked1, 0, raw1), live, 0)
+    token2 = tl.load(TOKEN_MAP + tl.where(blocked2, 0, raw2), live, 0)
+    token3 = tl.load(TOKEN_MAP + tl.where(blocked3, 0, raw3), live, 0)
+    token0 = tl.where(blocked0, pad_id, token0)
+    token1 = tl.where(blocked1, pad_id, token1)
+    token2 = tl.where(blocked2, pad_id, token2)
+    token3 = tl.where(blocked3, pad_id, token3)
+    for layer in tl.static_range(LAYERS):
+        rolling = token0 * tl.load(MULTIPLIERS + layer * 4)
+        for shift in tl.static_range(1, 4):
+            if shift == 1:
+                rolling = rolling ^ (token1 * tl.load(MULTIPLIERS + layer * 4 + shift))
+            elif shift == 2:
+                rolling = rolling ^ (token2 * tl.load(MULTIPLIERS + layer * 4 + shift))
+            else:
+                rolling = rolling ^ (token3 * tl.load(MULTIPLIERS + layer * 4 + shift))
+            column = (layer * 3 + shift - 1) * HEADS
+            primes = tl.load(PRIMES + column + heads, head_ok, 1)
+            offsets = tl.load(OFFSETS + column + heads, head_ok, 0)
+            # Python's modulo: the bucket takes the sign of the (positive) prime.
+            bucket = rolling[:, None] % primes[None, :]
+            bucket = tl.where(bucket < 0, bucket + primes[None, :], bucket)
+            tl.store(
+                O + rows[:, None] * (LAYERS * 3 * HEADS) + column + heads[None, :],
+                bucket + offsets[None, :],
+                live[:, None] & head_ok[None, :],
+            )
+
+
+@register_kernel(
+    "embedding",
+    "engram_hash",
+    name="triton_engram_hash",
+    solution="triton",
+    signatures=[format_signature(indices=dense_tensor_format(torch.int64))],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def engram_hash(
+    input_ids,
+    previous_token_ids,
+    token_mask,
+    token_map,
+    multipliers,
+    primes,
+    offsets,
+    pad_id,
+    dead_id,
+):
+    """Hash each token's 2/3/4-gram windows into per-layer table rows."""
+    layers, heads = primes.shape[0], primes.shape[2]
+    num_tokens = input_ids.shape[0]
+    out = torch.empty(
+        (num_tokens, layers, 3 * heads), dtype=torch.int64, device=input_ids.device
+    )
+    if num_tokens:
+        # 64-bit remainders dominate; small blocks keep each thread at one
+        # bucket per (layer, order) even for a decode step's dozen tokens.
+        block = 16
+        _engram_hash_kernel[(triton.cdiv(num_tokens, block),)](
+            input_ids,
+            previous_token_ids,
+            token_mask.view(torch.int8),
+            token_map,
+            multipliers,
+            primes,
+            offsets,
+            out,
+            num_tokens,
+            pad_id,
+            dead_id,
+            LAYERS=layers,
+            HEADS=heads,
+            HEADS_PAD=triton.next_power_of_2(heads),
+            BLOCK=block,
+            num_warps=4,
+        )
+    return out
+
+
+@register_kernel(
+    "embedding",
+    "mxfp8_embedding",
+    name="triton_mxfp8_embedding",
+    solution="triton",
+    signatures=[format_signature(weight=dense_tensor_format(torch.float8_e4m3fn))],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def mxfp8_embedding(weight, scales, indices, row_start, row_end):
+    """Gather local FP8/E8M0 rows, dequantize to BF16 and mask remote IDs."""
+    out = torch.empty(
+        (*indices.shape, weight.shape[1]), dtype=torch.bfloat16, device=indices.device
+    )
+    if indices.numel():
+        _mxfp8_embedding_kernel[(indices.numel(),)](
+            weight,
+            scales,
+            indices,
+            out,
+            weight.shape[1],
+            row_start,
+            row_end,
+            weight.stride(0),
+            scales.stride(0),
+            triton.next_power_of_2(weight.shape[1]),
+            num_warps=4,
+        )
+    return out

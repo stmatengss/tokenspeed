@@ -46,6 +46,8 @@ def _make_all_groups(group: Group) -> list[Group]:
 class ProcessGroupManager:
     def __init__(self):
         self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
+        self._pg_timeout: timedelta | None = None
+        self._device_backend = "nccl"
 
     def init_distributed(
         self,
@@ -55,17 +57,22 @@ class ProcessGroupManager:
         timeout: int | None = None,
         device_id: "torch.device | None" = None,
     ) -> None:
+
         if not dist.is_initialized():
             if distributed_init_method is None:
                 raise ValueError(
                     "distributed_init_method must be provided when initializing distributed environment"
                 )
+
             if timeout is not None:
                 if not isinstance(timeout, int):
                     raise TypeError("timeout must be a number")
                 if timeout <= 0:
                     raise ValueError("timeout must be positive")
                 timeout = timedelta(seconds=timeout)
+
+            self._pg_timeout = timeout
+            self._device_backend = backend
 
             dist.init_process_group(
                 backend=backend,
@@ -86,6 +93,10 @@ class ProcessGroupManager:
     def get_process_group(self, backend: str, group: Group):
         return self._process_groups[backend][group]
 
+    def get_device_process_group(self, group: Group):
+        """Return the accelerator collective group for the requested ranks."""
+        return self.get_process_group(self._device_backend, group)
+
     def has_process_group(self, backend: str, group: Group) -> bool:
         if backend not in self._process_groups:
             return False
@@ -95,7 +106,7 @@ class ProcessGroupManager:
         self, group: Group, backend: str | list[str] | None = None
     ) -> None:
         if backend is None:
-            backends = ["nccl", "gloo"]
+            backends = [self._device_backend, "gloo"]
         elif isinstance(backend, str):
             backends = [backend]
         else:
@@ -105,7 +116,7 @@ class ProcessGroupManager:
             if self.has_process_group(backend, group):
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(g, backend=backend)
+                pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
                 if g == group:
                     self.register_process_group(backend, g, pg)
 

@@ -21,11 +21,31 @@
 """Runtime configuration exports."""
 
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
+from tokenspeed.runtime.configs.deepseek_v41_config import (
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+)
+from tokenspeed.runtime.configs.inkling_config import (
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
+)
 from tokenspeed.runtime.configs.kimi_k2_config import KimiK2Config
+from tokenspeed.runtime.configs.kimi_k3_config import (
+    KimiK3Config,
+    KimiK3VisionConfig,
+    KimiLinearConfig,
+)
+from tokenspeed.runtime.configs.kimi_k3_dspark_config import KimiK3DSparkConfig
 from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
-from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
+from tokenspeed.runtime.configs.minimax_m3_config import MiniMaxM3Config
 from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
-from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5Config, Qwen3_5MoeConfig
+from tokenspeed.runtime.configs.qwen3_5_config import (
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+)
 from tokenspeed.runtime.configs.qwen3_asr_config import (
     Qwen3ASRAudioEncoderConfig,
     Qwen3ASRConfig,
@@ -33,18 +53,37 @@ from tokenspeed.runtime.configs.qwen3_asr_config import (
 )
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
+from tokenspeed.runtime.configs.qwen4_exp_config import (
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
+    Qwen4ExpVisionConfig,
+)
 
 __all__ = [
     "DeepseekV4Config",
+    "DeepseekV41Config",
+    "DeepseekV41TextConfig",
     "Qwen2Config",
     "Qwen3Config",
     "Qwen3MoeConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
+    "Qwen3_5MoeTextConfig",
     "Qwen3ASRAudioEncoderConfig",
     "Qwen3ASRConfig",
     "Qwen3ASRThinkerConfig",
-    "MiniMaxM2Config",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
+    "Qwen4ExpVisionConfig",
+    "MiniMaxM3Config",
     "KimiK2Config",
     "KimiK25Config",
+    "KimiK3Config",
+    "KimiK3DSparkConfig",
+    "KimiK3VisionConfig",
+    "KimiLinearConfig",
+    "InklingAudioConfig",
+    "InklingMMConfig",
+    "InklingModelConfig",
+    "InklingVisionConfig",
 ]

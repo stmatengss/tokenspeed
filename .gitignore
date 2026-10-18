@@ -91,7 +91,7 @@ celerybeat.pid
 .python-version
 .env
 .envrc
-.venv
+.venv*
 env/
 venv/
 ENV/
@@ -156,6 +156,8 @@ cython_debug/
 *.dylib
 *.dll
 *.so.*
+# Local CUDA build identities contain host-specific toolchain paths.
+tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/objs/**/build-identity.*
 
 # Fortran module files
 *.mod
@@ -196,6 +198,8 @@ Testing/
 .serena/*
 
 AGENTS.local.md
+AGENTS.override.md
+outputs/
 
 # Git worktrees (local isolation)
 .worktrees/

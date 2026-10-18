@@ -1,0 +1,190 @@
+// Copyright (c) 2026 LightSeek Foundation
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#include "cache/tier/transfer_manager.h"
+
+#include <algorithm>
+#include <unordered_set>
+#include <utility>
+
+#include "utils.h"
+
+namespace tokenspeed {
+
+std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreSourceGuard guard) {
+    std::vector<CacheKey> keys;
+    std::vector<CacheBlockRef> device_block_refs;
+    std::vector<std::uint32_t> group_ids;
+    // Keys already travelling: every ticket of every in-flight write-back.
+    // Derived from write_backs_ on demand rather than mirrored in a second
+    // container that would have to be kept in step with it. Candidates join
+    // the same set so a key queued twice in one round is stored once.
+    std::unordered_set<CacheKey, CacheKeyHash> storing_keys;
+    for (const auto& [op_id, write_back] : write_backs_) {
+        for (const StoreTicket& ticket : write_back.tickets) {
+            storing_keys.insert(ticket.key);
+        }
+    }
+    for (auto& candidate : coordinator_.TakePendingStores()) {
+        if (coordinator_.ContainsHostCachedBlock(candidate.key) || !storing_keys.insert(candidate.key).second) {
+            continue;
+        }
+
+        CacheBlockRef device_block_ref = coordinator_.AcquireDeviceCachedBlock(candidate.key);
+        if (!device_block_ref) {
+            continue;
+        }
+
+        group_ids.push_back(candidate.key.group_id);
+        keys.push_back(std::move(candidate.key));
+        device_block_refs.push_back(std::move(device_block_ref));
+    }
+
+    if (keys.empty()) {
+        return std::nullopt;
+    }
+
+    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids);
+    _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
+
+    const bool pin_source = guard == StoreSourceGuard::kPinnedUntilAck;
+    std::vector<CacheTransfer> transfers;
+    std::vector<StoreTicket> tickets;
+    transfers.reserve(host_allocation.stats.allocated);
+    tickets.reserve(host_allocation.stats.allocated);
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        CacheBlockRef& host_block_ref = host_allocation.blocks[i];
+        if (!host_block_ref) {
+            continue;
+        }
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(group_ids[i]));
+        transfers.push_back(CacheTransfer{
+            .group_id = group_ids[i],
+            .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
+            .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
+            .content_hash = keys[i].content_hash,
+            .page_offset = keys[i].page_offset,
+        });
+        // A stream-ordered store resolves the source page id and lets the
+        // reference go: the forward thread's stream orders the copy ahead of
+        // any later reuse. A pinned store keeps it until the ACK.
+        tickets.push_back(StoreTicket{
+            std::move(keys[i]),
+            pin_source ? std::move(device_block_refs[i]) : CacheBlockRef{},
+            std::move(host_block_ref),
+        });
+    }
+
+    if (transfers.empty()) {
+        return std::nullopt;
+    }
+    const std::uint32_t op_id = nextOpId();
+    const bool inserted = write_backs_.emplace(op_id, InFlightWriteBack{guard, std::move(tickets)}).second;
+    _assert(inserted, "duplicate store op id");
+    return WriteBackOperation{
+        .op_id = op_id,
+        .transfers = std::move(transfers),
+        .source_pinned = pin_source,
+    };
+}
+
+bool TierTransferManager::HasPinnedStoresInFlight() const {
+    return std::ranges::any_of(
+        write_backs_, [](const auto& entry) { return entry.second.guard == StoreSourceGuard::kPinnedUntilAck; });
+}
+
+LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {
+    _assert(!block_transfers.empty(), "prefix load requires at least one block transfer");
+    for (const BlockTransfer& pair : block_transfers) {
+        _assert(pair.prefetch_from_storage || coordinator_.IsHostCachedBlock(pair.source->Location()),
+                "pinned Host block lost its cache entry before load emission");
+    }
+    return startLoadBack(std::move(block_transfers));
+}
+
+LoadBackOperation TierTransferManager::startLoadBack(std::vector<BlockTransfer> block_transfers) {
+    std::vector<CacheTransfer> transfers = resolveTransfers(block_transfers);
+    const std::uint32_t op_id = nextOpId();
+    const bool inserted = load_backs_.emplace(op_id, std::move(block_transfers)).second;
+    _assert(inserted, "duplicate loadback op id");
+    return LoadBackOperation{op_id, std::move(transfers)};
+}
+
+void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
+    // The runtime emits this ACK only after the asynchronous copy completes.
+    // Transfer errors terminate the runtime and must never publish cache state.
+    auto it = write_backs_.find(op_id);
+    if (it == write_backs_.end()) {
+        return;
+    }
+    std::vector<StoreTicket> stores = std::move(it->second.tickets);
+    write_backs_.erase(it);
+    // Publishing the Host entry also drops the tickets' Device pins (if any)
+    // when `stores` goes out of scope: the source is evictable again.
+    for (StoreTicket& ticket : stores) {
+        coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
+    }
+}
+
+void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
+    auto it = load_backs_.find(op_id);
+    if (it == load_backs_.end()) {
+        return;
+    }
+    // A missed batch_get_into must not publish empty Host or Device pages.
+    // Host-warm destinations of a mixed L3 hash were not CacheFullBlocks'd at
+    // admit (the hash had an L3 prefetch sibling). Publish every keyed filled
+    // destination. Host-only L2 load-backs leave key empty; those pages were
+    // already published at admit. CacheHostBlock remains prefetch-only
+    // because Host-warm sources are already in the Host index.
+    for (BlockTransfer& transfer : it->second) {
+        if (!success) {
+            continue;
+        }
+        if (transfer.prefetch_from_storage && transfer.source) {
+            coordinator_.CacheHostBlock(transfer.source, transfer.key);
+        }
+        if (transfer.destination && !transfer.key.content_hash.empty()) {
+            coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
+        }
+    }
+    load_backs_.erase(it);
+}
+
+std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
+    std::vector<CacheTransfer> transfers;
+    transfers.reserve(block_transfers.size());
+    for (const BlockTransfer& block_transfer : block_transfers) {
+        _assert(block_transfer.source && block_transfer.destination,
+                "cache transfer requires pinned source and destination blocks");
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(block_transfer.group_id));
+        transfers.push_back(CacheTransfer{
+            .group_id = block_transfer.group_id,
+            .source_page = manager.ResolveCacheBlockId(block_transfer.source->Location()),
+            .destination_page = manager.ResolveCacheBlockId(block_transfer.destination->Location()),
+            .content_hash = block_transfer.key.content_hash,
+            .page_offset = block_transfer.key.page_offset,
+            .prefetch_from_storage = block_transfer.prefetch_from_storage,
+        });
+    }
+    return transfers;
+}
+
+}  // namespace tokenspeed

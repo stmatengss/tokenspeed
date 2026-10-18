@@ -26,6 +26,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.ops.communication import triton as triton_communication
 from tokenspeed_kernel.ops.communication.triton import (
     all_gather,
     all_reduce,
@@ -41,6 +42,33 @@ def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
+
+
+def test_alloc_symm_escapes_inference_mode(monkeypatch):
+    process_group = object()
+    handle = object()
+
+    def fake_empty(shape, *, dtype, device):
+        assert not torch.is_inference_mode_enabled()
+        assert not torch.is_grad_enabled()
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    def fake_rendezvous(tensor, *, group):
+        assert tensor.shape == (2, 3)
+        assert group is process_group
+        return handle
+
+    monkeypatch.setattr(triton_communication.symm_mem, "empty", fake_empty)
+    monkeypatch.setattr(triton_communication.symm_mem, "rendezvous", fake_rendezvous)
+
+    with torch.inference_mode():
+        tensor, result_handle = triton_communication._alloc_symm(
+            (2, 3), torch.float32, torch.device("cpu"), process_group
+        )
+
+    assert not tensor.is_inference()
+    assert result_handle is handle
+    tensor.copy_(torch.ones_like(tensor))
 
 
 def token_cases(world_size: int) -> List[List[int]]:
@@ -76,10 +104,16 @@ def worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None
         cases = token_cases(world_size)
         max_tokens = max(sum(tokens) for tokens in cases)
         rsag = create_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
+            attnres_max_numel=0,
+            attnres_max_rows=0,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
+            device=None,
+            max_numel=0,
+            max_bytes=0,
         )
 
         for tokens in cases:
@@ -121,10 +155,22 @@ def check_all_gather(
 def check_all_reduce(rank: int, world_size: int, device) -> None:
     max_numel = 512 * 1024 // torch.empty((), dtype=torch.bfloat16).element_size()
     state = create_state(
+        enable_lamport=False,
         group=dist.group.WORLD,
         rank_in_group=rank,
+        attnres_max_numel=0,
+        attnres_max_rows=0,
+        max_tokens=0,
+        hidden_size=0,
         max_numel=max_numel,
+        max_bytes=0,
         device=device,
+    )
+    assert state.max_bytes == 0
+    assert not triton_communication.symm_outputs_can_run(
+        state,
+        ((4,),),
+        torch.bfloat16,
     )
 
     for numel in [2880, 20160, 23040, 92160, 184320]:

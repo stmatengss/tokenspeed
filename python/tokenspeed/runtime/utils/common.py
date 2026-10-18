@@ -62,9 +62,7 @@ import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
-import triton
 import zmq
-from fastapi.responses import ORJSONResponse
 from PIL import Image
 from pydantic import BaseModel
 from starlette.routing import Mount
@@ -92,9 +90,8 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     if (value not in truthy_values) and (value not in falsy_values):
         if value not in _warned_bool_env_var_keys:
             logger.warning(
-                "get_bool_env_var(%s) see non-understandable value=%s and treat as false",
-                name,
-                value,
+                f"get_bool_env_var({name!s}) see non-understandable value={value!s} and"
+                " treat as false",
             )
         _warned_bool_env_var_keys.add(value)
 
@@ -143,10 +140,8 @@ def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
 
     proc.cpu_affinity(list(cpu_affinity))
     logger.info(
-        "Worker process %s pinned to %s NUMA-local CPUs for device %s.",
-        proc.pid,
-        len(cpu_affinity),
-        device_id,
+        f"Worker process {proc.pid!s} pinned to {len(cpu_affinity)!s} NUMA-local CPUs "
+        f"for device {device_id!s}.",
     )
 
 
@@ -157,22 +152,22 @@ def get_available_gpu_memory(
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
-    if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+    if device in {"cuda", "npu"}:
+        device_module = torch.get_device_module(device)
+        num_gpus = device_module.device_count()
         if gpu_id >= num_gpus:
             raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
 
-        if torch.cuda.current_device() != gpu_id:
+        if device_module.current_device() != gpu_id:
             logger.debug(
-                "Current device is not %s, but %s, which may cause useless "
+                f"Current device is not {gpu_id!s}, but "
+                f"{device_module.current_device()!s}, which may cause useless "
                 "memory allocation for torch CUDA context.",
-                gpu_id,
-                torch.cuda.current_device(),
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+            device_module.empty_cache()
+        free_gpu_memory, _ = device_module.mem_get_info(gpu_id)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -192,18 +187,45 @@ class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
+class PPMissingLayer(torch.nn.Identity):
+    """Placeholder for a layer owned by another pipeline stage.
+
+    Keeps global layer numbering intact (KV field names, weight names, and
+    ``layer_id`` all stay global) while contributing no parameters, so the
+    weight loader's skip-unknown semantics leave it untouched.
+    """
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
     prefix: str = "",
+    pp_start_layer: int = 0,
+    pp_end_layer: int | None = None,
 ) -> torch.nn.ModuleList:
-    """Make a list of layers with the given layer function"""
-    start_layer = 0
-    end_layer = num_hidden_layers
+    """Make a list of layers with the given layer function.
+
+    Args:
+        num_hidden_layers: Total layer count of the model (all stages).
+        layer_fn: Factory called with the GLOBAL layer index.
+        prefix: Parameter-name prefix.
+        pp_start_layer: First global layer index this pipeline stage owns.
+        pp_end_layer: One past the last owned layer; None means all layers.
+
+    Returns:
+        A ModuleList of length ``num_hidden_layers`` where positions outside
+        [pp_start_layer, pp_end_layer) hold :class:`PPMissingLayer`.
+    """
+    if pp_end_layer is None:
+        pp_end_layer = num_hidden_layers
     modules = torch.nn.ModuleList(
         [
-            layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-            for idx in range(start_layer, end_layer)
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                if pp_start_layer <= idx < pp_end_layer
+                else PPMissingLayer()
+            )
+            for idx in range(num_hidden_layers)
         ]
     )
     return modules
@@ -387,7 +409,7 @@ def set_ulimit(target_soft_limit=65535):
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
-            logger.warning("Failed to set RLIMIT_NOFILE: %s", e)
+            logger.warning(f"Failed to set RLIMIT_NOFILE: {e!s}")
 
     # stack size
     resource_type = resource.RLIMIT_STACK
@@ -399,21 +421,7 @@ def set_ulimit(target_soft_limit=65535):
                 resource_type, (target_soft_limit_stack_size, current_hard)
             )
         except ValueError as e:
-            logger.warning("Failed to set RLIMIT_STACK: %s", e)
-
-
-def add_api_key_middleware(app, api_key: str):
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
-            return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
+            logger.warning(f"Failed to set RLIMIT_STACK: {e!s}")
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
@@ -423,10 +431,14 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
-            model_path = snapshot_download(model_path)
-            tokenizer_path = snapshot_download(
-                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
-            )
+            from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+            with get_lock(model_path):
+                model_path = snapshot_download(model_path)
+            with get_lock(tokenizer_path):
+                tokenizer_path = snapshot_download(
+                    tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                )
     return model_path, tokenizer_path
 
 
@@ -493,6 +505,47 @@ def set_weight_attrs(
         if hasattr(weight, key):
             raise ValueError(f"Overwriting existing tensor attribute: {key}")
         setattr(weight, key, value)
+
+
+class PipelinedPyobjBroadcaster:
+    """Overlap empty Python-object notifications with useful work."""
+
+    def __init__(
+        self,
+        rank: int,
+        dist_group: torch.distributed.ProcessGroup | None = None,
+        src: int = 0,
+    ) -> None:
+        self.rank = rank
+        self.dist_group = dist_group
+        self.src = src
+        self._data = None
+        self._ready = torch.zeros(1, dtype=torch.long)
+        self._work = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._work is not None
+
+    def start(self, data: list[Any] | None) -> None:
+        self._data = data
+        if self.rank == self.src:
+            self._ready[0] = bool(data)
+        self._work = dist.broadcast(
+            self._ready,
+            src=self.src,
+            group=self.dist_group,
+            async_op=True,
+        )
+
+    def finish(self) -> list[Any]:
+        self._work.wait()
+        data = self._data
+        self._data = None
+        self._work = None
+        if self._ready.item():
+            return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
+        return data or []
 
 
 def broadcast_pyobj(
@@ -591,7 +644,7 @@ def delete_directory(dirpath):
         # This will remove the directory and all its contents
         shutil.rmtree(dirpath)
     except OSError as e:
-        logger.warning("Failed to delete directory %s: %s", dirpath, e.strerror)
+        logger.warning(f"Failed to delete directory {dirpath!s}: {e.strerror!s}")
 
 
 # Temporary directory for prometheus multiprocess mode
@@ -614,7 +667,9 @@ def set_prometheus_multiproc_dir():
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
-    logger.debug("PROMETHEUS_MULTIPROC_DIR: %s", os.environ["PROMETHEUS_MULTIPROC_DIR"])
+    logger.debug(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']!s}"
+    )
 
 
 def add_prometheus_middleware(app):
@@ -832,7 +887,7 @@ def debug_timing(func):
             num_tokens = len(indices) if indices is not None else 0
             throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
             logger.debug(
-                "Transfer time: %s ms, throughput: %s tokens/s", elapsed, throughput
+                f"Transfer time: {elapsed!s} ms, throughput: {throughput!s} tokens/s",
             )
             return result
         else:
@@ -891,12 +946,12 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     try:
         loop = asyncio.get_running_loop()
         logger.info(
-            "Dummy health check server scheduled on existing loop at %s:%s", host, port
+            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
         )
         loop.create_task(server.serve())
 
     except RuntimeError:
-        logger.info("Starting dummy health check server at %s:%s", host, port)
+        logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
         server.run()
 
 
@@ -909,15 +964,8 @@ def set_cuda_arch():
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
-def next_power_of_2(n: int):
-    return 1 << (n - 1).bit_length() if n > 0 else 1
-
-
 def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
-
-
-setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 def add_prefix(name: str, prefix: str) -> str:
@@ -1114,13 +1162,17 @@ def get_colorful_logger(name):
     logger.propagate = False
     logger.setLevel(LOG_LEVEL)
 
+    # ``logging.getLogger`` returns the one logger per name; a second call for
+    # the same name must not stack a second stream handler, or every record
+    # of that logger is emitted twice.
+    if any(isinstance(h.formatter, CustomFormatter) for h in logger.handlers):
+        return logger
+
     ch = logging.StreamHandler()
     ch.setLevel(LOG_LEVEL)
     ch.setFormatter(CustomFormatter())
-    # ch.flush = lambda: True
 
     logger.addHandler(ch)
-    logger.propagate = False
     return logger
 
 
@@ -1166,7 +1218,7 @@ def maybe_model_redirect(model: str) -> str:
         model_redirect_path
     )
     if redirect_model := redirect_dict.get(model):
-        logger.info("model redirect: [ %s ] -> [ %s ]", model, redirect_model)
+        logger.info(f"model redirect: [ {model!s} ] -> [ {redirect_model!s} ]")
         return redirect_model
 
     return model

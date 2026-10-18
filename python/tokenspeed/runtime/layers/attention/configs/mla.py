@@ -26,35 +26,62 @@ import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
-    BaseAttnConfig,
+    AttnConfig,
+    SoftmaxAttnConfig,
+    is_block_drafter,
+    model_wide_kwargs,
+    resolve_cache_layer_types,
     resolve_dtype,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-@dataclass
-class MLAConfig(BaseAttnConfig):
+def resolve_mla_kv_cache_dtype(
+    server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+) -> torch.dtype:
+    """Resolve MLA cache precision without quantizing K3 DSpark context blindly.
+
+    The public K3 DSpark checkpoint has no FP8 KV scales and its reference vLLM
+    launch uses the default BF16 cache. TokenSpeed's K3 target currently requires
+    FP8 LCM storage, so the unified arena exposes a separate BF16 compute view
+    for the draft continuation fields. Other MLA drafts continue to honor the
+    global cache setting.
+    """
+    if (
+        is_draft
+        and server_args.speculative_algorithm == "DSPARK"
+        and getattr(model_config.hf_config, "model_type", None) == "k3_dspark"
+    ):
+        return torch.bfloat16
+    return resolve_dtype(server_args.kv_cache_dtype)
+
+
+@dataclass(kw_only=True)
+class MLAConfig(SoftmaxAttnConfig):
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    # DeepSeek V4 stamps its window here post-construction (declared so the
+    # write is a real field, not a __dict__ stowaway).
+    sliding_window_tokens: int | None = None
 
     @classmethod
-    def generate(
-        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
-    ):
-        kwargs = {}
-        if server_args.speculative_algorithm is not None:
-            kwargs.update(
-                speculative_num_steps=server_args.speculative_num_steps,
-                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            )
-        return cls(
-            device=server_args.device,
-            context_len=model_config.context_len,
+    def _spec_kwargs(
+        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+    ) -> dict:
+        """MLA component fields, shared with the DSA subclass."""
+        cache_layer_types = resolve_cache_layer_types(
+            model_config.hf_config,
+            num_layers=model_config.num_attention_layers,
+            is_draft=is_draft,
+            draft_block_decode=is_block_drafter(
+                server_args.speculative_algorithm, is_draft
+            ),
+        )
+        return dict(
             backend_name=(
                 server_args.attention_backend
                 if not is_draft
@@ -64,57 +91,45 @@ class MLAConfig(BaseAttnConfig):
             num_kv_heads=model_config.num_key_value_heads,
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
-            dtype=model_config.dtype,
-            kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
-            page_size=server_args.block_size,
-            max_graph_bs=server_args.max_cudagraph_capture_size,
-            max_bs=server_args.max_num_seqs
-            // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
-            kv_cache_quant_method=server_args.kv_cache_quant_method,
-            is_draft=is_draft,
             kv_lora_rank=model_config.kv_lora_rank,
             qk_nope_head_dim=model_config.qk_nope_head_dim,
             qk_rope_head_dim=model_config.qk_rope_head_dim,
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
-            **kwargs,
+            cache_layer_types=cache_layer_types,
         )
 
-    def cache_cell_size(self) -> int:
-        if self.kv_cache_quant_method == "per_token_head":
+    @classmethod
+    def generate(
+        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
+    ) -> AttnConfig:
+        draft_block_decode = is_block_drafter(
+            server_args.speculative_algorithm, is_draft
+        )
+        spec = cls(**cls._spec_kwargs(server_args, model_config, is_draft))
+        return AttnConfig(
+            components=(spec,),
+            **model_wide_kwargs(
+                server_args,
+                model_config,
+                is_draft,
+                kv_cache_dtype=resolve_mla_kv_cache_dtype(
+                    server_args, model_config, is_draft
+                ),
+                draft_block_decode=draft_block_decode,
+            ),
+        )
+
+    def cache_cell_size(self, config: AttnConfig) -> int:
+        if config.kv_cache_quant_method == "per_token_head":
             cell_size = (
-                self.kv_lora_rank * torch._utils._element_size(self.kv_cache_dtype)
-                + self.qk_rope_head_dim * torch._utils._element_size(self.dtype)
+                self.kv_lora_rank * torch._utils._element_size(config.kv_cache_dtype)
+                + self.qk_rope_head_dim * torch._utils._element_size(config.dtype)
                 + 1 * torch._utils._element_size(torch.float32)
             )
         else:
             cell_size = (
                 self.kv_lora_rank + self.qk_rope_head_dim
-            ) * torch._utils._element_size(self.kv_cache_dtype)
+            ) * torch._utils._element_size(config.kv_cache_dtype)
         return cell_size
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-
-        return MLATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            model_dtype=self.dtype,
-            quant_method=self.kv_cache_quant_method,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-        )

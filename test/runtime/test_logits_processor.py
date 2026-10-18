@@ -22,6 +22,7 @@ from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsProcessor,
     fused_softcap,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 
 
 def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
@@ -67,7 +68,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
     calls = {"all_gather": 0}
 
-    def fake_all_gather_into_tensor(output, input_, group):
+    def fake_all_gather_single(output, input_, group):
         calls["all_gather"] += 1
         assert group == (0, 1)
         assert tuple(output.shape) == (0, 3)
@@ -75,8 +76,8 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 
     monkeypatch.setattr(
         logits_processor_module,
-        "all_gather_into_tensor",
-        fake_all_gather_into_tensor,
+        "all_gather_single",
+        fake_all_gather_single,
     )
 
     output = processor(
@@ -88,6 +89,339 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 
     assert calls["all_gather"] == 1
     assert tuple(output.next_token_logits.shape) == (0, 6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cached", [False, True])
+def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=16),
+        skip_all_gather=False,
+        do_argmax=False,
+        logit_scale=None,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    state = object()
+    if cached:
+        processor._all_gather_state = state
+    calls = []
+
+    def initialize(lm_head):
+        assert dtype == torch.bfloat16
+        calls.append("init")
+        return state
+
+    def multicast(received_state, logits, *, tp_hidden_dim, skip_entry_sync, safe):
+        assert received_state is state
+        assert logits.dtype == torch.bfloat16
+        assert tp_hidden_dim == 16 and skip_entry_sync and not safe
+        calls.append("multicast")
+        return torch.cat((logits, logits), dim=-1)
+
+    def collective(output, logits, group):
+        assert dtype != torch.bfloat16
+        assert output.dtype == logits.dtype == dtype
+        assert group == (0, 1)
+        calls.append("collective")
+        output.copy_(torch.cat((logits, logits), dim=0))
+
+    monkeypatch.setattr(processor, "_init_all_gather_state", initialize)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(logits_processor_module, "all_gather_inner", multicast)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    hidden = torch.tensor([[1.0, 1 / 512]], dtype=dtype)
+    weight = torch.zeros((8, 2), dtype=dtype)
+    weight[0, 0] = 1
+    weight[1] = 1
+    local = hidden @ weight.T
+    output = processor._get_logits(
+        hidden,
+        SimpleNamespace(weight=weight),
+        logits_metadata=None,
+        embedding_bias=None,
+        plan=None,
+    )
+    assert output.dtype == dtype
+    torch.testing.assert_close(
+        output, torch.cat((local, local), dim=-1), rtol=0, atol=0
+    )
+    if dtype == torch.bfloat16:
+        assert calls == (["multicast"] if cached else ["init", "multicast"])
+    else:
+        assert calls == ["collective"]
+        assert output.argmax(-1).item() == 1
+
+
+@pytest.mark.parametrize(
+    "initializer_name",
+    ["_init_all_gather_state", "_init_dist_argmax_state"],
+)
+def test_force_deterministic_rsag_disables_logits_symm_mem(
+    monkeypatch, initializer_name
+):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda *args, **kwargs: pytest.fail(
+            "symmetric-memory state must not initialize"
+        ),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "try_create_dist_argmax_state",
+        lambda *args, **kwargs: pytest.fail(
+            "symmetric-memory state must not initialize"
+        ),
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+
+    assert getattr(processor, initializer_name)(SimpleNamespace()) is None
+
+
+def _set_fabric(monkeypatch, supported: bool) -> None:
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    # These tests model NVIDIA multicast regardless of the runner's platform.
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    # The topology is what makes these groups host-spread; without it the tests
+    # would name a property their own setup never established.
+    monkeypatch.setitem(
+        global_server_args_dict, "mapping", SimpleNamespace(nprocs_per_node=4)
+    )
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
+
+
+def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
+    monkeypatch,
+):
+    _set_fabric(monkeypatch, False)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=8,
+        tp_group=tuple(range(8)),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda **kwargs: pytest.fail("a group without fabric must not gather"),
+    )
+    # Distributed argmax is no longer topology-gated: cross-node groups probe
+    # for NVLS instead. This shard is below the kernel's vocab floor, so the
+    # state is rejected before any collective work.
+    monkeypatch.setattr(
+        logits_processor_module,
+        "try_create_dist_argmax_state",
+        lambda **kwargs: pytest.fail(
+            "a shard below the vocab floor must not reach the constructor"
+        ),
+    )
+
+    assert processor._init_all_gather_state(lm_head) is None
+    assert processor._init_dist_argmax_state(lm_head) is None
+
+
+def test_a_strided_tp_group_smaller_than_one_host_is_still_probed(monkeypatch):
+    """Two ranks on two hosts is fewer ranks than one host holds.
+
+    Sizing the group against the local device count would admit it with no
+    probe, and a group the fabric cannot map hangs in the rendezvous.
+    """
+    _set_fabric(monkeypatch, False)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 4),
+    )
+    assert not processor._tp_group_multicast_reachable()
+
+
+def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch):
+    """The probe allocates on this device alone, so a lone no must carry.
+
+    One node with no IMEX channels answers no while its peers answer yes; the
+    yes-ranks would then block in a rendezvous the no-ranks never enter.
+    """
+    _set_fabric(monkeypatch, True)
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(
+        fabric,
+        "group_has_fabric",
+        lambda ranks: False,
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=8,
+        tp_group=tuple(range(8)),
+    )
+    assert not processor._tp_group_multicast_reachable()
+
+
+def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkeypatch):
+    """An NVLink domain can span hosts, so fabric decides, not the host count."""
+    _set_fabric(monkeypatch, True)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=8,
+        tp_group=tuple(range(8)),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
+    created = {}
+
+    def _create_state(**kwargs):
+        created.update(kwargs)
+        return "ag-state"
+
+    monkeypatch.setattr(logits_processor_module, "create_state", _create_state)
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda backend, group: "pg",
+    )
+
+    try:
+        assert processor._init_all_gather_state(lm_head) == "ag-state"
+        assert created["hidden_size"] == 64
+    finally:
+        # The cache is class-level; drop the stub so it cannot leak.
+        LogitsProcessor._LOGITS_AG_STATES.pop((tuple(range(8)), 64), None)
+
+
+def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
+    """A failed probe falls back, latches its verdict, and skips capture."""
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(nprocs_per_node=4),
+    )
+    monkeypatch.setattr(logits_processor_module, "dist_argmax_available", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    capturing = {"on": True}
+    monkeypatch.setattr(
+        logits_processor_module.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing["on"],
+    )
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.distributed,
+        "all_reduce",
+        lambda tensor, **k: None,
+    )
+    calls = []
+
+    def failing_create(**kwargs):
+        calls.append(1)
+        return None  # the group has no NVLS multicast
+
+    monkeypatch.setattr(
+        logits_processor_module, "try_create_dist_argmax_state", failing_create
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 4),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.float32))
+
+    # Inside capture: no collective work, and nothing may latch.
+    assert processor._init_dist_argmax_state(lm_head) is None
+    assert len(calls) == 0
+
+    capturing["on"] = False
+    assert processor._init_dist_argmax_state(lm_head) is None
+    # The verdict is cached: the constructor must not be retried.
+    assert processor._init_dist_argmax_state(lm_head) is None
+    assert len(calls) == 1
+
+
+def test_dist_argmax_state_cache_separates_logits_dtypes(monkeypatch):
+    """An FP32 corrected-logits user must not reuse a BF16 sampler state."""
+    monkeypatch.setattr(logits_processor_module, "dist_argmax_available", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.distributed,
+        "all_reduce",
+        lambda tensor, **k: None,
+    )
+    created = []
+
+    def fake_create(**kwargs):
+        created.append(kwargs["dtype"])
+        return SimpleNamespace(dtype=kwargs["dtype"])
+
+    monkeypatch.setattr(
+        logits_processor_module, "try_create_dist_argmax_state", fake_create
+    )
+    monkeypatch.setattr(LogitsProcessor, "_LOGITS_DIST_ARGMAX_STATES", {})
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.bfloat16))
+
+    bf16_state = processor.acquire_dist_argmax_state(
+        lm_head, max_M=8, skip_ping_pong=False, dtype=torch.bfloat16
+    )
+    fp32_state = processor.acquire_dist_argmax_state(
+        lm_head, max_M=8, skip_ping_pong=False, dtype=torch.float32
+    )
+    assert bf16_state.dtype == torch.bfloat16
+    assert fp32_state.dtype == torch.float32
+    assert created == [torch.bfloat16, torch.float32]
+
+    # Both verdicts are independently cached.
+    assert (
+        processor.acquire_dist_argmax_state(
+            lm_head, max_M=8, skip_ping_pong=False, dtype=torch.float32
+        )
+        is fp32_state
+    )
+    assert len(created) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -179,6 +513,48 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):
     assert out.shape == (4, 4)  # local shard width retained, not gathered to 8
 
 
+def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatch):
+    """The uninitialised sentinel must not be mistaken for a built state.
+
+    The gate reduces across the group, so it is skipped inside a capture. The
+    sentinel is an ``object()`` and so passes ``is not None``: leaving it in
+    place would hand it to ``all_gather_inner`` as if it were a state. It must
+    also survive, or an eager call afterwards would never build the real one.
+    """
+    proc = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=8, final_logit_softcapping=None
+        ),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    monkeypatch.setattr(
+        proc,
+        "_init_all_gather_state",
+        lambda lm_head: pytest.fail("the gate must not run inside a capture"),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_inner",
+        lambda *a, **k: pytest.fail("the sentinel must never reach the gather"),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_single",
+        lambda out, inp, group: None,
+    )
+
+    hidden = torch.randn(4, 2, dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    out = proc._get_logits(hidden, lm_head, md)
+
+    assert out.shape == (4, 8)
+    assert proc._all_gather_state is LogitsProcessor._LOGITS_AG_STATE_UNINITIALIZED
+
+
 def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
     """final_logit_softcapping must disable the fused early-return so the
     softcap is applied to full-vocab logits (then a plain argmax runs)."""
@@ -205,9 +581,94 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
         logits_processor_module, "fused_softcap_generic", lambda *a, **k: None
     )
 
-    hidden = torch.randn(4, 2, dtype=torch.float32)
-    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))  # 4*2 == 8
+    hidden = torch.randn(4, 2, dtype=torch.bfloat16)
+    lm_head = SimpleNamespace(
+        weight=torch.randn(4, 2, dtype=torch.bfloat16)
+    )  # 4*2 == 8
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
     out = proc._get_logits(hidden, lm_head, md)
     assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
     assert out.shape == (4, 8)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def _logprob_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def test_get_token_ids_logprobs_gathers_every_position_in_one_index():
+    device = _logprob_device()
+    torch.manual_seed(0)
+    all_logprobs = torch.log_softmax(torch.randn(6, 8, device=device), dim=-1)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        extend_logprob_pruned_lens_cpu=[3, 0, 2, 1],
+        token_ids_logprobs=[[1, 5], [2], [], [7, 0, 3]],
+    )
+
+    val, idx = LogitsProcessor.get_token_ids_logprobs(all_logprobs, metadata)
+
+    rows = all_logprobs.tolist()
+    expected_val, pt = [], 0
+    for token_ids, pruned_len in zip(
+        metadata.token_ids_logprobs, metadata.extend_logprob_pruned_lens_cpu
+    ):
+        expected_val.append(
+            [[rows[pt + j][t] for t in token_ids] for j in range(pruned_len)]
+        )
+        pt += pruned_len
+    assert val == expected_val
+    assert idx == [[[1, 5], [1, 5], [1, 5]], [], [[], []], [[7, 0, 3]]]
+
+
+def test_extend_return_logprob_indices_stage_through_pinned_host():
+    device = _logprob_device()
+    torch.manual_seed(0)
+    vocab = 6
+    hidden = torch.randn(5, 4, device=device)
+    weight = torch.randn(vocab, 4, device=device)
+    input_token_ids = torch.tensor([0, 5, 2, 3], device=device)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=vocab)
+    )
+    # Two requests of 3 and 2 tokens; logprobs start at position 1 and 0.
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        extend_return_logprob=True,
+        extend_token_ids_logprob=True,
+        extend_seq_lens_cpu=[3, 2],
+        extend_logprob_start_lens_cpu=[1, 0],
+        extend_logprob_pruned_lens_cpu=[2, 2],
+        extend_input_logprob_token_ids_gpu=input_token_ids,
+        token_ids_logprobs=[[0, 2], [3]],
+        temp_scaled_logprobs=True,
+        temperature=torch.tensor([[0.5], [2.0]], device=device),
+    )
+
+    out = processor(
+        input_ids=None,
+        hidden_states=hidden,
+        lm_head=SimpleNamespace(weight=weight),
+        logits_metadata=metadata,
+    )
+
+    logits = hidden[1:] @ weight.T
+    torch.testing.assert_close(out.next_token_logits, logits[[1, 3]])
+    per_row_temperature = torch.tensor([0.5, 0.5, 2.0, 2.0], device=device)
+    scaled = torch.log_softmax(logits / per_row_temperature.view(-1, 1), dim=-1)
+    torch.testing.assert_close(
+        out.input_token_logprobs,
+        scaled[torch.arange(4, device=device), input_token_ids],
+    )
+    assert out.input_token_ids_logprobs_idx == [[[0, 2], [0, 2]], [[3], [3]]]
+    torch.testing.assert_close(
+        torch.tensor(out.input_token_ids_logprobs_val[0]),
+        scaled[0:2][:, [0, 2]].cpu(),
+    )
+    torch.testing.assert_close(
+        torch.tensor(out.input_token_ids_logprobs_val[1]),
+        scaled[2:4][:, [3]].cpu(),
+    )

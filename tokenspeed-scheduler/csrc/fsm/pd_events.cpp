@@ -30,27 +30,15 @@ namespace tokenspeed {
 namespace fsm {
 
 Submitted BootstrappedEvent::operator()(Bootstrapping&& state) {
-    return Submitted{state.token_container, state.page_size};
+    return Submitted{state.token_container, state.prefix_granularity};
 }
 
 Finished SucceededEvent::operator()(Decoding&& /*state*/) {
     return Finished{};
 }
 
-PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
-    TokenContainer::Window w = state.window;
-    auto prefill_done = PrefillDone{
-        state.GetTokenContainer(),
-        state.GetPageSize(),
-        std::move(state).TakeHostNodeRef(),
-        std::move(state).TakeDeviceNodeRef(),
-        std::move(state).TakeLocalKVAllocator(),
-        std::move(state).TakeReqPoolIndex(),
-        w,
-        0,  // reserve_num_tokens_in_next_schedule_event
-        std::move(state).TakeLocalMambaAllocator(),
-    };
-
+PrefillDone RemotePrefillDoneEvent::operator()(RemotePrefilling&& state) {
+    PrefillDone prefill_done{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
     prefill_done.ExtendResultTokens({bootstrap_token});
     return prefill_done;
 }

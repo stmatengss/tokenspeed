@@ -33,7 +33,7 @@ platform = current_platform()
 
 
 if platform.is_amd:
-    from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe import gluon_bf16_moe
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import gluon_bf16_moe
 
     @register_kernel(
         "moe",
@@ -110,4 +110,9 @@ if platform.is_amd:
             w.w2_weight,
             topk_ids,
             topk_weights.to(torch.float32),
+            expert_start=(
+                int(getattr(w, "ep_rank", 0))
+                * int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
+            ),
+            expert_parallel=int(getattr(w, "ep_size", 1)) > 1,
         )

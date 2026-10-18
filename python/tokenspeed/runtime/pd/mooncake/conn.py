@@ -26,14 +26,16 @@ from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
 from tokenspeed.runtime.pd.base.mooncake_engine import (
     MooncakeTransferEngine,
 )
+from tokenspeed.runtime.pd.cache_protocol import (
+    CacheTransferContract,
+)
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 
 class MooncakeKVManagerBase(DisaggManagerBase):
-    """KV (prefill->decode) manager: the shared engine/socket/status FSM plus the
-    KV-specific args, MLA flags, dp-attention wiring, and metrics."""
+    """CachePD manager: shared engine/socket/status state and typed slabs."""
 
     def __init__(
         self,
@@ -41,25 +43,18 @@ class MooncakeKVManagerBase(DisaggManagerBase):
         kv_args: KVArgs,
         disaggregation_mode: DisaggregationMode,
     ):
-        self.args = args
         self.kv_args = kv_args
-        self.attn_tp_rank = args.attn_tp_rank
-        self.src_mode = "ON" if bool(args.enable_mla_l1_5_cache) else "OFF"
-        self.is_mla_backend = args.is_mla_backend
-        self.draft_is_mla_backend = args.draft_is_mla_backend
+        self.topology = args.topology
+        self.topology.require_cache_pd_supported()
         self.disaggregation_mode = disaggregation_mode
         self.bootstrap_port = args.bootstrap_port
         self.dist_init_addr = args.dist_init_addr
-        self.world_size = args.world_size
-        self.dp_size = args.dp_size
-        self.attn_dp_rank = args.attn_dp_rank
-        self.enable_dp_attention = args.enable_dp_attention
-        if not args.enable_dp_attention and args.dp_size != 1:
+        if not args.enable_dp_attention and self.topology.dp_size != 1:
             raise ValueError(
                 "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
             )
 
-        if hasattr(args, "enable_metrics") and args.enable_metrics:
+        if args.enable_metrics:
             labels = {
                 "model_name": args.served_model_name,
                 "app_key": args.app_key,
@@ -79,46 +74,56 @@ class MooncakeKVManagerBase(DisaggManagerBase):
         super().__init__(engine=engine)
 
     def register_buffer_to_engine(self):
-        for kv_data_ptr, kv_data_len in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-        ):
-            self.engine.register(kv_data_ptr, kv_data_len)
-        for state_data_ptr, state_data_len in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-        ):
-            self.engine.register(state_data_ptr, state_data_len)
+        layout = self.kv_args.cache_layout
+        self.engine.register(
+            self.kv_args.kv_data_ptr,
+            layout.plan.arena_bytes,
+        )
 
 
 class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
-    """KV bootstrap rendezvous: the shared server plus the prefill-side MLA /
-    kv-page length fields the decode side needs in the parallel-info sync."""
+    """CachePD bootstrap rendezvous for one typed Prefill layout."""
 
     def __init__(self, port: int):
         # Set before super() -- super() starts the server thread, after which a
         # register PUT can call _ingest_put_extra and read these.
-        self.enable_mla_l1_5_cache = False
-        self.prefill_kv_item_lens = []
-        self.prefill_kv_unit_lens = []
-        self.prefill_state_item_lens = []
-        self.prefill_state_unit_lens = []
+        self.prefill_cache_layout_wire: str | None = None
+        self.prefill_cache_fields_by_stage: tuple[tuple[str, ...], ...] | None = None
         super().__init__(port)
 
     def _ingest_put_extra(self, data: dict) -> None:
-        self.enable_mla_l1_5_cache = bool(data["enable_mla_l1_5_cache"])
-        self.prefill_kv_item_lens = data.get("kv_item_lens", self.prefill_kv_item_lens)
-        self.prefill_kv_unit_lens = data.get("kv_unit_lens", self.prefill_kv_unit_lens)
-        self.prefill_state_item_lens = data.get(
-            "state_item_lens", self.prefill_state_item_lens
-        )
-        self.prefill_state_unit_lens = data.get(
-            "state_unit_lens", self.prefill_state_unit_lens
-        )
+        cache_layout_wire = data.get("cache_layout")
+        if not isinstance(cache_layout_wire, str):
+            raise ValueError("CachePD bootstrap layout must be a string")
+        try:
+            cache_layout = CacheTransferContract.from_wire_bytes(
+                cache_layout_wire.encode("ascii")
+            )
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise ValueError("CachePD bootstrap layout is invalid") from exc
+        from tokenspeed.runtime.pd.transfer_plan import validate_cache_stage_fields
+
+        raw_stages = data["cache_fields_by_stage"]
+        if not isinstance(raw_stages, (list, tuple)) or any(
+            not isinstance(stage, (list, tuple)) for stage in raw_stages
+        ):
+            raise ValueError("CachePD requires explicit stage field placement")
+        stages = tuple(tuple(stage) for stage in raw_stages)
+        validate_cache_stage_fields(cache_layout, stages)
+        if len(stages) != int(data["pp_size"]):
+            raise ValueError("CachePD placement does not match pipeline stage count")
+        if self.prefill_cache_fields_by_stage not in (None, stages):
+            raise ValueError(
+                "CachePD prefill ranks registered incompatible field placement"
+            )
+        canonical_wire = cache_layout.to_wire_bytes().decode("ascii")
+        if self.prefill_cache_layout_wire not in (None, canonical_wire):
+            raise ValueError("CachePD prefill ranks registered incompatible layouts")
+        self.prefill_cache_layout_wire = canonical_wire
+        self.prefill_cache_fields_by_stage = stages
 
     def _extra_parallel_info(self) -> dict:
         return {
-            "enable_mla_l1_5_cache": self.enable_mla_l1_5_cache,
-            "kv_item_lens": self.prefill_kv_item_lens,
-            "kv_unit_lens": self.prefill_kv_unit_lens,
-            "state_item_lens": self.prefill_state_item_lens,
-            "state_unit_lens": self.prefill_state_unit_lens,
+            "cache_layout": self.prefill_cache_layout_wire,
+            "cache_fields_by_stage": self.prefill_cache_fields_by_stage,
         }

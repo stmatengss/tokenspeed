@@ -69,15 +69,31 @@ class QuantizationConfig(ABC):
         """Name of the quantization method."""
         raise NotImplementedError
 
-    def moe_weight_dtype(self) -> str:
+    def moe_weight_dtype(self, prefix: str = "") -> str:
         """Logical MoE weight dtype fed to ``moe_plan`` as the ``weight_dtype`` trait.
 
         Must name a concrete dtype the kernels register against (``fp8``,
         ``nvfp4``, ``mxfp4``), not the quant method. Configs whose name already
         is the dtype need no override; container formats (compressed-tensors)
-        resolve it from the parsed scheme.
+        resolve it from the parsed scheme. Mixed-precision configs resolve it
+        per layer from ``prefix`` (the MoE experts module); single-algorithm
+        configs ignore the argument.
         """
         return self.get_name()
+
+    def get_moe_quant_config(self, prefix: str) -> "QuantizationConfig":
+        """Return the concrete quantization config for a routed MoE layer."""
+        return self
+
+    def apply_checkpoint_name_replacements(
+        self, replacements: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Rewrite checkpoint module names in this config to runtime naming.
+
+        Called by the model loader with the model's ordered (old, new)
+        substring table. Only configs keyed by checkpoint module names
+        (mixed precision) need to override; the default is a no-op.
+        """
 
     @abstractmethod
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
@@ -183,6 +199,24 @@ class LinearMethodBase(QuantizeMethodBase):
         """Apply the weights in layer to the input tensor.
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
+
+    def apply_with_activation(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        activation: nn.Module,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply an activation followed by the linear operation.
+
+        Quantized methods may override this semantic boundary when their
+        prepared kernel supports fused activation and input quantization.
+        """
+        return self.apply(layer, activation(x), bias)
+
+    def prepared_linear_plan(self, layer: nn.Module) -> object | None:
+        """Return an opaque backend warmup plan, if this layer prepared one."""
+        return None
 
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:

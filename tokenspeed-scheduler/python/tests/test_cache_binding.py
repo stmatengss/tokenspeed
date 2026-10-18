@@ -18,28 +18,68 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for CacheEvent Python bindings."""
+"""Tests for cache-related Python bindings."""
 
+import pytest
+import tokenspeed_scheduler as ts
 from tokenspeed_scheduler import Cache, ExecutionEvent
+
+
+def test_removed_storage_cache_api_is_not_exported():
+    assert not hasattr(ts, "PrefixCacheAdjunctSpec")
+
+    config = ts.SchedulerConfig()
+    assert not hasattr(config, "prefix_cache_adjunct")
+    assert not hasattr(config, "prefetch_threshold")
+
+    request = ts.RequestSpec()
+    assert not hasattr(request, "rolling_hashes")
+    assert not hasattr(request, "storage_hit_pages")
+
+    assert not hasattr(Cache, "PrefetchDoneEvent")
+    assert not hasattr(Cache, "PrefetchOp")
+    assert not hasattr(Cache, "BackUpOp")
+    assert not hasattr(Cache, "CacheKind")
+    assert not hasattr(Cache.WriteBackOp, "is_retract")
+    assert not hasattr(Cache.WriteBackOp, "src_pages_by_kind")
+    assert not hasattr(Cache.LoadBackOp, "src_pages_by_kind")
+    assert not hasattr(ts.Forward.Batch, "hist_token_lens")
+    assert not hasattr(ts.Scheduler, "get_request_paged_cache_page_ids")
+
+
+def test_write_back_op_carries_the_source_guard():
+    # The runtime branches on how the scheduler guards the Device sources
+    # (pinned until the ACK, or released and stream-ordered), never on why.
+    assert hasattr(Cache.WriteBackOp, "source_pinned")
 
 
 def test_cache_event_fields_are_bound():
     write_back = Cache.WriteBackDoneEvent()
-    write_back.success = True
-    assert write_back.success is True
+    write_back.op_id = 7
+    assert write_back.op_id == 7
 
-    prefetch_done = Cache.PrefetchDoneEvent()
-    prefetch_done.request_id = "req-1"
-    assert prefetch_done.request_id == "req-1"
+    load_back = Cache.LoadBackDoneEvent(8, False)
+    assert load_back.op_id == 8
+    assert load_back.success is False
+    with pytest.raises(TypeError):
+        Cache.LoadBackDoneEvent()
+    with pytest.raises(TypeError):
+        Cache.LoadBackDoneEvent(9)
 
 
 def test_execution_event_accepts_cache_events():
     execution_event = ExecutionEvent()
 
     write_back = Cache.WriteBackDoneEvent()
-    write_back.success = True
     assert execution_event.add_event(write_back) is execution_event
 
-    prefetch_done = Cache.PrefetchDoneEvent()
-    prefetch_done.request_id = "req-0"
-    assert execution_event.add_event(prefetch_done) is execution_event
+    load_back = Cache.LoadBackDoneEvent(8, True)
+    assert execution_event.add_event(load_back) is execution_event
+
+
+def test_forward_retract_event_is_bound():
+    retract = ts.ForwardEvent.Retract()
+    retract.request_id = "r0"
+    assert retract.request_id == "r0"
+    execution_event = ExecutionEvent()
+    assert execution_event.add_event(retract) is execution_event

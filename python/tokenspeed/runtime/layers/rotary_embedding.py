@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
     apply_rope,
 )
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -178,7 +176,6 @@ class RotaryEmbedding(torch.nn.Module):
         fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
         output_q_rope: torch.Tensor | None = None,
         output_k_rope: torch.Tensor | None = None,
-        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is not None:
             raise ValueError("embedding.rope does not support offsets")
@@ -193,7 +190,6 @@ class RotaryEmbedding(torch.nn.Module):
             fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=output_q_rope,
             k_rope_out=output_k_rope,
-            enable_pdl=enable_pdl,
         )
 
     def extra_repr(self) -> str:
@@ -679,7 +675,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         fused_mla_set_kv_buffer_arg=None,
         output_q_rope=None,
         offsets: torch.Tensor | None = None,
-        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is None:
             return super().forward(
@@ -690,7 +685,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
                 fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
                 output_q_rope=output_q_rope,
                 offsets=offsets,
-                enable_pdl=enable_pdl,
             )
         if (
             fused_set_kv_buffer_arg is not None
@@ -873,7 +867,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
         self,
         positions: torch.Tensor,
@@ -1035,6 +1028,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen3_vl_moe",
                         "qwen3_5",
                         "qwen3_5_moe",
+                        "qwen4_exp",
                     ):
                         t_index = (
                             torch.arange(llm_grid_t)

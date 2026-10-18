@@ -30,16 +30,16 @@ def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     run_smg_from_args(args, raw_argv)
 
 
-def _bench(args: argparse.Namespace) -> None:
-    from tokenspeed.bench import main as bench_main
-
-    bench_main(args.bench_args)
-
-
 def _env(args: argparse.Namespace) -> None:
     from tokenspeed.env import main as env_main
 
     env_main()
+
+
+def _merge_traces(args: argparse.Namespace) -> None:
+    from tokenspeed.cli.trace_merge import main as merge_traces_main
+
+    merge_traces_main(args.merge_args)
 
 
 def _version(args: argparse.Namespace) -> None:
@@ -61,21 +61,35 @@ def main() -> None:
     serve_parser = subparsers.add_parser(
         "serve",
         help="Launch the TokenSpeed inference server.",
+        description="Launch the TokenSpeed inference server: the full serving "
+        "stack by default (currently an smg gateway fronting a gRPC engine), "
+        "or the engine alone with --headless.",
+    )
+    serve_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the engine only, without a frontend. An external frontend "
+        "— e.g. `smg serve --backend tokenspeed --connection-mode zmq` — "
+        "binds the msgpack ZMQ sockets and this engine dials in at "
+        "--data-parallel-address/--data-parallel-rpc-port (default "
+        "tcp://127.0.0.1:30500). Implies --zmq-msgpack and "
+        "--skip-tokenizer-init.",
     )
     serve_parser.set_defaults(func=_serve)
-
-    bench_parser = subparsers.add_parser(
-        "bench",
-        add_help=False,
-        help="Run TokenSpeed benchmark commands.",
-    )
-    bench_parser.set_defaults(func=_bench, bench_args=[])
 
     env_parser = subparsers.add_parser(
         "env",
         help="Check environment configurations and dependency versions.",
     )
     env_parser.set_defaults(func=_env)
+
+    merge_traces_parser = subparsers.add_parser(
+        "merge-traces",
+        add_help=False,
+        help="Merge one or more Proton/VizTracer trace pairs onto a shared "
+        "timeline.",
+    )
+    merge_traces_parser.set_defaults(func=_merge_traces, merge_args=[])
 
     version_parser = subparsers.add_parser(
         "version",
@@ -89,8 +103,8 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    if args.func is _bench:
-        args.bench_args = extra_args
+    if args.func is _merge_traces:
+        args.merge_args = extra_args
         args.func(args)
         return
 

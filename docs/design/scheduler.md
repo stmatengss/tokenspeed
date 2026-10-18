@@ -1,0 +1,664 @@
+# Scheduler: admission, retraction and recovery
+
+The C++ scheduler (`tokenspeed-scheduler/`) decides, once per round, what each
+engine does next. This document covers one axis of that: **at what granularity
+KV capacity is admitted**, what happens when admission fails, and how a
+retracted request comes back — per engine role.
+
+Companion documents: `event-loop.md` (the control/data plane split that
+consumes these plans), `cache-concepts.md` (the vocabulary below —
+prefix granularity, cache groups, LCM blocks).
+
+## 1. Admission is per chunk
+
+A prompt is prefilled in chunks bounded by `max_scheduled_tokens`
+(`--chunked-prefill-size`). Capacity is admitted **for the chunk being
+scheduled, never for the whole prompt**: `schedulePrefill` /
+`schedulePrefillFirstChunk` build one `GroupDemand` per cache group sized by
+this chunk's tokens, and the coordinator either grants the pages or the
+request stays put. Alongside the demands, one `RequestProgress` per request
+carries what it computed since its previous admission — the prefix pages
+just completed and its computed-token count — which the coordinator publishes
+and reclaims inside the same `Admit` (`advanceRequestProgress` in
+`scheduler/operations/forward.cpp` is the one place that hashes those pages
+and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
+for why publication rides with admission).
+
+When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
+`host_prefix_tokens` and rounds that length down to `prefix_granularity`
+(the identity boundary every group's `block_granularity` divides).
+`acquireHostWithKeys` re-runs the non-prefix-closed matcher at that bound
+and reconverges the groups: truncating a sliding-window or Mamba hits
+mask (for example `[0, 1, 1]` to `[0, 1]`, with a five-token window and
+two-token blocks requiring two lookback pages) can leave the first live
+lookback page as a hole, and a full re-probe would see the same L3 keys
+as a complete hit again. Retry count is the probed Host span in prefix
+pages, not a fixed cap, so a long window/Mamba hit can shrink to the
+Device floor instead of asserting. `schedulePrefillFirstChunk` then frees that
+attempt — including the discarded `AdmissionResult`, whose `load_pairs`
+pin Host sources and Device destinations independently of the tables —
+and retries from the shortened probe so `hit_tokens` / `tokens_this_round`
+match the tables. Each retry recomputes the reserve from the cache group's
+declared `block_granularity`, using the same reservation interface as later
+prefill chunks.
+
+Two adjustments ride on top of the raw chunk size. Both are pure token
+arithmetic kept out of the planner: how a chunk is cut lives in
+`scheduler/operations/prefill_chunk.h` (`PrefillChunkTokens` is the one
+entry both prefill paths call), what each group demands for it in
+`scheduler/operations/group_demands.h`.
+
+**Alignment.** `AlignPrefillChunk` shortens a chunk so it ends on a prefix-page
+boundary (or on a promotion boundary), because a page is the unit of prefix
+caching — a chunk ending mid-page would leave a partial page that can never be
+matched. A chunk that *completes* the prompt is exempt: there is no next chunk
+to align for.
+
+**Reserve.** What an admission holds beyond the chunk it computes is stated
+once per round (`PrefillReserve`: decode width, prompt headroom,
+whether the round finishes shaping the state groups) and turned into each
+group's page demand by `ReservePrefillDemands` — the only writer of
+`GroupDemand::reserve_tokens`. It picks the rule by the group's retention,
+never by call site:
+
+- *Full-history* groups hold the decode slot — the chunk that
+  completes the prompt reserves `decode_input_tokens`, so the first decode step
+  is guaranteed a slot; intermediate chunks reserve nothing, they are not about
+  to decode — raised on a decoding role's first chunk to the rest of the prompt
+  plus the admission headroom (§4), so a partially prefetched request is never
+  stranded.
+- *Sliding-window* groups recycle slid-out pages, so the rest
+  of the prompt costs them nothing: they hold only the decode slot.
+  Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
+  waiting on a pool that had room for it.
+- *Snapshot-state* groups reserve at least one growth block on a decoding
+  role's completing chunk or remote landing, and nothing on other rounds (§1.2).
+
+The decode slot is reserved on **every** role, the P role included. A P node
+never decodes locally, but with speculation configured the forward that
+completes a prompt runs the drafter once and writes its candidate block into
+the `decode_input_tokens` slots behind the prompt — the same window a decoding
+role verifies into — before `plan.remote_decode` ships the candidates. Without
+that reserve those rows have no page and fall to the dummy slot, and the block
+attention that reads them back proposes garbage. What P does *not* reserve is
+decode growth: no admission headroom, no snapshot-state growth block, no
+overlap protection (§3.1). The capacity model (§1.4) states the same split.
+
+### 1.1 Head-of-line: an incomplete prefill holds the queue
+
+`holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
+prefill that is still incomplete. Nothing behind it is scheduled that round.
+
+The reason is that per-chunk admission gives an in-progress prefill **no claim
+on the capacity it still needs**. Let a newcomer take pages while a prompt is
+half prefilled, and the half-prefilled one may never assemble its remaining
+chunks — it holds pages, makes no progress, and eventually has to be retracted,
+throwing away work already done.
+
+The cost is one round of queue latency; the alternative risks a retraction
+cycle. One full chunk already saturates the GPU, so interleaving a newcomer
+into the same round buys no throughput to offset that risk.
+
+**Holding is a property of the *incomplete*, decided at plan-build time.** A
+chunk that reaches the end of its prompt moves the request to `PrefillDone`
+inside the same plan build (`SchedulePrefillEvent` picks the successor state
+by whether the window reaches `PrefillSize()`), so a prompt scheduled in full
+never holds the line. A round can therefore carry **several prefills that
+complete this round plus at most one truncated one — and the truncated one is
+necessarily last**, because `holdsHeadOfLine` seals the phase the moment it
+appears. With 6K of budget left and prompts of 2K / 1K / 10K waiting, the
+round schedules the 2K and the 1K in full and the first 3K chunk of the 10K
+prompt, then stops. The same rule makes the finishing round of a chunked
+prefill cheap: its final chunk releases the line *within* the round, so the
+prompts queued behind it start in that round, not the next.
+
+**Decodes are not part of the line.** In mixed mode the decode batch is built
+before the prefill phases and takes its token budget first (§3.3), so a round
+is *all decodes + the completing prefills + at most one truncated prefill*.
+Outside mixed mode, prefill and decode never share a round at all — decodes
+get the round only when no prefill scheduled — so head-of-line only ever
+orders prefills against each other, never a decode behind a prefill.
+
+### 1.2 State checkpoints: one forward
+
+A stateful prompt may finish off a prefix boundary. Its final state is needed
+to continue decode, while the preceding aligned state is needed to publish the
+last reusable prefix page. The scheduler schedules the whole final extent in
+one forward, materializing both the aligned checkpoint and the final,
+request-local continuation state. This applies when the remaining extent fits
+the round's token budget and has no pending prefix-promotion boundary inside it.
+`AlignPrefillChunk` still enforces those limits; checkpoint output alone never
+creates an extra forward.
+
+For example, after a 50,432-token cache hit with an 868-token extent and
+128-token prefix granularity, the scheduler submits `[868]`. This produces an
+aligned checkpoint at token 51,200 and a final state at token 51,300. With only
+800 tokens of budget left, the same request instead schedules 768 tokens and
+leaves 100 for a later round: ordinary chunking is still required.
+
+Admission allocates the sparse state suffix beginning at the aligned checkpoint
+when one falls inside the chunk. It includes the final state block and any
+role-appropriate decode reserve atomically. Only the latest internal aligned
+checkpoint is materialized, not every prefix boundary traversed by the chunk.
+An aligned endpoint is itself the checkpoint; an extent crossing no boundary
+needs only its final output. Only materialized aligned checkpoints are cached;
+an off-boundary endpoint is never keyed as a complete prefix.
+
+`CacheProgress::materialized_state_boundaries` records the aligned checkpoints
+produced by admitted prefill windows: local prefill records its last aligned
+boundary, and a remote landing records only an aligned endpoint. Publication
+uses the preceding window's record before the next prefill advances it.
+Only recorded boundaries within the newly hashed range are eligible. A
+successful admission discards the covered records; a failed one leaves them
+for retry.
+
+Only materialized State Endpoint/Promoted boundaries are published; ordinary
+Chunks remain request-owned. For newly completed prefix hashes, the last aligned
+prompt checkpoint is an Endpoint unless already Promoted, including before a
+short final tail. A step with no newly completed hashes does not publish or
+upgrade state. Admission from `PrefillDone` can publish pending prefill state
+before local decode or PD handoff; decode itself records and publishes no state
+checkpoints. History publication and working-state retention use the exact
+`Request::NumComputedTokens()` frontier (§5).
+
+One forward means one model dispatch, not one kernel launch. The state backend
+handles checkpoint outputs within it: the example's recurrent scan evaluates
+768 body tokens and then the remaining 100 tokens from the body state. These
+are not two scheduler requests or repeated full-model forwards. The batched
+conv/state writes and scan continuation contract are described in
+[Cache concepts](cache-concepts.md#snapshot-state-prefill-checkpoints); the scheduler
+only supplies the full extent and block tables, not a body/tail execution plan.
+
+An incomplete prefill holds the head of line; a completing prefill releases
+it within the same plan build. The same rule applies with prefix caching
+disabled and during local recovery on a decode node. Remote decode-role
+admission keeps its endpoint-only landing layout.
+
+The capacity guarantees are retention-specific:
+
+- **History and sliding-window groups reserve decode tokens.** A decoding
+  role's first chunk additionally raises full-history reserve to the remaining
+  prompt plus admission headroom; sliding-window groups do not hold headroom.
+- **Snapshot-state groups on decoding roles reserve growth at the admission
+  that finishes shaping them** (completing chunk or remote landing):
+  `ReservePrefillDemands` reserves `max(block_granularity, decode_input_tokens)`,
+  at least one block beyond the endpoint for every prompt length.
+  Without it an endpoint with no spare block needs a fresh **empty** parent
+  per state group at its first boundary crossing. A full pool can deadlock
+  when residents are retraction-exempt because their generation is covered by
+  admission headroom (§4). Invariant: *no request needs an empty parent
+  for its first crossing* — it already owns the block. Later crossings
+  re-acquire from the shared pool and depend on the capacity bound (§1.4) and
+  admission back-pressure.
+  The P role and intermediate local chunks reserve no growth block (the next
+  sparse re-shaping requires `AvailableTokens() == 0`).
+
+Finish can publish a pending prefill checkpoint, then queues existing prefill
+cache for L2 without upgrading its kind. With L2, prefill retraction may publish
+a materialized recovery Endpoint at the completed window boundary; `Prefilling`
+and `PrefillDone` both use their actual prefill window. Decode retraction adds
+no state checkpoint. Missing cache is recomputed through ordinary prefill.
+
+### 1.3 Bounded replay
+
+A sliding History group can be declared **replayable** (`CacheGroupConfig::
+replayable`, see [Cache concepts](cache-concepts.md)): it leaves
+prefix caching entirely — never matched, published or streamed — and the
+model regenerates its rows from **re-fed prompt tokens**. DeepSeek V4.1's SWA
+rows and compressor tails are the motivating case: caching them persistently
+costs more than recomputing a bounded window, and the prefix hit should
+depend on the global KV alone. What a hit re-feeds is the group's whole
+retention window: retention keeps exactly what the queries after the hit
+read, and every page the group retains must be regenerated, so there is no
+second number to declare.
+
+The cache facts live on the `CacheCoordinator`, next to the specs they
+derive from: `ReplayWindowTokens()` (`W`, the largest `sliding_window_tokens`
+over the replayable groups) and `ReplayTokens(P)` (`min(W, P)`, what a hit at
+`P` must re-feed). The
+scheduling rules live with the other chunk-cutting rules in
+`scheduler/operations/prefill_chunk.h`; the forward planner never branches on
+replay — the two decisions below reach the common path only through
+`PrefillChunkTokens`, the one chunk-sizing helper both prefill paths call,
+which also carries the snapshot-state and promotion alignment every chunk
+already went through:
+
+- **After a prefix hit at `P`**, the first chunk re-feeds `[P − min(W, P), P)`
+  ahead of its new tokens, so the queries at and after `P` find the whole
+  window regenerated. This is the only place tokens are re-fed.
+- **No prompt's final chunk is shorter than `W`** (`ChunkKeepingFinalWindow`):
+  a chunk that would leave `0 < remainder < W` is shortened so exactly `W`
+  remain. A promotion boundary (the alignment rule above) that falls inside that final window
+  yields: no chunk end satisfies both rules, so the chunk passes the boundary
+  and the closed group recomputes the promoted pages rather than the request
+  waiting forever. The model narrows its decoder to the prompt's last window, which
+  must therefore arrive in one forward — as new tokens, never by re-feeding
+  what an earlier chunk of the same request already computed.
+
+The re-fed rows are ordinary forward input — they consume the round's token
+budget like any other row and `input_length` counts them — but they are not
+progress: `TokenContainer::Window{begin, size, replay}` keeps `begin`/`size`
+as the tokens this chunk computes (`replay` is non-zero only on a hit's first
+chunk), and `MakePrefillInfo` derives the model input
+`[begin − replay, begin + size)`. The runtime sees the pair
+`extend_prefix_len = begin − replay` and `extend_replay_len = replay` on the
+`ForwardBatch`; positions `[extend_prefix_len, extend_prefix_len +
+extend_replay_len)` regenerate the replayable groups only and must not be
+written into any other group, whose rows already sit in the shared cached
+pages the hit claimed.
+
+Capacity: a replayable group claims no hit pages, so at first admission its
+table is empty and `CacheCoordinator::Admit` itself materializes it as a
+sparse private suffix from the replay window's first token — slots below stay
+null holes, exactly as absolute-slot tables require — while closed groups keep
+the dense demand beyond `P` the caller stated. The FSM derives the window's
+`replay` from the same coordinator (`SchedulePrefillFirstChunkEvent`), so no
+event or scheduler operation carries a replay parameter. Later chunks change
+nothing.
+
+Budget: `SchedulerConfig::Validate` requires `max_scheduled_tokens ≥ W +
+max(W, P)` — a hit chunk re-feeds up to `W` and must still advance: by every
+new token when fewer than `W` remain, or by one prefix page when a promotion
+boundary aligns it — the first chunk spends the hit window before sizing its
+new tokens (and waits for a fresher budget when none is left), and in fused
+mixed mode the decode batch leaves that same amount for a pending local
+prefill (`MinPrefillChunkTokens`, the same reserve the mamba checkpoint page
+uses). Replay is re-derived at every
+admission, so a retracted request carries nothing: its readmission re-probes
+and replays from the new `P`. Replayable groups cannot be combined with
+snapshot-state groups, whose chunk alignment would fight the final-window
+rule.
+
+PD: a replayable group travels like any sliding-window group. The prefill
+role replays on its own local hits exactly as the fused role does and, at
+completion, transfers the group's retained tail (`full_suffix` selects the
+pages intersecting the last `sliding_window_tokens − 1` positions). Every
+page of that tail exists because a hit re-feeds the whole retention window:
+the regenerated suffix starts at or before the tail. The decode role computes no prompt rows, so
+`SchedulePrefillFirstChunkEvent` gives a remote prefill `replay = 0` and
+`Admit` leaves a demand that already names the landing's sparse suffix
+alone; the landed tail is what the first decode steps read, with no
+regeneration anywhere.
+
+### 1.4 What bounds a single request
+
+`MaxSingleRequestTokens` is a **startup** bound computed by binary search over
+`CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):
+the largest prompt whose worst-case working set — aligned checkpoint + final
+continuation state, decode reserve, overlap-depth protection, the state growth
+block, and for chunked sparse local recovery the retained input checkpoint
+(and, with the prefix cache on, a first chunk's cached one) — fits the pool.
+It is not a live check against currently free capacity; a prompt within the
+bound can still fail admission right now and simply waits.
+
+The `CapacityModel` is deliberately **config-only**: it reads every
+`SchedulerConfig` field that is known before a pool exists and no
+`total_pages`, validating that subset through
+`SchedulerConfig::ValidateCapacityInputs()`. That is what lets the Python
+recipes size a pool from the same model before the arena is allocated
+(`recipes/scheduler_bridge.py` builds an unsized config and asks
+`ConcurrentGroupPages(max_total_tokens, max_context_len)` for each group's
+demand at `max_batch_size` live requests), and then lets the `Scheduler`
+bound requests against the pool they sized. The per-request working set —
+`decode_width + overlap_schedule_depth * decode_width` protected tokens,
+`SnapshotStateReserveTokens`, a group's prefix-match lookback (the same
+`PrefixMatcher` the coordinator builds, via `MakePrefixMatcher`) — exists in
+that one file; neither side restates it. The two answers are tied by an
+invariant the model's tests sweep: for one live request of `L` tokens,
+`ConcurrentGroupPages(L, L)` is never below `SingleRequestGroupPages(L)` in
+any group, so a pool sized for the configured concurrency admits every
+request the bound accepts.
+
+Per group, `ConcurrentGroupPages` charges: a snapshot-state group its
+single-request peak once per live request (the working set does not grow
+with history); a prefix-closed history group `ceil(T / g)` dense pages plus,
+per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
+protected tokens that may spill past it; a sliding group, per request,
+`ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
+pages, plus one in-flight prefill chunk behind its lookback (or, on the
+decode role, the landing bound `min(dense, lookback + window)` per request).
+
+For an internal checkpoint followed by `tail` tokens, the forward holds
+both the tail and the ordinary growth reserve: the output working set is
+`1 + ceil((tail + reserve) / block_granularity)` blocks. Admission and the
+capacity bound share `SnapshotStateReserveTokens` for the growth reservation.
+The retained input is additional. With ordinary decode and equal prefix/state
+grains, an unaligned finishing chunk can therefore need four state blocks,
+not three. This also applies to local recovery on a decode node, and to
+single-forward execution with prefix caching disabled. Narrower state blocks
+must count the entire materialized suffix, not assume that two outputs always
+occupy two adjacent slots. Tests cover small pools that must reject an oversized
+request instead of accepting a request that can never produce a forward.
+
+## 2. Retraction: when admission fails
+
+`maybeRetractForCapacity` fires when **no prefill made progress** this round
+(`PlanBuild::NoPrefillProgress()`: nothing was admitted and no resident prefill
+advanced a chunk) and an admission failed for capacity. Decode steps do not
+count as progress — they release no capacity, so a round of pure decode leaves
+a stalled prefill exactly as stuck as an empty one.
+
+**Retract-and-grant, in one round.** The retraction serves a specific request —
+the first candidate whose admission failed for capacity
+(`AdmissionFeedback::capacity_blocker`). Victims are retracted and the blocked
+admission is **retried in the same plan build**, looping (retract → retry →
+retract) until it fits or the victims run out. The freed capacity therefore
+reaches the request it was freed for within the round; there is never a free
+page waiting for whoever asks first next round, which is what previously
+required a cross-round capacity barrier. Two edges of the loop:
+
+- **The victim may BE the blocker** (a resident request blocked on its own
+  next page is the preferred victim). It comes back through the readmission
+  phase; the grant is redirected to the first waiting prompt instead —
+  granting the pages straight back to the victim's own readmission is the
+  loop the grant exists to break.
+- **A grant that cannot legally join its round's batch** (a D-role recovery
+  chunk beside an already-built decode batch; a fused prefill beside decodes
+  outside mixed mode) still retracts one victim, and the next round's phase
+  order (§3) tries the blocker before any other claim.
+
+**The victim's pages are released — and grantable — immediately**, even though
+its L2 snapshot has not been copied yet. The snapshot store is issued with
+`StoreSourceGuard::kStreamOrdered`: its ticket pins only the Host destination,
+and the runtime fences the **forward thread's stream** on the D2H copy's
+completion ahead of everything else the plan does to those pages — that
+stream carries the zeroing, fences the forwards, and gates a granted remote
+prefill's RDMA trigger (see `DeviceHandle.execute` and `event-loop.md`) — so
+the copy reads the old bytes whatever the scheduler does with the pages. This
+is the one store that pays for its ordering on the forward's critical path,
+and it has to: the pages are gone in the same round.
+
+**Every other store pins its Device sources until the ack.** Boundary
+publications of a live request and the finish-time flush are issued with
+`StoreSourceGuard::kPinnedUntilAck`: the ticket holds a `CacheBlockRef` on
+each source, so the block stays cached and unevictable — the admission planner
+cannot take it, `ClearDeviceCache` refuses, `NumNewlyReleasableLcmBlocks` does
+not count it — until `CompleteWriteBack` publishes the Host entry and drops the
+pin. Nothing else needs to know the copy is in flight, so the runtime copies
+on its own stream and no forward waits. A cached block is never written again
+by its owner (prefix reuse already depends on that), so the pin alone makes
+the copy race-free. Both guards are one path — `StartPendingStores(guard)` —
+and the op carries `source_pinned` to the runtime, which branches on the guard
+and never on the reason.
+
+**Per-victim quiescence, not global.** A request whose own forward is still
+out must not be retracted — its result would land on pages it no longer owns —
+and one whose pages a PD transfer still pins must not be either. Both are
+checked on the chosen victim; if it is not quiescent, retraction waits for it
+rather than sacrificing a worse-ranked request. Two global gates remain. An
+in-flight load-back: it is writing pages its readmission owns, and the victim
+policy cannot see that write. And an in-flight *pinned* store: it holds Device
+capacity the ack returns by itself, so retracting anyone for that capacity
+would be the thrash of §4 — the blocked admission retries against the
+released pins next round instead. Stream-ordered stores hold nothing and gate
+nothing.
+
+The forward-out check is a count in `fsm::ForwardResources`, incremented when
+a forward is scheduled and cleared when its result lands. It lives in the
+resource bundle rather than on the states that consume a *token*, because a
+forward is out against the **pages**, and the bundle is what holds the pages.
+Every page-holding state carries one bundle, and a transition moves it whole
+to the successor state — so the count, like the pages, cannot be dropped on
+the way from one state to the next.
+
+The bundle follows one rule: **resources and publication progress land when
+an admission succeeds; a state transition only moves them, never modifies
+them.** The block tables are filled by the coordinator inside `Admit`; the
+cache progress (prefix-hash chain, promotion boundary, pending state
+checkpoints) is advanced by the scheduler on a copy, handed to that same
+admission — which publishes the newly completed pages — and written back to
+the request only after it succeeds. A failed admission therefore leaves both
+untouched, and the retry re-derives the same completed pages and asks for
+their publication again. Committing progress before admission would record
+the pages as hashed while never publishing them. Landed results advance token
+progress but add no reusable state checkpoints (§1.2).
+The scheduling events carry nothing but the shape of the next state (chunk
+size, decode reserve). An intermediate prefill chunk produces no token but
+does write KV, so it reports back with an empty `ExtendResult`: the arrival
+is the point, not the payload. Work this
+engine does not perform — the peer's decode on a P node, the peer's prefill on
+a D node — is not counted here; those are fenced by the PD transfer ack.
+
+**Victim choice** (`chooseVictim`, shared by D and fused): an incomplete
+prefill first — it has produced no output a client is reading, and L2 writeback
+may preserve a computed checkpoint for the retry — largest first, freeing the
+most at once; then decode work by most newly releasable LCM blocks and fewest
+tokens — the most capacity for the least lost work. Exempt in both tiers: a
+request whose reserve already covers its whole generation
+(`Request::ReserveCoversGeneration`) — retracting it frees exactly what its
+readmission must take back, pure thrash.
+
+The P role never retracts: `buildPrefillWorkerPlan` simply does not call
+`maybeRetractForCapacity` (the only two call sites are the D and fused
+grammars). See 3.1 for why.
+
+## 3. Per role: explicit phases
+
+Each role's plan builder is a sequence of **phases** over one stable
+candidate order: **submission order** (`requests_` is a vector — the FIFO —
+with a side index by id for lookups). It is identical on every rank because
+the mirrored schedulers receive identical submission batches, so no sort is
+needed for determinism, and within a phase older requests win — FIFO is the
+fairness policy, not an accident of key order. There is no priority ladder:
+what used to be a rank in a ladder is now the position of a phase in its
+builder, readable top to bottom. A round schedules each request at most once
+(`PlanBuild::Scheduled`), whatever states it moves through while the phases
+run.
+
+A pass's mutable state is split in two on a layer boundary. `PlanBuild` — the
+output plan, the batch under construction, budgets, and the composition flags —
+is held by the role grammars alone, and every operation enters the batch
+through one gate, `pushOperation`, where budget and flag accounting live. The
+per-request admission layer (`admit`, `schedulePrefill*`, `scheduleDecode`)
+sees none of that: it receives only the output plan (to record fresh pages to
+zero) and an `AdmissionFeedback` (`admission_failed`, `capacity_blocker`), so
+it can report outcomes but never compose the batch.
+
+### 3.1 P — prefill worker
+
+**Phases:** completed prompts out on `plan.remote_decode` (their pages stay
+pinned until the transfer finishes, so releasing them outranks feeding more
+prompt work), then the shared local-prefill phases
+(`scheduleLocalPrefillWork`): resident chunks, then new prompts.
+
+**Reserve: the decode slot, nothing else.** The completing chunk reserves
+`decode_input_tokens` like every role, because the drafter writes the first
+candidate block there before the remote decode carries it to the peer. The
+growth reserves stay off: no admission headroom (nothing is ever retracted),
+no snapshot-state growth block (the peer banks its own), no overlap protection
+(no local decode is ever in flight).
+
+Preparing the handoff can publish a newly completed prefill boundary. The
+transfer ACK releases request ownership without further publication; cached
+entries remain subject to normal eviction.
+
+**Retraction: none.** A P node's pressure valve is the transfer itself — pages
+are pinned until the peer acknowledges, then released wholesale. Retracting a
+prompt whose KV is mid-transfer would strand the decode side.
+
+The PD pin is not recorded anywhere; it is a function of the FSM
+(`Scheduler::pdTransferInFlight`). On this role every page-holding state is
+pinned — the peer's decode reads the pages from the first scheduled chunk until
+the PD ACK finishes or aborts the request. On the D role the pin is exactly
+`RemotePrefilling`: the peer's prefill is writing the destination pages, and
+`RemotePrefillDone` ends it by leaving that state. A fused engine never
+transfers. Because the pin is the state, no event handler can forget to clear
+it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
+
+**Recovery: n/a.** The readmission path is unreachable on this role.
+
+### 3.2 D — decode worker
+
+**Phases:**
+
+1. Local recovery, alone in its batch — a resident recovery chunk if one is
+   mid-prompt, else the one readmission this round may start (§4).
+2. The decode batch (`scheduleDecodeBatch`) — every PrefillDone first decode
+   and Decoding step; decodes consume no token budget on this role.
+3. At most **one** remote admission — the whole prompt at once (the peer
+   prefills it), riding `plan.remote_prefill` **beside** the decode batch: it
+   consumes no token budget and no batch slot, so there is nothing to defer
+   for. Capped at one per round because each reserves an entire prompt's
+   pages; a queue's worth in one round would drain the pool before any KV
+   arrives. Head-of-line (1.1) does not apply — there is no mid-way.
+4. `maybeRetractForCapacity` (§2), whose grant also rides beside the batch
+   (a remote admission) or joins it (a blocked decode).
+
+The old "one of exactly three shapes per round" grammar is gone: a decode
+batch and a remote admission coexist routinely, and only a local recovery
+chunk still claims a round to itself (its load-back's layerwise streaming and
+the recovery prefill are batch-global machinery).
+
+**Retraction and recovery:** victims are chosen by the shared rule in §2 —
+normally decode work (resident requests are decoding prompts the peer
+prefilled), with a mid-prompt local recovery chunk as the one possible
+prefill-tier victim. The victim's KV is written back to L2 (best-effort) and
+it enters `fsm::Retracted`; recovery re-prefills locally, loading the
+snapshot back (`LoadBackBatch`). A D-role victim recovers through this
+ordered path even when there is no host cache to snapshot into (from
+scratch), because the role has no other way back.
+
+### 3.3 Fused — one engine, everything local
+
+**Phases, mixed mode** (`enable_mixed_prefill_decode`): decodes first — a
+client is streaming them, and a long prefill chunk must not starve them of
+token budget — then the shared local-prefill phases (readmission first, since
+it holds an L2 snapshot other admissions could evict; then resident chunks;
+then new prompts) spend what remains, then `maybeRetractForCapacity`. The
+decode batch leaves `state_prefill_reserve` (one state-checkpoint page of
+budget) untouched when a mamba prefill is pending, since that prefill cannot
+advance in sub-page chunks.
+
+**Phases, non-mixed:** the prefill phases run first and alone; decodes get
+the round only when no prefill scheduled. No state reserve is needed —
+scheduling order is the capacity priority.
+
+**Retraction:** the shared victim rule (§2): incomplete prefills first, then
+decode work. Whether the victim's KV is stored depends on the host cache:
+with one, the retraction becomes an L2 snapshot the readmission loads back;
+without one the request re-prefills from scratch
+(`has_recoverable_snapshot = false`) and competes for admission like a
+newcomer rather than queueing behind other readmissions.
+
+## 4. The recovery protocol
+
+What remains of cross-request recovery bookkeeping is **one integer** on the
+scheduler (`next_retraction_epoch_`); everything else is derived from the
+`fsm::Retracted` states themselves. The former `RetractionRecovery` class —
+barrier, recovering-pin, priority overrides — is gone; §2's same-round grant
+and the rules below absorb each of its jobs.
+
+**Readmission order** (`nextReadmission`) is derived, not stored. Each
+retraction stamps a monotonic `retraction_epoch` and a `resumes_generation`
+flag onto the `fsm::Retracted` state; among this round's candidates holding a
+recoverable snapshot, victims with generated output first (they resume a
+generation a client is already reading), then oldest epoch. The flag is
+`Request::HasGeneratedOutput()` — token count above the submitted prompt
+size — rather than "was the victim decoding": a victim taken mid-RECOVERY is
+Prefilling again, but its generated tokens still exist (an earlier
+retraction rebased them into its prefill window), and its standing survives.
+A store-less fused retraction is not in this ordering at all — it has no L2
+pages to load back, so it re-prefills through the ordinary admission path
+(`admitsLikeNewPrompt`). The runtime can also emit `forward::Retract` without
+a Host snapshot: an L3 prefetch that missed after Admit. Dest pages were
+not filled, so publishing would cache empty KV; the request re-prefills
+the same way. Mixed partners in that forward retract together so ranks
+stay aligned, and a D-role `plan.remote_prefill` admission retracts with
+them — the peer pull is withheld so suffix-only KV cannot land on empty
+prefix pages. The client is not failed. There is no queue to keep in
+step with the FSM: a request that finishes or aborts while retracted
+simply stops qualifying, with no bookkeeping to prune.
+Nor is bounded replay (§1.3) carried across a
+retraction: the readmission re-probes and derives its replay window from the
+new hit, and the L2 snapshot never holds a replayable group's pages.
+
+**A readmission that does not fit, waits.** Its failed admission never
+triggers retraction (it is never recorded as the capacity blocker): when the
+readmission needs a victim, the two simply do not fit together, and swapping
+them — a writeback, a load-back and a re-prefill per swap — is pure thrash.
+The resident request keeps running and its completion frees the space. This
+replaces the old `recovering_` head-of-line pin, and unlike escalation-bounded
+ping-pong it makes the evict-each-other cycle structurally impossible. Nor
+does a waiting readmission stall anyone else: decodes run regardless, and
+only new-prompt admission is sealed behind it (a newcomer taking the pages it
+waits for would starve it).
+
+**Escalating headroom** is what keeps a request from being retracted forever.
+Being retracted means the previous admission was still too optimistic, so
+each retraction raises the decode headroom the next admission must secure:
+
+```
+Request::AdmissionHeadroom(safe_steps)
+    = min(RemainingNewTokens(), safe_steps * (1 + retraction_count))
+```
+
+with `safe_steps = 4096` — note the `1 +`: a *fresh* admission already
+prepays one window (see `schedulePrefillFirstChunk`), so for prompts with
+`max_new_tokens <= 4096` the reserve covers the whole generation up front and
+retraction never touches them. Capped by the generation budget the request
+could ever use, so after a couple of retractions it holds enough room to run
+to completion — at which point `ReserveCoversGeneration` exempts it from the
+victim policy and it **cannot be retracted again**. This is a per-request
+adaptive backoff: it penalises only the request whose admission proved
+over-optimistic, and never makes anyone else wait.
+
+The exemption compares the windows the admission secured against the budget
+that was open **at that admission** (`Request::RemainingNewTokensAtAdmission`
+— recoverable from the prefill window, because every retraction rebases and
+nothing else moves it), never against the current remaining budget. Decode
+spends the prepaid headroom exactly as fast as it shrinks that budget, so
+judging the window against today's remainder would count spent headroom as
+still held: a request that outgrew a partial reserve would look covered the
+moment its remainder dipped under the window — exactly when it needs a new
+page — and once every resident request looked covered, retraction would have
+no victim and nothing could free that page.
+
+## 5. Invariants a change must preserve
+
+- Admission never grants pages for tokens beyond the chunk being scheduled,
+  except the decode reserve on the completing chunk (1), the snapshot-state
+  growth block banked by the admission that finishes shaping a state group
+  (1.2), and the admission headroom (4) — which only full-history groups hold.
+  A replayable group's private suffix starts at the replay window, which is
+  inside the forward's input, not beyond it (1.3).
+- A replayable group is never matched, published or streamed (1.3); its
+  re-fed rows are forward input that debits the token budget but never
+  advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no
+  final chunk is shorter than the replay window (`ChunkKeepingFinalWindow`).
+- A prefill demand's reserve is decided once per group, by retention, in
+  `ReservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
+  helper asserts it found none set.
+- An incomplete local prefill is not overtaken (1.1). Decodes are never hostage
+  to it: they consume no fresh capacity within their reserve, so they keep
+  running beside a stalled prefill.
+- Retraction fires only when no prefill progressed and an admission failed
+  (2). The chosen victim must be quiescent — no forward of its own in flight,
+  no PD transfer against its pages (§3.1) — and an in-flight load-back or an in-flight pinned
+  store defers all retraction; stream-ordered stores defer nothing.
+- Freed capacity is granted to the request it was freed for in the same plan
+  build whenever the round's grammar admits the grant (2); the write-back →
+  zero → load → forward order on the forward thread's stream is what makes
+  the immediate release safe, and changing `DeviceHandle.execute`'s ordering
+  breaks it.
+- A store either pins its Device sources until the ack or is stream-ordered;
+  never neither (2). Only `retractVictim` issues a stream-ordered store — its
+  sources are granted away in the same round — and only such an op may be
+  fenced ahead of the plan's page reuse by the runtime. A new store site
+  chooses its guard explicitly (`StartPendingStores` has no default).
+- Only computed tokens are published as a prefix, and exactly those.
+  `Request::NumComputedTokens()` is the one frontier for prefix hashing and
+  retention on admission and retraction: the scheduled window end while
+  prefilling (an incomplete prefill's whole token count would publish pages
+  never computed), and every token but the last while decoding — feedback
+  ends with the sampled token the next forward computes. It does not subtract
+  the verify width: a decode result lands its accepted tokens, not a fixed
+  number, so any margin is an estimate that lags the real endpoint and
+  delays publication and reclaim behind it.
+- At most one readmission is in progress per role, by phase construction; a
+  readmission that fails admission waits and never triggers retraction (4).
+- A request whose admission prepaid the generation budget open at that
+  admission is never a victim (2); with the fresh-admission prepay this bounds
+  retraction to requests whose `max_new_tokens` exceeds one safe-step window
+  (or is undeclared). Spending a partial reserve never makes it qualify: the
+  exemption is judged against the budget open at admission, not the current
+  remainder (4).

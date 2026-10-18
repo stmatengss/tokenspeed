@@ -42,6 +42,8 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3_5 import (
@@ -51,6 +53,18 @@ from tokenspeed.runtime.models.qwen3_5 import (
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_mtp_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    # ModelOpt recipes may leave the MTP subtree unquantized even when the
+    # target model is NVFP4. Honor that checkpoint contract during construction.
+    if quant_config is not None and should_exclude_quant_module(
+        "mtp.layers.0", quant_config.exclude_modules
+    ):
+        return None
+    return quant_config
 
 
 class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
@@ -72,12 +86,12 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None:
-            return super()._attn(q, k, v, gate, ctx, out_cache_loc)
+        if ctx.draft_narrowing is None:
+            return super()._attn(q, k, v, gate, ctx)
 
-        self._apply_correction(ctx)
+        # The live rows attend over the accepted prefix, not the verify window.
+        ctx.draft_narrowing.publish_accepted_prefix()
         q = q.index_select(0, ctx.gather_ids)
         if gate is not None:
             gate = gate.index_select(0, ctx.gather_ids)
@@ -92,32 +106,18 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             k,
             v,
             decode_ctx,
-            out_cache_loc,
             record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
         )
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
 
-    def _apply_correction(self, ctx: ForwardContext) -> None:
-        """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        seq_lens_buf = ctx.draft_seq_lens_buf
-        if seq_lens_buf is None or ctx.accept_lengths is None:
-            return
-        num_extends = ctx.num_extends
-        if num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
-        ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-
     def _maybe_narrow_residual(
         self,
         residual: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None or ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is None or ctx.forward_mode.is_idle():
             return residual
         return residual.index_select(0, ctx.gather_ids)
 
@@ -125,10 +125,9 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
 class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
     """Causal LM with the draft-variant attention layer injected.
 
-    Restricted to single-layer drafts: ``_apply_correction`` mutates
-    ``ctx.draft_seq_lens_buf`` in place and is not idempotent across layers.
-    A multi-layer draft would double-trim cache_seqlens. Lift the correction
-    out of the per-layer hook (e.g. into the drafter) before relaxing this.
+    Restricted to single-layer drafts: the narrowing happens once, at this
+    layer's attention, so a second layer would receive the already-narrowed
+    ``[bs, H]`` rows.
     """
 
     ATTENTION_LAYER_CLS: type = Qwen3_5DraftAttentionDecoderLayer
@@ -143,8 +142,8 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
         if config.num_hidden_layers != 1:
             raise ValueError(
                 "Qwen3_5DraftForCausalLM requires num_hidden_layers == 1 "
-                f"(got {config.num_hidden_layers}); _apply_correction is not "
-                "idempotent across layers."
+                f"(got {config.num_hidden_layers}); the draft row narrowing "
+                "happens once, at the single layer's attention."
             )
         super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
 
@@ -163,9 +162,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         if self.is_multimodal:
             config = config.text_config
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() == "nvfp4":
-            quant_config = None
+        quant_config = _resolve_mtp_quant_config(quant_config)
 
         self.config = config
         self.mapping = mapping
@@ -194,6 +191,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     config.hidden_size,
                     config.vocab_size,
                     bias=False,
+                    quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
             else:
@@ -231,13 +229,21 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head = lm_head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     @torch.no_grad()
     def forward(
         self,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         **kwargs,
@@ -270,7 +276,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 input_embeds=hidden_states,
             )
 
@@ -278,6 +283,15 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes
+        (it only processes MTP-branch weights), so shards without any MTP
+        tensor are skipped entirely.
+        """
+        return "mtp" in name
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
@@ -390,7 +404,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     continue
 
                 if name not in params_dict:
-                    logger.warning("MTP weight not in params_dict: %s", name)
+                    logger.warning(f"MTP weight not in params_dict: {name!s}")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -413,7 +427,12 @@ class Qwen3_5MoeForConditionalGenerationNextN(Qwen3_5ForConditionalGenerationNex
         )
 
 
+class Qwen3_5MoeForCausalLMNextN(Qwen3_5MoeForConditionalGenerationNextN):
+    """MTP draft head for text-only flat checkpoints."""
+
+
 EntryClass = [
     Qwen3_5ForConditionalGenerationNextN,
     Qwen3_5MoeForConditionalGenerationNextN,
+    Qwen3_5MoeForCausalLMNextN,
 ]

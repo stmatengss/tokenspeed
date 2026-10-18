@@ -32,6 +32,11 @@ struct ExtendResult {
     // Tokens whose KV has already become stable request history.
     // token placeholder should be removed in python
     std::vector<std::int32_t> tokens;
+    // P role, final prefill chunk only: the drafter's candidate rows for the
+    // decode side to seed speculation from (candidate[0] == the sampled
+    // bootstrap token == tokens.back()). Empty otherwise. Carried here so
+    // the remote-decode operation is self-contained, like every decode op.
+    std::vector<std::int32_t> spec_candidate_ids;
 };
 
 struct Finish {
@@ -46,9 +51,16 @@ struct UpdateReserveNumTokens {
 struct Abort {
     std::string request_id;
 };
+
+// Snapshot-less retract: release request-owned pages and requeue as prefill.
+// Used when an admitted L3 prefetch missed; dest pages were not filled, so
+// the next admit recomputes those tokens instead of finishing the client.
+struct Retract {
+    std::string request_id;
+};
 }  // namespace forward
 
-using ForwardEvent =
-    std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::UpdateReserveNumTokens>;
+using ForwardEvent = std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::Retract,
+                                  forward::UpdateReserveNumTokens>;
 
 }  // namespace tokenspeed

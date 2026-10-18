@@ -21,28 +21,29 @@
 
 """Utilities for downloading and initializing model weights."""
 
-import concurrent.futures
 import fnmatch
 import glob
 import hashlib
 import importlib.util
 import json
 import os
+import struct
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator, Iterable
-from typing import (
-    Any,
-)
+from typing import Any
 
 import filelock
 import huggingface_hub.constants
 import numpy as np
+import psutil
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from safetensors import safe_open
+from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
@@ -54,7 +55,8 @@ from tokenspeed.runtime.layers.quantization import (
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
-_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024
+
+_AUXILIARY_SAFETENSORS_FILES = {"input_scales.safetensors"}
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -148,7 +150,9 @@ def get_quant_config(
         config = json.load(f)
 
         if model_config.quantization == "nvfp4":
-            if config["producer"]["name"] == "modelopt":
+            # The nested-"quantization" schema is ModelOpt's; some exports (e.g. Inkling) omit producer.
+            producer = config.get("producer", {}).get("name", "modelopt")
+            if producer == "modelopt":
                 return quant_cls.from_config(config)
             else:
                 raise ValueError(
@@ -195,7 +199,7 @@ def download_weights_from_hf(
                 allow_patterns = [pattern]
                 break
 
-    logger.info("Using model weights format %s", allow_patterns)
+    logger.info(f"Using model weights format {allow_patterns!s}")
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
@@ -240,9 +244,9 @@ def download_safetensors_index_file_from_hf(
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
         except huggingface_hub.utils.EntryNotFoundError:
-            logger.info("No %s found in remote.", index_file)
+            logger.info(f"No {index_file!s} found in remote.")
         except huggingface_hub.utils.LocalEntryNotFoundError:
-            logger.info("No %s found in local cache.", index_file)
+            logger.info(f"No {index_file!s} found in local cache.")
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
@@ -266,9 +270,73 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
-    # Filter out any fields that are not found in the index file.
-    hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
+    # ModelOpt may store activation scales in a standalone safetensors file
+    # that is intentionally absent from the model weight index. It is not a
+    # duplicate checkpoint, and dropping it leaves NVFP4 input scales
+    # uninitialized. Preserve known auxiliary files alongside indexed shards.
+    hf_weights_files = [
+        file_path
+        for file_path in hf_weights_files
+        if file_path in weight_files_in_index
+        or os.path.basename(file_path) in _AUXILIARY_SAFETENSORS_FILES
+    ]
     return hf_weights_files
+
+
+def filter_safetensors_files_by_weight_names(
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    weight_name_filter: Callable[[str], bool],
+) -> list[str]:
+    """Keep only the safetensors shards holding weights the consumer wants.
+
+    Used for draft (NextN/MTP) models whose weights are embedded in the
+    target checkpoint: their loaders consume a small name subset, so most
+    shards need not be read (or prefetched) at all.
+
+    Args:
+        hf_weights_files: Candidate shard paths.
+        hf_folder: Checkpoint directory containing ``index_file``.
+        index_file: Safetensors index file name mapping weight names to
+            shard file names.
+        weight_name_filter: Predicate on checkpoint weight names; a shard is
+            kept if it holds at least one accepted name.
+
+    Returns:
+        The filtered shard list, input order preserved. Shards absent from
+        the index are kept, and the full list is returned when the index is
+        missing or nothing matches, so a wrong predicate degrades to reading
+        extra shards instead of breaking the load.
+    """
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    needed_files = set()
+    for weight_name, shard_name in weight_map.items():
+        if weight_name_filter(weight_name):
+            needed_files.add(os.path.join(hf_folder, shard_name))
+    indexed_files = {
+        os.path.join(hf_folder, shard_name) for shard_name in weight_map.values()
+    }
+    filtered = [
+        f for f in hf_weights_files if f in needed_files or f not in indexed_files
+    ]
+    if not filtered:
+        logger.warning(
+            f"Weight-name shard filter matched nothing in {index_file_name}; "
+            f"falling back to loading all {len(hf_weights_files)} shards."
+        )
+        return hf_weights_files
+    if len(filtered) < len(hf_weights_files):
+        logger.info(
+            f"Loading {len(filtered)} of {len(hf_weights_files)} checkpoint "
+            "shards; the others hold no weights needed by this model."
+        )
+    return filtered
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
@@ -357,86 +425,121 @@ def safetensors_encrypted_weights_iterator(
     raise NotImplementedError()
 
 
-def _get_checkpoint_prefetch_rank_info() -> tuple[int, int]:
-    local_rank = os.getenv("LOCAL_RANK")
-    local_world_size = os.getenv("LOCAL_WORLD_SIZE")
-    if local_rank is not None and local_world_size is not None:
-        try:
-            rank = int(local_rank)
-            world_size = int(local_world_size)
-            if 0 <= rank < world_size:
-                return rank, world_size
-        except ValueError:
-            logger.warning(
-                "Ignoring invalid LOCAL_RANK/LOCAL_WORLD_SIZE for checkpoint prefetch: "
-                "%s/%s",
-                local_rank,
-                local_world_size,
-            )
+class CheckpointPrefetcher:
+    """Sequentially read checkpoint shards a bounded distance ahead of the consumer.
 
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    Copying weights out of an mmap'd safetensors shard demand-faults one page
+    at a time; on cold network filesystems the sparse per-rank access pattern
+    defeats readahead and every page fault becomes a synchronous round trip.
+    Reading each shard sequentially first moves the bytes at streaming
+    bandwidth, so the consumer's copies hit the page cache instead.
 
-    return 0, 1
+    The read-ahead window is bounded so shards are consumed before cache
+    pressure evicts them again; an unbounded prefetch of a checkpoint larger
+    than the page cache evicts its own early work. The window defaults to
+    min(80 GiB, 25% of available host memory): it only needs to be much
+    larger than a few shards and much smaller than the page cache, and no
+    cross-rank agreement is needed since it only sizes each rank's
+    independent read-ahead. Every rank reads every shard in consumption
+    order; concurrent readers of the same shard are deduplicated by the page
+    cache, so the shared filesystem sees roughly one read per node.
 
+    Args:
+        files: Shard paths in the exact order the consumer will load them.
+        num_threads: Number of background reader threads.
+    """
 
-def _prefetch_checkpoint_file(file_path: str) -> int:
-    bytes_read = 0
-    with open(file_path, "rb") as f:
-        while True:
-            data = f.read(_PREFETCH_BLOCK_SIZE)
-            if not data:
-                break
-            bytes_read += len(data)
-    return bytes_read
+    _BLOCK_SIZE = 16 * 1024 * 1024
+    _WINDOW_MAX_BYTES = 80 * 1024**3
+    _WINDOW_MEM_FRACTION = 0.25
 
-
-def prefetch_checkpoint_files(
-    hf_weights_files: list[str],
-    num_threads: int = 4,
-) -> threading.Thread:
-    """Prefetch checkpoint shards into the OS page cache in the background."""
-    sorted_files = sorted(hf_weights_files)
-    rank, world_size = _get_checkpoint_prefetch_rank_info()
-    my_files = sorted_files[rank::world_size]
-    num_threads = max(1, num_threads)
-
-    logger.info(
-        "Rank %d: prefetching %d/%d checkpoint shards into OS page cache "
-        "(background, %d local ranks sharing work, %d threads per rank).",
-        rank,
-        len(my_files),
-        len(sorted_files),
-        world_size,
-        num_threads,
-    )
-
-    def _run_prefetch() -> None:
-        start = time.perf_counter()
+    @classmethod
+    def _read_file(cls, file_path: str) -> int:
+        """Sequentially read a file so its pages land in the OS page cache."""
         bytes_read = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [
-                executor.submit(_prefetch_checkpoint_file, path) for path in my_files
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    bytes_read += future.result()
-                except Exception:
-                    logger.warning(
-                        "Failed to prefetch a checkpoint shard.", exc_info=True
-                    )
+        with open(file_path, "rb") as f:
+            while True:
+                data = f.read(cls._BLOCK_SIZE)
+                if not data:
+                    break
+                bytes_read += len(data)
+        return bytes_read
 
-        elapsed = time.perf_counter() - start
-        logger.info(
-            "Rank %d: checkpoint prefetch finished in %.2fs, %.2f GiB read.",
-            rank,
-            elapsed,
-            bytes_read / (1024**3),
+    def __init__(
+        self,
+        files: list[str],
+        num_threads: int = 4,
+    ) -> None:
+        self._files = list(files)
+        self._sizes = [os.path.getsize(path) for path in self._files]
+        self._num_threads = max(1, min(num_threads, max(len(self._files), 1)))
+        self._window_bytes = min(
+            self._WINDOW_MAX_BYTES,
+            int(psutil.virtual_memory().available * self._WINDOW_MEM_FRACTION),
         )
+        self._cond = threading.Condition()
+        self._next_to_read = 0
+        self._files_read = 0
+        self._inflight_bytes = 0  # claimed by a reader, not yet consumed
+        self._ready = [threading.Event() for _ in self._files]
+        self._start_time = 0.0
 
-    thread = threading.Thread(target=_run_prefetch, daemon=True)
-    thread.start()
-    return thread
+    def start(self) -> None:
+        logger.info(
+            f"Prefetching {len(self._files)} checkpoint shards into the OS page "
+            f"cache (window {self._window_bytes / 1024**3:.1f} GiB, "
+            f"{self._num_threads} reader threads)."
+        )
+        self._start_time = time.perf_counter()
+        for _ in range(self._num_threads):
+            threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    if self._next_to_read >= len(self._files):
+                        return
+                    size = self._sizes[self._next_to_read]
+                    # A shard larger than the window may still go alone.
+                    if (
+                        self._inflight_bytes == 0
+                        or self._inflight_bytes + size <= self._window_bytes
+                    ):
+                        break
+                    self._cond.wait()
+                idx = self._next_to_read
+                self._next_to_read += 1
+                self._inflight_bytes += size
+            try:
+                self._read_file(self._files[idx])
+            except Exception:
+                logger.warning(
+                    f"Failed to prefetch checkpoint shard {self._files[idx]}; "
+                    f"the consumer will fall back to demand paging for it.",
+                    exc_info=True,
+                )
+            finally:
+                # Unblock the consumer even on failure.
+                self._ready[idx].set()
+            with self._cond:
+                self._files_read += 1
+                all_read = self._files_read == len(self._files)
+            if all_read:
+                logger.info(
+                    "Checkpoint prefetch finished after "
+                    f"{time.perf_counter() - self._start_time:.2f}s."
+                )
+
+    def wait_file(self, idx: int) -> None:
+        """Block until shard ``idx`` has been prefetched."""
+        self._ready[idx].wait()
+
+    def advance(self, idx: int) -> None:
+        """Tell the prefetcher shard ``idx`` has been consumed, freeing window budget."""
+        with self._cond:
+            self._inflight_bytes -= self._sizes[idx]
+            self._cond.notify_all()
 
 
 def safetensors_weights_iterator(
@@ -450,6 +553,12 @@ def safetensors_weights_iterator(
 
     If is_all_weights_sharded is True, it uses more optimize read by reading an
     entire file instead of reading each tensor one by one.
+
+    If prefetch is True, shards are sequentially read into the OS page cache a
+    bounded window ahead of this iterator (see CheckpointPrefetcher),
+    paced by how fast the caller actually consumes the yielded tensors. The
+    pacing only works if the caller loads weights while iterating instead of
+    draining the iterator into a list first.
     """
     if decryption_key:
         yield from safetensors_encrypted_weights_iterator(
@@ -460,20 +569,175 @@ def safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+    prefetcher = None
     if prefetch:
-        prefetch_checkpoint_files(
+        prefetcher = CheckpointPrefetcher(
             hf_weights_files,
             num_threads=prefetch_num_threads,
         )
+        prefetcher.start()
 
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
+    for file_idx, st_file in enumerate(
+        tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        )
     ):
+        if prefetcher is not None:
+            prefetcher.wait_file(file_idx)
         result = safetensors.torch.load_file(st_file, device="cpu")
         yield from result.items()
+        if prefetcher is not None:
+            prefetcher.advance(file_idx)
+
+
+def safetensors_filtered_weights_iterator(
+    hf_weights_files: list[str],
+    accept: Callable[[str], bool],
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield accepted tensors one at a time via ``get_tensor``, never load_file.
+
+    Used when a model must skip huge tables (Engram embed) that share a shard
+    with ordinary weights. Rejected keys are not materialized.
+    """
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    prefetcher = None
+    if prefetch:
+        prefetcher = CheckpointPrefetcher(
+            hf_weights_files,
+            num_threads=prefetch_num_threads,
+        )
+        prefetcher.start()
+    for file_idx, st_file in enumerate(
+        tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        )
+    ):
+        if prefetcher is not None:
+            prefetcher.wait_file(file_idx)
+        with safe_open(st_file, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if not accept(key):
+                    continue
+                yield key, handle.get_tensor(key)
+        if prefetcher is not None:
+            prefetcher.advance(file_idx)
+
+
+_SUB_BYTE_SAFETENSORS_DTYPES = frozenset({"F4", "F6_E2M3", "F6_E3M2"})
+
+# Bounds a corrupt length prefix; real headers are a few hundred KB.
+_MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
+
+
+def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
+    """Return the first sub-byte dtype any shard declares, else ``None``.
+
+    InstantTensor 0.1.9 applies a header's logical element count to a torch
+    dtype whose element is a packed pair, so an ``F4`` tensor declared ``[2048]``
+    over 1024 bytes arrives as shape ``(2048,)`` -- twice its own storage --
+    where safetensors correctly reports ``(1024,)``. Nothing raises, so callers
+    must refuse these checkpoints rather than load them wrong.
+
+    Only each shard's length-prefixed JSON header is read, never tensor data.
+    A header that will not parse raises: this decides whether a checkpoint is
+    safe to load, so it must not wave through the shard it cannot inspect.
+    """
+    for path in hf_weights_files:
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                raise ValueError(
+                    f"{path}: safetensors header claims {header_len} bytes"
+                )
+            header = json.loads(f.read(header_len))
+
+        if not isinstance(header, dict):
+            raise ValueError(f"{path}: safetensors header is not a JSON object")
+
+        for name, meta in header.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            if meta.get("dtype") in _SUB_BYTE_SAFETENSORS_DTYPES:
+                return meta["dtype"]
+    return None
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: list[str],
+    *,
+    process_group: torch.distributed.ProcessGroup | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files using the
+    InstantTensor library.
+
+    InstantTensor accelerates loading safetensors weights on NVIDIA GPUs
+    through distributed loading, pipelined prefetching, and direct I/O. When
+    a process group is supplied, reads are sharded across those ranks. All
+    participants must consume the same checkpoint files and tensor iterator.
+
+    Args:
+        hf_weights_files: Local paths to the ``*.safetensors`` shards to load.
+        process_group: Ranks consuming the same weights, or None for local
+            loading. Pipeline context models use their stage's TP group.
+
+    Yields:
+        ``(name, tensor)`` pairs for every tensor in the checkpoint, with the
+        tensors materialized on the current CUDA device.
+    """
+    if not current_platform().is_nvidia:
+        raise ValueError("InstantTensor requires NVIDIA GPUs")
+
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            'Please install instanttensor via `pip install "tokenspeed[instanttensor]"`'
+        ) from e
+
+    sub_byte_dtype = _find_sub_byte_dtype(hf_weights_files)
+    if sub_byte_dtype is not None:
+        raise ValueError(
+            f"This checkpoint declares the sub-byte safetensors dtype "
+            f"{sub_byte_dtype!r}, which InstantTensor loads incorrectly. "
+            "Use --load-format auto instead."
+        )
+
+    return _instanttensor_tensors(instanttensor, hf_weights_files, process_group)
+
+
+def _instanttensor_tensors(
+    instanttensor,
+    hf_weights_files: list[str],
+    process_group: torch.distributed.ProcessGroup | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    device = torch.cuda.current_device()
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    with instanttensor.safe_open(
+        hf_weights_files, framework="pt", device=device, process_group=process_group
+    ) as f:
+        # InstantTensor 0.1.9 clones internally, so no extra clone here.
+        yield from tqdm(
+            f.tensors(),
+            desc="Loading safetensors using InstantTensor loader",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+            total=len(f.keys()),
+            mininterval=1.0,
+        )
 
 
 def pt_weights_iterator(
@@ -663,18 +927,17 @@ def kv_cache_scales_loader(
             layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
             return layer_scales_map.items()
     except FileNotFoundError:
-        logger.error("File or directory '%s' not found.", filename)
+        logger.error(f"File or directory '{filename!s}' not found.")
     except json.JSONDecodeError:
-        logger.error("Error decoding JSON in file '%s'.", filename)
+        logger.error(f"Error decoding JSON in file '{filename!s}'.")
     except Exception:
-        logger.error("An error occurred while reading '%s'.", filename)
+        logger.error(f"An error occurred while reading '{filename!s}'.")
     # This section is reached if and only if any of the excepts are hit
     # Return an empty iterable (list) => no KV cache scales are loaded
     # which ultimately defaults to 1.0 scales
     logger.warning(
         "Defaulting to KV cache scaling factors = 1.0 for all "
-        "layers in TP rank %d as an error occurred during loading.",
-        tp_rank,
+        f"layers in TP rank {tp_rank:d} as an error occurred during loading.",
     )
     return []
 

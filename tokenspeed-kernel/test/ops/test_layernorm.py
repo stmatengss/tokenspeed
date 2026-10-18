@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
+    fused_qk_rmsnorm_rope,
     fused_qk_rmsnorm_rope_gate,
     qk_rmsnorm,
     rmsnorm,
@@ -53,6 +55,49 @@ def test_rmsnorm_with_residual(
     ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(2, 7, 16, 512), (1, 2, 64, 512)])
+def test_grouped_rmsnorm_matches_per_head_reference(
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(shape, device=device, dtype=dtype)
+    reference_input = x.clone()
+
+    actual = grouped_rmsnorm(x, shape[-1], eps, out=x)
+
+    reference_float = reference_input.float()
+    reference = reference_float * torch.rsqrt(
+        reference_float.square().mean(-1, keepdim=True) + eps
+    )
+    assert actual is x
+    torch.testing.assert_close(actual, reference.to(dtype), atol=2e-2, rtol=2e-2)
+
+
+def test_grouped_rmsnorm_cuda_graph_replays(device: str) -> None:
+    shape = (2, 8, 16, 512)
+    eps = 1e-6
+    x = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    grouped_rmsnorm(x, shape[-1], eps, out=x)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        grouped_rmsnorm(x, shape[-1], eps, out=x)
+
+    x.copy_(torch.randn_like(x))
+    reference_input = x.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    reference_float = reference_input.float()
+    reference = reference_float * torch.rsqrt(
+        reference_float.square().mean(-1, keepdim=True) + eps
+    )
+    torch.testing.assert_close(x, reference.to(x.dtype), atol=2e-2, rtol=2e-2)
 
 
 def _gemma_ref(
@@ -367,3 +412,222 @@ def test_rmsnorm_inplace(device: str) -> None:
     ref = (x_float * torch.rsqrt(variance + eps) * weight).to(torch.bfloat16)
     assert out.data_ptr() == x.data_ptr()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# fused_qk_rmsnorm_rope (no gate, full RoPE) — used by DFLASH draft model
+# ---------------------------------------------------------------------------
+
+
+def _ref_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Per-head RMSNorm reference (standard, NOT Gemma)."""
+    x_f = x.float()
+    var = x_f.pow(2).mean(dim=-1, keepdim=True)
+    return (x_f * torch.rsqrt(var + eps) * weight.float()).to(x.dtype)
+
+
+def _ref_rope_full(
+    x: torch.Tensor, cos_sin_cache: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """Full-dim RoPE reference (rotary_dim == head_dim)."""
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    # Gather cos/sin for each token's position
+    cos = cos_sin_cache[positions.long(), :half].float()  # [n_tokens, half]
+    sin = cos_sin_cache[positions.long(), half:].float()
+    x_f = x.float()
+    x1, x2 = x_f[..., :half], x_f[..., half:]
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    return torch.cat([o1, o2], dim=-1).to(x.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads,head_dim",
+    [(8, 8, 128), (8, 2, 128), (4, 4, 64)],
+)
+def test_fused_qk_rmsnorm_rope(
+    dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    device: str,
+) -> None:
+    """Verify fused_qk_rmsnorm_rope matches separate qk_norm + RoPE."""
+    n_tokens = 13
+    eps = 1e-6
+    max_pos = 4096
+
+    q = torch.randn(n_tokens, num_q_heads * head_dim, device=device, dtype=dtype)
+    k = torch.randn(n_tokens, num_kv_heads * head_dim, device=device, dtype=dtype)
+    q_weight = torch.randn(head_dim, device=device, dtype=torch.float32)
+    k_weight = torch.randn(head_dim, device=device, dtype=torch.float32)
+    positions = torch.randint(0, max_pos, (n_tokens,), device=device, dtype=torch.int32)
+
+    # Build cos_sin_cache: (max_pos, head_dim) = [cos(half) | sin(half)]
+    half = head_dim // 2
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, half, dtype=torch.float32) / half))
+    t = torch.arange(max_pos, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(device=device)
+
+    # --- Fused kernel ---
+    q_fused, k_fused = fused_qk_rmsnorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+    )
+
+    # --- Reference: per-head norm then full RoPE ---
+    # Reshape to per-head, apply norm per head, reshape back
+    q_heads = q.view(n_tokens, num_q_heads, head_dim)
+    k_heads = k.view(n_tokens, num_kv_heads, head_dim)
+    q_normed = torch.stack(
+        [_ref_rmsnorm(q_heads[:, h], q_weight, eps) for h in range(num_q_heads)], dim=1
+    ).view(n_tokens, num_q_heads * head_dim)
+    k_normed = torch.stack(
+        [_ref_rmsnorm(k_heads[:, h], k_weight, eps) for h in range(num_kv_heads)], dim=1
+    ).view(n_tokens, num_kv_heads * head_dim)
+
+    # Apply RoPE per head
+    q_ref_heads = q_normed.view(n_tokens, num_q_heads, head_dim)
+    k_ref_heads = k_normed.view(n_tokens, num_kv_heads, head_dim)
+    q_ref = torch.stack(
+        [
+            _ref_rope_full(q_ref_heads[:, h], cos_sin_cache, positions)
+            for h in range(num_q_heads)
+        ],
+        dim=1,
+    ).view(n_tokens, num_q_heads * head_dim)
+    k_ref = torch.stack(
+        [
+            _ref_rope_full(k_ref_heads[:, h], cos_sin_cache, positions)
+            for h in range(num_kv_heads)
+        ],
+        dim=1,
+    ).view(n_tokens, num_kv_heads * head_dim)
+
+    torch.testing.assert_close(q_fused, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_fused, k_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_qk_rmsnorm_rope_non_contiguous_input(
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    """Verify the kernel handles non-contiguous q/k views from qkv.split()."""
+    n_tokens = 5
+    num_q_heads = 4
+    num_kv_heads = 4
+    head_dim = 128
+    eps = 1e-6
+    max_pos = 2048
+    q_size = num_q_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+
+    # Simulate qkv.split() which produces non-contiguous views
+    qkv = torch.randn(n_tokens, q_size + 2 * kv_size, device=device, dtype=dtype)
+    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    assert not q.is_contiguous() or not k.is_contiguous()  # at least one non-contig
+
+    q_weight = torch.randn(head_dim, device=device, dtype=torch.float32)
+    k_weight = torch.randn(head_dim, device=device, dtype=torch.float32)
+    positions = torch.randint(0, max_pos, (n_tokens,), device=device, dtype=torch.int32)
+
+    half = head_dim // 2
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, half, dtype=torch.float32) / half))
+    t = torch.arange(max_pos, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(device=device)
+
+    # Should not crash — non-contiguous inputs handled via stride
+    q_fused, k_fused = fused_qk_rmsnorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+    )
+
+    # Compare with contiguous version
+    q_contig_fused, k_contig_fused = fused_qk_rmsnorm_rope(
+        q.contiguous(),
+        k.contiguous(),
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+    )
+
+    torch.testing.assert_close(q_fused, q_contig_fused, atol=0, rtol=0)
+    torch.testing.assert_close(k_fused, k_contig_fused, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("hidden_size", [128, 512, 5120])
+def test_reference_rmsnorm_matches_eager_cast_order(
+    dtype: torch.dtype, hidden_size: int, device: str
+) -> None:
+    """The fused kernel reproduces the eager reference row by row.
+
+    The reference scales in FP32, multiplies the FP32 weight, and rounds
+    once; ``torch.mean`` multiplies by the reciprocal of N. Only the FP32
+    summation order may differ, which a bf16/fp16 round trip absorbs.
+    """
+    from tokenspeed_kernel.ops.layernorm import reference_rmsnorm
+
+    torch.manual_seed(7)
+    eps = 1e-6
+    x = torch.randn(33, hidden_size, device=device, dtype=dtype) * 4
+    x[0] *= 1e-3
+    x[1] *= 1e3
+    weight = (torch.rand(hidden_size, device=device) + 0.5).to(torch.bfloat16)
+    values = x.float()
+    values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+    expected = (weight.float() * values).to(dtype)
+    out = reference_rmsnorm(x, weight, eps, None)
+    if dtype == torch.float32:
+        torch.testing.assert_close(out, expected, rtol=2e-6, atol=0)
+    else:
+        # A different FP32 summation order can move a value across a
+        # rounding boundary, never further than one low-precision ulp.
+        ulp = 2.0 ** (-7 if dtype == torch.bfloat16 else -10)
+        torch.testing.assert_close(out.float(), expected.float(), rtol=ulp, atol=0)
+        assert out.eq(expected).float().mean() > 0.999
+    # Column slices of a wider row are accepted and land in a caller buffer.
+    wide = torch.randn(9, 3 * hidden_size, device=device, dtype=dtype)
+    destination = torch.empty(9, hidden_size, device=device, dtype=dtype)
+    got = reference_rmsnorm(
+        wide[:, hidden_size : 2 * hidden_size], weight, eps, destination
+    )
+    assert got is destination
+    torch.testing.assert_close(
+        got,
+        reference_rmsnorm(
+            wide[:, hidden_size : 2 * hidden_size].contiguous(), weight, eps, None
+        ),
+        rtol=0,
+        atol=0,
+    )
+    with pytest.raises(ValueError):
+        reference_rmsnorm(x.t(), weight, eps, None)
+    with pytest.raises(ValueError):
+        reference_rmsnorm(x, weight[:-1], eps, None)

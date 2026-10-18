@@ -81,7 +81,14 @@ class NcclBackend(CommBackend):
 
     # ---- Public CommBackend interface ----
 
-    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(tensor, torch.Tensor):
+            return super().all_reduce(tensor, group, op=op)
         res = self._get_or_create_resources(group)
         if res["world_size"] == 1:
             return tensor
@@ -93,6 +100,40 @@ class NcclBackend(CommBackend):
         else:
             torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
         return tensor
+
+    def all_reduce_two(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce two tensors in one grouped NCCL launch.
+
+        NCCL group semantics aggregate the two collectives into a single
+        kernel launch, so callers get single-launch latency WITHOUT first
+        copying the operands into one contiguous buffer -- the copy-free
+        alternative to a cat + single all-reduce. Falls back to two ordinary
+        collectives when the coalescing manager is unavailable (pynccl-driven
+        groups, torch without ``_coalescing_manager``).
+        """
+        res = self._get_or_create_resources(group)
+        if res["world_size"] == 1:
+            return first, second
+        if op is None:
+            op = torch.distributed.ReduceOp.SUM
+        pynccl = res["pynccl_comm"]
+        coalescing = getattr(torch.distributed, "_coalescing_manager", None)
+        if coalescing is None or (pynccl is not None and not pynccl.disabled):
+            return (
+                self.all_reduce(first, group, op=op),
+                self.all_reduce(second, group, op=op),
+            )
+        device_group = res["device_group"]
+        with coalescing(group=device_group):
+            torch.distributed.all_reduce(first, op=op, group=device_group)
+            torch.distributed.all_reduce(second, op=op, group=device_group)
+        return first, second
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
@@ -110,7 +151,7 @@ class NcclBackend(CommBackend):
             output_size, dtype=tensor.dtype, device=tensor.device
         )
 
-        self.all_gather_into_tensor(output_tensor, tensor, group)
+        self.all_gather_single(output_tensor, tensor, group)
 
         output_tensor = output_tensor.reshape((ws,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -119,7 +160,7 @@ class NcclBackend(CommBackend):
         )
         return output_tensor
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         res = self._get_or_create_resources(group)
@@ -127,7 +168,7 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.all_gather(output, input)
         else:
-            torch.distributed.all_gather_into_tensor(
+            torch.distributed.all_gather_single(
                 output, input, group=res["device_group"]
             )
 
@@ -157,7 +198,7 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.reduce_scatter(output_tensor, tensor)
         else:
-            torch.distributed.reduce_scatter_tensor(
+            torch.distributed.reduce_scatter_single(
                 output_tensor, tensor, group=res["device_group"]
             )
         return output_tensor
@@ -216,7 +257,7 @@ class NcclBackend(CommBackend):
         output = torch.empty(
             tp_size * max_tokens, hidden, dtype=tensor.dtype, device=tensor.device
         )
-        self.all_gather_into_tensor(output, padded.contiguous(), group)
+        self.all_gather_single(output, padded.contiguous(), group)
 
         chunks = []
         for i, n in enumerate(scattered_num_tokens):
@@ -251,7 +292,7 @@ class NcclBackend(CommBackend):
             max_tokens, hidden, dtype=tensor.dtype, device=tensor.device
         )
         res = self._get_or_create_resources(group)
-        torch.distributed.reduce_scatter_tensor(
+        torch.distributed.reduce_scatter_single(
             output, padded_input.contiguous(), group=res["device_group"]
         )
         rank = group.index(torch.distributed.get_rank())

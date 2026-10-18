@@ -19,7 +19,17 @@
 # SOFTWARE.
 
 """``ts serve`` orchestrator: spawn smg gateway + gRPC engine, tag logs, probe
-readiness, and tear down gateway-first on shutdown."""
+readiness, and tear down gateway-first on shutdown.
+
+``ts serve`` is the full serving command; today its internals are the smg
+gateway plus the gRPC engine servicer. ``ts serve --headless`` is engine-only:
+nothing else is spawned here — an external frontend such as ``smg serve
+--backend tokenspeed --connection-mode zmq`` binds the msgpack ZMQ sockets and
+this engine dials in at ``tcp://{--data-parallel-address}:
+{--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
+mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
+``launch_scheduler_headless``).
+"""
 
 from __future__ import annotations
 
@@ -28,20 +38,25 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 from pathlib import Path
 
-from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
+from tokenspeed_kernel.platform import current_platform
+
+from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv, split_headless_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
+    engine_argv,
     spawn_engine,
     spawn_gateway,
     terminate_then_kill,
     wait_grpc_serving,
     wait_http_ready,
 )
+from tokenspeed.runtime.utils.launcher import _ephemeral_port_range, detect_topology
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -52,20 +67,41 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
+INKLING_REASONING_PARSER = "inkling"
+INKLING_TOOL_CALL_PARSER = "inkling"
+INKLING_ATTENTION_BACKEND = "fa4"
+KIMI_K3_REASONING_PARSER = "kimi_k3"
+KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
+DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
 # smg routing policy for ``ts serve``. Distinct from DEFAULT_REASONING_PARSER,
 # which happens to share the "passthrough" string but configures an unrelated
 # flag (--reasoning-parser).
 DEFAULT_SMG_POLICY = "passthrough"
-# smg reliability knobs we always want disabled when launched under
-# ts serve. These are tokenspeed-internal defaults: not surfaced via
-# the ts CLI, not routed through split_argv.
+# smg reliability and background load-monitoring knobs we always want disabled
+# when launched under ts serve. These are tokenspeed-internal defaults: not
+# surfaced via the ts CLI, not routed through split_argv. This is independent
+# from the routing policy below: disabling load monitoring stops smg's
+# background engine-load polling.
 _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
+    "--disable-load-monitoring",
 )
+
+
+def _set_default_grpc_max_message_bytes() -> None:
+    """Raise the gRPC payload ceiling for ``ts serve`` child processes.
+
+    Multimodal tensors can exceed the smaller transport default. ``setdefault``
+    keeps this an orchestrator default: an operator-provided environment value
+    is inherited unchanged by both the engine and gateway subprocesses.
+    """
+    os.environ.setdefault(GRPC_MAX_MESSAGE_BYTES_ENV, DEFAULT_GRPC_MAX_MESSAGE_BYTES)
 
 
 def _check_serve_extra_installed() -> None:
@@ -91,22 +127,31 @@ def _check_serve_extra_installed() -> None:
         sys.exit(1)
 
 
-def _user_host_port_from_gateway_args(gateway_args: list[str]) -> tuple[str, int]:
-    """Pull --host / --port out of the gateway-bound argv.
+def _get_from_args(
+    args: list[str], flag: str, default: str | None = None
+) -> str | None:
+    """Return the value following ``flag`` in a split argv.
 
-    Defaults match TokenSpeed's public serving endpoint. The argv MUST
-    be in canonical ``[--flag, value, ...]`` form as produced by
+    The argv MUST be in canonical ``[--flag, value, ...]`` form as produced by
     ``split_argv``; equals-form (``--port=8000``) is not handled here.
+
+    Args:
+        args: Engine- or gateway-side argv.
+        flag: Long-form flag to look up, including the leading dashes.
+        default: Returned when the flag is absent or is the final token.
+
+    Returns:
+        The value following the last occurrence of ``flag``, else ``default``.
+        Last-wins matches argparse, so a wrapper can append a flag to override
+        one already in the argv.
     """
-    host = DEFAULT_GATEWAY_HOST
-    port = DEFAULT_GATEWAY_PORT
-    it = iter(gateway_args)
-    for token in it:
-        if token == "--host":
-            host = next(it)
-        elif token == "--port":
-            port = int(next(it))
-    return host, port
+    try:
+        index = len(args) - 1 - args[::-1].index(flag)
+    except ValueError:
+        return default
+    if index + 1 >= len(args):
+        return default
+    return args[index + 1]
 
 
 def _gateway_args_with_default_port(gateway_args: list[str]) -> list[str]:
@@ -121,10 +166,35 @@ def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
 
+def _operator_policy(gateway_args: list[str]) -> str | None:
+    """The operator's explicit ``--policy`` value (last-wins), or None.
+
+    Call before ``_gateway_args_with_default_policy`` injects a default.
+    """
+    policy = None
+    for i, arg in enumerate(gateway_args):
+        if arg == "--policy" and i + 1 < len(gateway_args):
+            policy = gateway_args[i + 1]
+        elif arg.startswith("--policy="):
+            policy = arg.split("=", 1)[1]
+    return policy
+
+
 def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
-    """Append the smg reliability-disable switches if they are not already there."""
+    """Append smg reliability and load-monitoring disable switches when absent.
+
+    ``--policy cache_aware`` keeps load monitoring: its imbalance/overload
+    triggers feed on the worker load monitor.
+
+    NOTE: ``--dp-aware`` is deliberately NOT auto-injected — rank pinning
+    needs smg releases with TokenSpeed dp-affinity support; bump the
+    tokenspeed-smg* pins in lockstep before enabling it.
+    """
+    keep_load_monitoring = _operator_policy(gateway_args) == "cache_aware"
     result = list(gateway_args)
     for flag in _DEFAULT_SMG_DISABLE_FLAGS:
+        if flag == "--disable-load-monitoring" and keep_load_monitoring:
+            continue
         if flag not in result:
             result.append(flag)
     return result
@@ -139,7 +209,8 @@ def _gateway_args_with_default_policy(gateway_args: list[str]) -> list[str]:
     Against engines that predate that RPC the subscription surfaced as
     ``NotImplementedError: Method not implemented`` (smg#1794). The ``passthrough``
     policy (smg#1797) forwards every request to the single healthy worker with no
-    load balancing, load monitoring, or KV-event subscription.
+    load-aware routing or KV-event subscription. Separately,
+    ``--disable-load-monitoring`` turns off smg's background engine-load polling.
 
     Default-when-unset: an explicit operator ``--policy`` is preserved.
 
@@ -149,7 +220,7 @@ def _gateway_args_with_default_policy(gateway_args: list[str]) -> list[str]:
     the pin in ``python/pyproject.toml`` must be bumped to such a release in
     lockstep with this default.
     """
-    if "--policy" in gateway_args:
+    if _operator_policy(gateway_args) is not None:
         return gateway_args
     return [*gateway_args, "--policy", DEFAULT_SMG_POLICY]
 
@@ -192,6 +263,41 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
 
 
+_FREE_PORT_MAX_ATTEMPTS = 5
+
+
+def _free_port_avoiding_ephemeral_range() -> int:
+    """Allocate a free TCP port, retrying one that falls in the ephemeral range.
+
+    ``get_free_port()`` samples via ``bind(("", 0))``, which the kernel
+    satisfies from the very same ephemeral range it uses to auto-assign
+    *source* ports to outbound connections (health probes, gRPC dials, HF
+    Hub downloads, ...). The gap between that sample and the freshly spawned
+    smg subprocess actually binding it is real (process spawn + Python/PyO3
+    import + router construction), and on a host running several
+    ``ts serve`` replicas at once — each doing its own outbound networking —
+    an unrelated connection can grab that exact port first. smg's Rust
+    listeners don't set ``SO_REUSEADDR``, so the late bind then fails with
+    ``AddrInUse``, and because a dead listener aborts the whole
+    ``router.start()`` call, this is fatal to the gateway regardless of
+    which listener (main port, Prometheus, ...) lost the race.
+
+    Retrying a handful of times against a *known* ephemeral range keeps the
+    returned port out of it; on hosts where the range can't be read (e.g.
+    non-Linux), this degrades to a plain ``get_free_port()`` call.
+    """
+    ephemeral = _ephemeral_port_range()
+    port = get_free_port()
+    if ephemeral is None:
+        return port
+    low, high = ephemeral
+    for _ in range(_FREE_PORT_MAX_ATTEMPTS - 1):
+        if not (low <= port <= high):
+            return port
+        port = get_free_port()
+    return port
+
+
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
     """Bind the smg Prometheus exporter to a freshly allocated free port.
 
@@ -202,45 +308,65 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     A dead metrics server makes the gateway exit during startup, the
     tokenizer registration job never runs, and the first request surfaces
     ``tokenizer_not_found`` / ``no worker available``. Allocating a fresh
-    free port per launch (like the engine and control ports) avoids every
-    collision; callers that need a stable scrape target can still pass an
-    explicit ``--prometheus-port``.
+    free port per launch (like the engine and control ports) avoids stale
+    collisions, but only if it happens right before ``spawn_gateway``: a
+    port picked at argv-build time sits unreserved through the whole engine
+    startup — minutes for large models — and the kernel can hand it to any
+    outbound connection (engine bootstrap, readiness probes) as an ephemeral
+    source port, failing the gateway bind. Callers that need a stable scrape
+    target can still pass an explicit ``--prometheus-port``.
+
+    The port itself is drawn via ``_free_port_avoiding_ephemeral_range()``
+    rather than a bare ``get_free_port()``: even allocated "right before"
+    spawn, a candidate sampled from the ephemeral range can still be raced
+    away by an unrelated outbound connection during subprocess startup —
+    see that helper's docstring.
     """
     if "--prometheus-port" in gateway_args:
         return gateway_args
-    return [*gateway_args, "--prometheus-port", str(get_free_port())]
+    return [
+        *gateway_args,
+        "--prometheus-port",
+        str(_free_port_avoiding_ephemeral_range()),
+    ]
 
 
-def _user_model_id(gateway_args: list[str]) -> str | None:
-    """Return the value of ``--model`` from a split gateway argv, or ``None``."""
-    try:
-        idx = gateway_args.index("--model")
-    except ValueError:
-        return None
-    if idx + 1 >= len(gateway_args):
-        return None
-    return gateway_args[idx + 1]
-
-
-def _is_deepseek_v4_model(model_id: str | None) -> bool:
+def _load_model_config(model_id: str | None) -> dict:
+    """Best-effort read of ``<model_id>/config.json`` (empty dict on any miss)."""
     if not model_id:
-        return False
-
-    normalized = model_id.lower().replace("_", "-")
-    compact = normalized.replace("-", "")
-    if "deepseek-v4" in normalized or "deepseekv4" in compact:
-        return True
-
+        return {}
     config_path = Path(model_id) / "config.json"
     if not config_path.is_file():
-        return False
+        return {}
     try:
         with config_path.open() as f:
             config = json.load(f)
     except (OSError, json.JSONDecodeError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _is_deepseek_v41_model(model_id: str | None) -> bool:
+    if not model_id:
         return False
-    if not isinstance(config, dict):
+    config = _load_model_config(model_id)
+    if config.get("model_type") in {"deepseek_v41", "deepseek_v41_text"} or (
+        "DeepseekV41ForCausalLM" in (config.get("architectures") or [])
+    ):
+        return True
+    return (
+        re.search(r"deepseek[-_]?v4[._-]?1(?:[-_/]|$)", model_id, re.IGNORECASE)
+        is not None
+    )
+
+
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id or _is_deepseek_v41_model(model_id):
         return False
+    normalized = model_id.lower().replace("_", "-")
+    if "deepseek-v4" in normalized or "deepseekv4" in normalized.replace("-", ""):
+        return True
+    config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
     return (
         config.get("model_type") == "deepseek_v4"
@@ -251,25 +377,45 @@ def _is_deepseek_v4_model(model_id: str | None) -> bool:
 def _is_glm_dsa_model(model_id: str | None) -> bool:
     if not model_id:
         return False
-
     normalized = model_id.lower().replace("_", "-")
-    compact = normalized.replace("-", "")
-    if "glm-5" in normalized or "glm5" in compact:
+    if "glm-5" in normalized or "glm5" in normalized.replace("-", ""):
         return True
-
-    config_path = Path(model_id) / "config.json"
-    if not config_path.is_file():
-        return False
-    try:
-        with config_path.open() as f:
-            config = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(config, dict):
-        return False
+    config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
     return config.get("model_type") == "glm_moe_dsa" or any(
         arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"}
+        for arch in architectures
+    )
+
+
+def _is_inkling_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    normalized = model_id.lower().replace("_", "-").rstrip("/")
+    if "inkling" in normalized:
+        return True
+    config = _load_model_config(model_id)
+    architectures = config.get("architectures") or []
+    return (
+        config.get("model_type") == "inkling_mm_model"
+        or "InklingForConditionalGeneration" in architectures
+    )
+
+
+def _is_kimi_k3_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    normalized = model_id.lower().replace("_", "-").rstrip("/")
+    if "kimi-k3" in normalized or "kimik3" in normalized.replace("-", ""):
+        return True
+    config = _load_model_config(model_id)
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "kimi_k3" or any(
+        arch
+        in {
+            "KimiK3ForConditionalGeneration",
+            "KimiK3ForConditionalGenerationNextN",
+        }
         for arch in architectures
     )
 
@@ -283,11 +429,23 @@ def _args_with_default_model_parsers(
     reasoning_content after generation, while the engine uses the same parser
     name to defer json_schema grammars past the reasoning channel.
     """
-    model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
+    model_id = _get_from_args(gateway_args, "--model") or _get_from_args(
+        engine_args, "--model"
+    )
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
 
-    if _is_deepseek_v4_model(model_id):
+    if _is_deepseek_v41_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", "deepseek_v41"])
+
+    elif _is_deepseek_v4_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -307,11 +465,47 @@ def _args_with_default_model_parsers(
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
 
+    elif _is_inkling_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", INKLING_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", INKLING_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", INKLING_TOOL_CALL_PARSER])
+        if current_platform().is_nvidia:
+            # Inkling's NVIDIA rel-bias attention requires FA4; reject bad explicit backends before workers start.
+            if "--attention-backend" in engine_result:
+                backend_index = engine_result.index("--attention-backend")
+                backend = (
+                    engine_result[backend_index + 1]
+                    if backend_index + 1 < len(engine_result)
+                    else None
+                )
+                if backend != INKLING_ATTENTION_BACKEND:
+                    raise ValueError(
+                        "Inkling requires --attention-backend "
+                        f"{INKLING_ATTENTION_BACKEND}, got {backend!r}"
+                    )
+            else:
+                engine_result.extend(["--attention-backend", INKLING_ATTENTION_BACKEND])
+
+    elif _is_kimi_k3_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", KIMI_K3_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", KIMI_K3_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", KIMI_K3_TOOL_CALL_PARSER])
+
     return engine_result, gateway_result
 
 
 def _prewarm_hf_tokenizer(model_id: str) -> None:
-    """Download tokenizer artifacts to the HF cache before the gateway boots.
+    """Download tokenizer and chat-template assets before the gateway boots.
 
     smg fires its ``AddTokenizer`` job asynchronously after the engine
     reports SERVING. On fast runners (e.g. b300) the first eval request
@@ -333,11 +527,12 @@ def _prewarm_hf_tokenizer(model_id: str) -> None:
                 "special_tokens_map*",
                 "vocab*",
                 "merges*",
+                "chat_template*",
                 "*.json",
             ],
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("HF tokenizer prewarm failed for %s: %s", model_id, exc)
+        logger.warning(f"HF tokenizer prewarm failed for {model_id!s}: {exc!s}")
 
 
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
@@ -346,8 +541,7 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
     gateway_args = _gateway_args_with_default_policy(gateway_args)
     gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
-    gateway_args = _gateway_args_with_default_log_level(gateway_args)
-    return _gateway_args_with_default_prometheus_port(gateway_args)
+    return _gateway_args_with_default_log_level(gateway_args)
 
 
 def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
@@ -357,11 +551,10 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     is present in the engine argv (allocating a free port if the user did not pin
     one) and return the matching ``rl_control_url``.
     """
-    if "--rl-control-port" in engine_args:
-        idx = engine_args.index("--rl-control-port")
-        port = int(engine_args[idx + 1])
-        return engine_args, f"http://127.0.0.1:{port}"
-    port = get_free_port()
+    pinned = _get_from_args(engine_args, "--rl-control-port")
+    if pinned is not None:
+        return engine_args, f"http://127.0.0.1:{int(pinned)}"
+    port = _free_port_avoiding_ephemeral_range()
     return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
 
@@ -405,7 +598,7 @@ async def _start_control_server(
         if loop.time() >= deadline:
             return False
         await asyncio.sleep(0.05)
-    logger.info("control server bound in %.2fs", loop.time() - start)
+    logger.info(f"control server bound in {loop.time() - start:.2f}s")
     return True
 
 
@@ -488,7 +681,7 @@ async def run_smg(
             pass  # Windows: signal handlers via asyncio aren't supported. Out of scope.
 
     try:
-        engine_port = get_free_port()
+        engine_port = _free_port_avoiding_ephemeral_range()
 
         # Wire the in-engine RL control-plane port (always on). Must happen
         # before spawn_engine.
@@ -507,6 +700,9 @@ async def run_smg(
             label=ENGINE_TAG,
         )
 
+        # Allocate the metrics port only now — see
+        # _gateway_args_with_default_prometheus_port for why earlier is racy.
+        gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
         gateway = await spawn_gateway(
             gateway_args, engine_host="127.0.0.1", engine_port=engine_port
         )
@@ -568,13 +764,13 @@ async def run_smg(
         return 0
 
     except _ChildExitedDuringStartup as exc:
-        logger.error("startup failed: %s", exc)
+        logger.error(f"startup failed: {exc!s}")
         return 1
     except _ShutdownDuringStartup:
         logger.info("shutdown signal received during startup; exiting cleanly")
         return 0
     except TimeoutError as exc:
-        logger.error("startup failed: %s", exc)
+        logger.error(f"startup failed: {exc!s}")
         return 1
     except KeyboardInterrupt:
         logger.info("interrupted; exiting cleanly")
@@ -603,8 +799,37 @@ async def run_smg(
                     pass
 
 
+def _run_headless(argv: list[str]) -> None:
+    """``ts serve --headless``: run the scheduler-only launcher in-process.
+
+    No gateway, gRPC servicer, or control server: the external frontend owns
+    the HTTP surface, binds the ZMQ sockets, and does the (de)tokenization.
+    Reuses the ``python -m tokenspeed.runtime.entrypoints.engine``
+    implementation; ``argv`` is a plain ServerArgs argv.
+    """
+    try:
+        import setproctitle
+
+        setproctitle.setproctitle("ts-serve-headless")
+    except ImportError:
+        pass
+
+    from tokenspeed.runtime.entrypoints.engine import run_scheduler_headless_from_cli
+
+    run_scheduler_headless_from_cli(argv)
+
+
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
+    headless_argv = split_headless_argv(raw_argv)
+    if headless_argv is not None:
+        # Engine-only: skip the orchestrator entirely, including its
+        # gRPC-specific env defaults and bundled-gateway install check.
+        _run_headless(headless_argv)
+        return
+
+    _set_default_grpc_max_message_bytes()
+
     try:
         import setproctitle
 
@@ -620,18 +845,35 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
         split.engine, split.gateway
     )
     gateway_args = _gateway_args_with_defaults(gateway_args)
-    user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
+    user_host = _get_from_args(gateway_args, "--host", DEFAULT_GATEWAY_HOST)
+    user_port = int(_get_from_args(gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)))
 
-    model_id = _user_model_id(gateway_args)
-    if model_id is not None:
-        _prewarm_hf_tokenizer(model_id)
-    rc = asyncio.run(
-        run_smg(
-            engine_args=engine_args,
-            gateway_args=gateway_args,
-            opts=split.opts,
-            user_host=user_host,
-            user_port=user_port,
+    node_rank = _get_from_args(engine_args, "--node-rank")
+    if node_rank is None:
+        topology = detect_topology()
+        node_rank = 0 if topology is None else topology.node_rank
+    else:
+        node_rank = int(node_rank)
+
+    if node_rank == 0:
+        model_id = _get_from_args(gateway_args, "--model")
+        if model_id is not None:
+            _prewarm_hf_tokenizer(model_id)
+        rc = asyncio.run(
+            run_smg(
+                engine_args=engine_args,
+                gateway_args=gateway_args,
+                opts=split.opts,
+                user_host=user_host,
+                user_port=user_port,
+            )
         )
-    )
-    sys.exit(rc)
+        sys.exit(rc)
+    else:
+        # Non-zero-rank nodes never create a gRPC servicer, so they run the
+        # engine directly, skipping the gateway.
+        argv = engine_argv(engine_args, host=user_host, port=user_port)
+        logger.info(f"follower node: exec {' '.join(argv)}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(argv[0], argv)

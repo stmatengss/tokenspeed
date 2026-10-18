@@ -21,22 +21,16 @@
 from __future__ import annotations
 
 import ctypes
-import json
 import logging
 import math
 import os
-import pickle
-import subprocess
+import site
 import sys
-import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
-from itertools import product
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +41,54 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "prepare_cuda_toolkit_env",
 ]
+
+
+def prepare_cuda_toolkit_env() -> None:
+    """Expose a wheel-provided CUDA toolkit to extensions that require nvcc."""
+    site_paths = []
+    try:
+        site_paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    site_paths.extend(sys.path)
+
+    candidates = []
+    requested_cuda_home = os.environ.get("CUDA_HOME")
+    if requested_cuda_home:
+        candidates.append(Path(requested_cuda_home))
+    for base in site_paths:
+        candidates.extend(sorted((Path(base) / "nvidia").glob("cu*"), reverse=True))
+
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if not (
+            (candidate / "include" / "cuda_runtime.h").exists()
+            and (candidate / "bin" / "nvcc").exists()
+        ):
+            continue
+
+        os.environ["CUDA_HOME"] = str(candidate)
+        _prepend_env_path("CPATH", candidate / "include")
+        _prepend_env_path("PATH", candidate / "bin")
+        return
+
+
+def _prepend_env_path(name: str, path: Path) -> None:
+    value = str(path)
+    entries = [entry for entry in os.environ.get(name, "").split(os.pathsep) if entry]
+    if value not in entries:
+        os.environ[name] = os.pathsep.join([value, *entries])
+
+
+def _npu_is_available() -> bool:
+    """Return whether torch-npu is installed and an Ascend device is visible."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(torch.npu.is_available())
 
 
 # ---------------------------------------------------------------------------
@@ -89,20 +130,10 @@ class InterconnectInfo:
 
 
 @dataclass(frozen=True)
-class Fp8E4M3FnDType:
-    dtype: torch.dtype
-    max: float
-    min: float
-
-
-_fp8e4m3_dtype = None
-
-
-@dataclass(frozen=True)
 class PlatformInfo:
     """Complete description of a compute platform."""
 
-    vendor: str  # "nvidia", "amd"
+    vendor: str  # "nvidia", "amd", "ascend"
     arch_version: ArchVersion
     device_name: str
     device_count: int
@@ -153,12 +184,16 @@ class PlatformInfo:
         return self.vendor == "amd"
 
     @property
-    def is_cdna3(self) -> bool:
-        return self.is_amd and self.arch_version == ArchVersion(9, 4)
+    def is_npu(self) -> bool:
+        return self.vendor == "ascend"
 
     @property
     def is_cdna4(self) -> bool:
         return self.is_amd and self.arch_version == ArchVersion(9, 5)
+
+    @property
+    def is_cdna5(self) -> bool:
+        return self.is_amd and self.arch_version == ArchVersion(12, 5)
 
     @property
     def is_ampere_plus(self) -> bool:
@@ -173,35 +208,17 @@ class PlatformInfo:
         return self.is_nvidia and self.arch_version >= ArchVersion(10, 0)
 
     @property
-    def is_cdna3_plus(self) -> bool:
-        return self.is_amd and self.arch_version >= ArchVersion(9, 4)
-
-    @property
     def is_cdna4_plus(self) -> bool:
         return self.is_amd and self.arch_version >= ArchVersion(9, 5)
+
+    @property
+    def is_cdna5_plus(self) -> bool:
+        return self.is_amd and self.arch_version >= ArchVersion(12, 5)
 
     @property
     def arch(self) -> str:
         """Short architecture string for cache keys."""
         return str(self.arch_version)
-
-    @property
-    def is_fp8e4m3fnuz(self) -> bool:
-        return self.is_cdna3
-
-    @property
-    def fp8e4m3fn(self) -> Fp8E4M3FnDType:
-        global _fp8e4m3_dtype
-        if _fp8e4m3_dtype is None:
-            if self.is_cdna3:
-                dtype = torch.float8_e4m3fnuz
-                fp8_max = 224.0
-            else:
-                dtype = torch.float8_e4m3fn
-                fp8_max = torch.finfo(dtype).max
-            fp8_min = -fp8_max
-            _fp8e4m3_dtype = Fp8E4M3FnDType(dtype=dtype, max=fp8_max, min=fp8_min)
-        return _fp8e4m3_dtype
 
     def register_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
         """Register host memory that GPU kernels will directly dereference."""
@@ -235,8 +252,8 @@ class PlatformInfo:
             return names.get(arch_version, f"SM{arch_version[0]}.{arch_version[1]}")
         if self.is_amd:
             names = {
-                (9, 4): "CDNA3",  # MI300
                 (9, 5): "CDNA4",  # MI350
+                (12, 5): "CDNA5",
             }
             return names.get(arch_version, f"GFX{arch_version[0]}.{arch_version[1]}")
         return f"{self.vendor}:{arch_version[0]}.{arch_version[1]}"
@@ -310,6 +327,18 @@ def current_platform() -> PlatformInfo:
     return Platform.get()
 
 
+_pdl_enabled: bool | None = None
+
+
+def pdl_enabled(overwrite: bool | None = None) -> bool:
+    global _pdl_enabled
+    if overwrite is not None:
+        _pdl_enabled = bool(overwrite) and current_platform().is_hopper_plus
+    elif _pdl_enabled is None:
+        _pdl_enabled = current_platform().is_hopper_plus
+    return _pdl_enabled
+
+
 # ---------------------------------------------------------------------------
 # Detection implementation
 # ---------------------------------------------------------------------------
@@ -339,7 +368,31 @@ def _detect_platform() -> PlatformInfo:
             return _detect_rocm_platform()
         return _detect_cuda_platform()
 
-    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+    if _npu_is_available():
+        return _detect_npu_platform()
+
+    raise RuntimeError(
+        "tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, or Ascend NPU device."
+    )
+
+
+def _detect_npu_platform() -> PlatformInfo:
+    """Detect an Ascend platform exposed through torch-npu."""
+    props = torch.npu.get_device_properties(torch.npu.current_device())
+    return PlatformInfo(
+        vendor="ascend",
+        arch_version=ArchVersion(9, 1),
+        device_name=props.name,
+        device_count=torch.npu.device_count(),
+        total_memory=props.total_memory,
+        memory_bandwidth=0.0,
+        sm_count=getattr(props, "cube_core_num", 0),
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
+        sm_features=frozenset({"tensor_core:f16", "tensor_core:bf16"}),
+        runtime_features=frozenset({"runtime:acl_graph"}),
+        interconnect=InterconnectInfo(topology="single_gpu"),
+    )
 
 
 def _detect_cuda_platform() -> PlatformInfo:
@@ -413,12 +466,19 @@ def _detect_rocm_platform() -> PlatformInfo:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch = _extract_amd_arch(props.gcnArchName)
 
-    # Map AMD architectures
+    # Map supported AMD architectures.
     arch_map = {
-        "gfx942": ArchVersion(9, 4),  # MI300
         "gfx950": ArchVersion(9, 5),  # MI350
+        "gfx1250": ArchVersion(12, 5),
     }
-    arch_version = arch_map.get(arch, ArchVersion(9, 0))
+    try:
+        arch_version = arch_map[arch]
+    except KeyError:
+        supported_arches = ", ".join(sorted(arch_map))
+        raise RuntimeError(
+            f"Detected unsupported AMD GPU architecture {arch!r}; "
+            f"current support list: {supported_arches}"
+        ) from None
     sm_features = _get_rocm_sm_features(arch)
     runtime_features = _get_rocm_runtime_features()
 
@@ -431,9 +491,9 @@ def _detect_rocm_platform() -> PlatformInfo:
         memory_bandwidth=_estimate_amd_bandwidth(props),
         sm_count=props.multi_processor_count,
         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
-        max_shared_memory_per_sm={"gfx942": 64 * 1024, "gfx950": 160 * 1024}.get(
-            arch, getattr(props, "max_shared_memory_per_block", 0)
-        ),
+        max_shared_memory_per_sm={
+            "gfx950": 160 * 1024,
+        }.get(arch, getattr(props, "max_shared_memory_per_block", 0)),
         sm_features=sm_features,
         runtime_features=runtime_features,
         interconnect=_detect_rocm_interconnect(),
@@ -444,10 +504,10 @@ def _get_rocm_sm_features(arch: str) -> frozenset[str]:
     """Determine ROCm SM features from architecture."""
     features: set[str] = set()
 
-    if arch in ("gfx942", "gfx950"):
+    if arch in ("gfx950", "gfx1250"):
         features |= {"tensor_core:f16", "tensor_core:f8"}
 
-    if arch == "gfx950":
+    if arch in ("gfx950", "gfx1250"):
         features |= {"tensor_core:f4", "memory:async_copy"}
 
     return frozenset(features)
@@ -471,7 +531,7 @@ def _get_rocm_runtime_features() -> frozenset[str]:
 def _extract_amd_arch(gcn_arch_name: str) -> str:
     """Extract base architecture from GCN arch name.
 
-    Example: 'gfx942:sramecc+:xnack-' -> 'gfx942'
+    Example: 'gfx950:sramecc+:xnack-' -> 'gfx950'
     """
     return gcn_arch_name.split(":")[0]
 
@@ -586,7 +646,7 @@ def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
                 )
             )
     except Exception as e:
-        logger.warning("NVML failed to query NUMA affinity: %s", e)
+        logger.warning(f"NVML failed to query NUMA affinity: {e!s}")
         return ()
     finally:
         if nvml_initialized:
@@ -635,7 +695,7 @@ def _detect_cuda_nvlink_topology() -> str | None:
                 except pynvml.NVMLError:
                     full_nvlink = False
     except Exception as e:
-        logger.warning("NVML failed to query NVLink topology: %s", e)
+        logger.warning(f"NVML failed to query NVLink topology: {e!s}")
         return None
     finally:
         if nvml_initialized:

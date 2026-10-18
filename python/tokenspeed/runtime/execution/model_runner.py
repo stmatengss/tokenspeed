@@ -25,8 +25,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -39,6 +41,33 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = get_colorful_logger(__name__)
+
+
+def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
+    """Return the dtype of the loaded multimodal encoder when discoverable."""
+    for path in (
+        ("visual",),
+        ("vision_tower",),
+        ("audio_tower",),
+        ("model", "visual"),
+        ("model", "vision_tower"),
+        ("model", "audio_tower"),
+    ):
+        component = model
+        for name in path:
+            component = getattr(component, name, None)
+            if component is None:
+                break
+        else:
+            dtype = getattr(component, "dtype", None)
+            if isinstance(dtype, torch.dtype):
+                return str(dtype).removeprefix("torch.")
+            if isinstance(component, torch.nn.Module):
+                for tensors in (component.parameters(), component.buffers()):
+                    for tensor in tensors:
+                        if tensor.is_floating_point():
+                            return str(tensor.dtype).removeprefix("torch.")
+    return None
 
 
 class ModelRunner:
@@ -62,11 +91,10 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
+        self._weight_update_pg: torch.distributed.ProcessGroup | None = None
+        self._weight_update_device: torch.device | None = None
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
-        self.sliding_window_size = getattr(
-            model_config.hf_config, "sliding_window", None
-        )
 
         draft_moe_override = (
             self.is_draft_worker
@@ -87,8 +115,7 @@ class ModelRunner:
                     server_args.kv_cache_dtype = "fp8_e4m3"
                     logger.info(
                         "Auto-detected kv_cache_dtype=fp8_e4m3 from checkpoint "
-                        "quant config (kv_cache_quant_algo=%s)",
-                        kv_algo,
+                        f"quant config (kv_cache_quant_algo={kv_algo!s})",
                     )
 
         global_server_args_dict_update(server_args)
@@ -115,6 +142,43 @@ class ModelRunner:
             self.model, "spec_step_idx"
         )
 
+    @property
+    def multimodal_encoder_dtype(self) -> str | None:
+        return infer_multimodal_encoder_dtype(self.model)
+
+    def prepare_multimodal_runtime(self) -> None:
+        """Prepare loaded multimodal encoders for serving.
+
+        This is an explicit post-load phase because it can execute substantial
+        GPU work. Language workers must call it before KV-cache memory
+        profiling so retained encoder graph pools and lazy buffers are included
+        in the cache budget. Encoder-only EPD workers call the same phase even
+        though they do not allocate a KV cache.
+        """
+        self.encoder_graph_wrappers = MultimodalRuntime.install_encoder_graphs(
+            self.model, self.server_args
+        )
+        if self.encoder_graph_wrappers:
+            logger.info(
+                "Multimodal encoder CUDA graphs installed for "
+                f"{sorted(self.encoder_graph_wrappers)!s}",
+            )
+
+        warmup_device = torch.device(self.device)
+        if warmup_device.type == "cuda" and warmup_device.index is None:
+            warmup_device = torch.device("cuda", self.gpu_id)
+        warmup_multimodal_encoders(
+            self.model,
+            device=warmup_device,
+        )
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Allocate model communication buffers before cache planning."""
+        prepare = getattr(self.model, "prepare_communication_runtime", None)
+        if prepare is None:
+            return False
+        return bool(prepare(max_num_tokens))
+
     @staticmethod
     def _forward_accepts_kwarg(model, name: str) -> bool:
         try:
@@ -129,22 +193,16 @@ class ModelRunner:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        req_pool_indices: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
+        kv_sync_event: "torch.cuda.Event | None" = None,
+        pp_inbound=None,
+        **kwargs,
     ) -> LogitsProcessorOutput:
-        kwargs = {}
-        if req_pool_indices is not None:
-            kwargs["req_pool_indices"] = req_pool_indices
-        if seq_lens is not None:
-            kwargs["seq_lens"] = seq_lens
-        if extend_prefix_lens is not None:
-            kwargs["extend_prefix_lens"] = extend_prefix_lens
+        if pp_inbound is not None:
+            kwargs["pp_inbound"] = pp_inbound
         if not self.is_generation:
             kwargs["get_embedding"] = True
         if captured_hidden_states is not None:
@@ -157,12 +215,13 @@ class ModelRunner:
             self, "_model_forward_accepts_spec_step_idx", False
         ):
             kwargs["spec_step_idx"] = spec_step_idx
+        if kv_sync_event is not None:
+            kwargs["kv_sync_event"] = kv_sync_event
 
         return self.model.forward(
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 
@@ -235,11 +294,8 @@ class ModelRunner:
             self._weight_update_pg = pg
             self._weight_update_device = device
             logger.info(
-                "weight-update group joined: rank=%d world_size=%d device=%s group=%s",
-                rank,
-                world_size,
-                device,
-                group_name,
+                f"weight-update group joined: rank={rank:d} world_size={world_size:d} "
+                f"device={device!s} group={group_name!s}",
             )
             return True, "weight update group initialized"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
@@ -250,7 +306,7 @@ class ModelRunner:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
         import torch.distributed as dist
 
-        pg = getattr(self, "_weight_update_pg", None)
+        pg = self._weight_update_pg
         if pg is None:
             return False, "weight update group not initialized"
         try:
@@ -288,7 +344,7 @@ class ModelRunner:
         clean group. Idempotent: tearing down when no group is live is a success
         so a trainer that always calls destroy (e.g. slime) never errors.
         """
-        pg = getattr(self, "_weight_update_pg", None)
+        pg = self._weight_update_pg
         if pg is None:
             return True, "weight update group not initialized"
 

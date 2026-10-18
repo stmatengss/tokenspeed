@@ -37,6 +37,19 @@ logger = logging.getLogger(__name__)
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
+    weight_scale_dtype = torch.float32
+
+    # Excluded from online quantization: linear-attention (GDN/mamba)
+    # projections, plus wo_a, whose grouped projection plan requires serialized
+    # weights and scales during its one-time backend preprocessing.
+    ONLINE_IGNORED_LAYERS = [
+        "re:.*linear_attn.*",
+        "re:.*conv1d.*",
+        "re:.*in_proj.*",
+        "re:.*out_proj.*",
+        "re:.*wo_a.*",
+    ]
+
     def __init__(
         self,
         is_checkpoint_fp8_serialized: bool = False,
@@ -45,6 +58,8 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: list[int] = None,
         scale_fmt: str | None = None,
     ) -> None:
+        if not is_checkpoint_fp8_serialized:
+            ignored_layers = (ignored_layers or []) + self.ONLINE_IGNORED_LAYERS
         super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -52,11 +67,9 @@ class Fp8Config(QuantizationConfig):
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
+        if weight_block_size is None and not is_checkpoint_fp8_serialized:
+            weight_block_size = [128, 128]
         if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
-                )
             if len(weight_block_size) != 2:
                 raise ValueError(
                     f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
@@ -89,7 +102,9 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
         return cls(
@@ -102,3 +117,23 @@ class Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
+
+
+class Mxfp8Config(Fp8Config):
+    """Config class for MXFP8."""
+
+    weight_scale_dtype = torch.uint8
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "mxfp8"
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> Mxfp8Config:
+        config = dict(config)
+        if config.get("scale_fmt") is None:
+            config["scale_fmt"] = "ue8m0"
+        return super().from_config(config)
+
+    def moe_weight_dtype(self, prefix: str = "") -> str:
+        return "fp8"

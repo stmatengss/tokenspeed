@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 
 @triton.jit
@@ -33,6 +34,81 @@ def _rmsnorm_kernel(
     x *= tl.rsqrt(variance + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + row_offsets, x * weight, mask=mask)
+
+
+@triton.jit
+def reference_rmsnorm_row(x, weight, eps: tl.constexpr, N: tl.constexpr):
+    """RMSNorm one FP32 row in the eager reference's arithmetic order.
+
+    ``x`` and ``weight`` are FP32 vectors of ``N`` elements. The mean scales
+    the sum by the FP32 reciprocal of ``N`` exactly as ``torch.mean`` does,
+    the row is scaled before the weight multiplies it, and nothing is
+    rounded in between; the caller casts the result once. Only the
+    summation order can differ from the sequential reference.
+    """
+    scale = tl.rsqrt(tl.sum(x * x, 0) * (1.0 / N) + eps)
+    return weight * (x * scale)
+
+
+@triton.jit
+def _reference_rmsnorm_kernel(
+    X,
+    W,
+    OUT,
+    X0,
+    O0,
+    N: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, BLOCK)
+    mask = d < N
+    x = tl.load(X + row * X0 + d, mask, 0.0).to(tl.float32)
+    weight = tl.load(W + d, mask, 0.0).to(tl.float32)
+    tl.store(OUT + row * O0 + d, reference_rmsnorm_row(x, weight, EPS, N), mask)
+
+
+def reference_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor | None
+) -> torch.Tensor:
+    """RMSNorm ``x`` with the cast order of the eager FP32 reference.
+
+    Args:
+        x: Floating ``[..., N]`` rows with a unit last stride.
+        weight: ``[N]`` contiguous weight in any floating dtype.
+        eps: Variance epsilon added to the FP32 mean of squares.
+        out: Contiguous destination shaped like ``x`` in ``x``'s dtype, or
+            None to allocate one.
+
+    Returns:
+        ``out``: ``(weight.float() * (x.float() * rsqrt(mean(x.float()**2) +
+        eps))).to(x.dtype)`` row by row, rounded once at the store.
+    """
+    n = x.shape[-1]
+    if x.ndim < 1 or x.stride(-1) != 1:
+        raise ValueError("reference RMSNorm rows need a unit last stride")
+    if weight.shape != (n,) or not weight.is_contiguous():
+        raise ValueError(f"reference RMSNorm weight must be contiguous [{n}]")
+    if out is None:
+        out = torch.empty_like(x)
+    elif out.shape != x.shape or out.dtype != x.dtype or not out.is_contiguous():
+        raise ValueError("reference RMSNorm out must be contiguous and match x")
+    rows = x.reshape(-1, n) if x.ndim != 2 else x
+    if rows.numel():
+        _reference_rmsnorm_kernel[(rows.shape[0],)](
+            rows,
+            weight,
+            out.view(-1, n),
+            rows.stride(0),
+            n,
+            N=n,
+            EPS=eps,
+            BLOCK=triton.next_power_of_2(n),
+            num_warps=8 if n >= 4096 else 4,
+            enable_fp_fusion=False,
+        )
+    return out
 
 
 @triton.jit
@@ -129,6 +205,328 @@ def rmsnorm(
 
 
 @triton.jit
+def _grouped_gemma_rmsnorm_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    row_stride,
+    out_row_stride,
+    eps: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < GROUP_SIZE
+    group_offset = group * GROUP_SIZE
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    x = tl.load(
+        x_ptr + row * row_stride + group_offset + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    variance = tl.sum(x * x, axis=0) / GROUP_SIZE
+    weight = tl.load(weight_ptr + group_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    normalized = x * tl.rsqrt(variance + eps) * (1.0 + weight)
+    tl.store(
+        out_ptr + row * out_row_stride + group_offset + offsets,
+        normalized,
+        mask=mask,
+    )
+
+
+def grouped_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Grouped Gemma RMSNorm without the unused inverse-RMS output.
+
+    ``weight`` is the checkpoint offset, so the kernel multiplies by
+    ``1 + weight``. Variance is independent for each last-dimension group.
+    """
+    if x.ndim < 1:
+        raise ValueError("x must have at least one dimension")
+    width = int(x.shape[-1])
+    if group_size <= 0 or width % group_size:
+        raise ValueError(
+            f"group_size must divide the last dimension ({width}), got {group_size}"
+        )
+    if weight.shape != (width,):
+        raise ValueError(
+            f"weight must have shape {(width,)}, got {tuple(weight.shape)}"
+        )
+    if weight.dtype != x.dtype or weight.device != x.device:
+        raise ValueError("weight must match x dtype and device")
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    elif out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:
+        raise ValueError("out must match x shape, dtype, and device")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if x.numel() == 0:
+        return out
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    rows = x.numel() // width
+    groups = width // group_size
+    x_2d = x.view(rows, width)
+    out_2d = out.view(rows, width)
+    block = triton.next_power_of_2(group_size)
+    if block > 65536:
+        raise ValueError("group_size is too large for the Triton reduction")
+    enable_pdl = pdl_enabled()
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
+    _grouped_gemma_rmsnorm_kernel[(rows, groups)](
+        x_2d,
+        weight,
+        out_2d,
+        x_2d.stride(0),
+        out_2d.stride(0),
+        eps=eps,
+        GROUP_SIZE=group_size,
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
+    )
+    return out
+
+
+@triton.jit
+def _gated_residual_combine_norm_kernel(
+    residual_ptr,
+    block_ptr,
+    inject_ptr,
+    weight_ptr,
+    residual_out_ptr,
+    norm_out_ptr,
+    weight_group_stride,
+    eps: tl.constexpr,
+    WIDTH: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PRELOAD_RESIDUAL: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < GROUP_SIZE
+    positions = row * WIDTH + group * GROUP_SIZE + offsets
+
+    if ENABLE_PDL and not PRELOAD_RESIDUAL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    residual = tl.load(residual_ptr + positions, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(
+        weight_ptr + group * weight_group_stride + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    if ENABLE_PDL and PRELOAD_RESIDUAL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    block_output = tl.load(
+        block_ptr + row * GROUP_SIZE + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    logit = tl.load(inject_ptr + row * (WIDTH // GROUP_SIZE) + group).to(tl.float32)
+    combined = residual + block_output * 2.0 * tl.sigmoid(logit)
+    # Match a standalone combine store before the following norm reads it.
+    combined = combined.to(residual_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(residual_out_ptr + positions, combined, mask=mask)
+    combined = tl.where(mask, combined, 0.0)
+
+    variance = tl.sum(combined * combined, axis=0) / GROUP_SIZE
+    normalized = combined * tl.rsqrt(variance + eps) * (1.0 + weight)
+    tl.store(norm_out_ptr + positions, normalized, mask=mask)
+
+
+def gated_residual_combine_norm(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    inject_logits: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+    preload_residual: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine gated residual branches and apply grouped Gemma RMSNorm."""
+    if residual.ndim < 1:
+        raise ValueError("residual must have at least one dimension")
+    width = int(residual.shape[-1])
+    if group_size <= 0 or width % group_size:
+        raise ValueError(
+            f"group_size must divide the last dimension ({width}), got {group_size}"
+        )
+    groups = width // group_size
+    for name, value, shape in (
+        ("block_output", block_output, (*residual.shape[:-1], group_size)),
+        ("inject_logits", inject_logits, (*residual.shape[:-1], groups)),
+    ):
+        if (
+            value.shape != shape
+            or value.dtype != residual.dtype
+            or value.device != residual.device
+        ):
+            raise ValueError(
+                f"{name} must have shape {tuple(shape)} and match residual "
+                "dtype and device"
+            )
+    if weight.shape not in ((width,), (group_size,)):
+        raise ValueError(
+            f"weight must have shape {(width,)} or {(group_size,)}, "
+            f"got {tuple(weight.shape)}"
+        )
+    if weight.dtype != residual.dtype or weight.device != residual.device:
+        raise ValueError("weight must match residual dtype and device")
+
+    combined = torch.empty_like(residual, memory_format=torch.contiguous_format)
+    normalized = torch.empty_like(residual, memory_format=torch.contiguous_format)
+    if residual.numel() == 0:
+        return combined, normalized
+    if not residual.is_contiguous():
+        residual = residual.contiguous()
+        preload_residual = False
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+        preload_residual = False
+    block_output = block_output.contiguous()
+    inject_logits = inject_logits.contiguous()
+
+    block = triton.next_power_of_2(group_size)
+    if block > 65536:
+        raise ValueError("group_size is too large for the Triton reduction")
+    rows = residual.numel() // width
+    enable_pdl = pdl_enabled()
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
+    _gated_residual_combine_norm_kernel[(rows, groups)](
+        residual,
+        block_output,
+        inject_logits,
+        weight,
+        combined,
+        normalized,
+        group_size if weight.numel() == width else 0,
+        eps=eps,
+        WIDTH=width,
+        GROUP_SIZE=group_size,
+        BLOCK=block,
+        PRELOAD_RESIDUAL=preload_residual,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
+    )
+    return combined, normalized
+
+
+@triton.jit
+def _grouped_rmsnorm_kernel(
+    x_ptr,
+    out_ptr,
+    row_stride,
+    out_row_stride,
+    eps: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < GROUP_SIZE
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(
+        x_ptr + row * row_stride + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    variance = tl.sum(x * x, axis=0) / GROUP_SIZE
+    normalized = x * tl.rsqrt(variance + eps)
+    tl.store(
+        out_ptr + row * out_row_stride + offsets,
+        normalized,
+        mask=mask,
+    )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def grouped_rmsnorm(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float,
+    *,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply weight-free RMSNorm independently to last-dimension groups.
+
+    Args:
+        x: GPU input shaped ``[..., width]``.
+        group_size: Number of contiguous last-dimension values sharing one RMS
+            statistic. The last dimension must be divisible by this value.
+        eps: Epsilon added before reciprocal square root.
+        out: Optional contiguous output matching ``x``. ``out=x`` is supported
+            for graph-safe in-place normalization.
+
+    Returns:
+        Normalized tensor matching ``x`` shape and dtype.
+    """
+    if x.ndim < 1:
+        raise ValueError("x must have at least one dimension")
+    width = int(x.shape[-1])
+    if group_size <= 0 or width % group_size:
+        raise ValueError(
+            f"group_size must divide the last dimension ({width}), got {group_size}"
+        )
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    elif out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:
+        raise ValueError("out must match x shape, dtype, and device")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if x.numel() == 0:
+        return out
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    rows = x.numel() // group_size
+    x_2d = x.view(rows, group_size)
+    out_2d = out.view(rows, group_size)
+    block = triton.next_power_of_2(group_size)
+    if block > 65536:
+        raise ValueError("group_size is too large for the Triton reduction")
+    enable_pdl = pdl_enabled()
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
+    _grouped_rmsnorm_kernel[(rows,)](
+        x_2d,
+        out_2d,
+        x_2d.stride(0),
+        out_2d.stride(0),
+        eps=eps,
+        GROUP_SIZE=group_size,
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
+    )
+    return out
+
+
+@triton.jit
 def _fused_qk_rmsnorm_kernel(
     q_in_ptr,
     k_in_ptr,
@@ -145,6 +543,7 @@ def _fused_qk_rmsnorm_kernel(
     head_dim: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     # 2D grid: (token, head). Heads in [0, num_q_heads) handle q rows;
     # heads in [num_q_heads, num_q_heads + num_kv_heads) handle k rows.
@@ -175,11 +574,20 @@ def _fused_qk_rmsnorm_kernel(
         )
         w_addrs = q_weight_ptr + offsets
 
+    # Weights are parameters nothing in the decode graph writes; safe to load before the PDL wait.
+    w = tl.load(w_addrs, mask=mask, other=0.0).to(tl.float32)
+
+    if ENABLE_PDL:
+        # Wait for the producer's stores before the first dependent load.
+        tl.extra.cuda.gdc_wait()
+
     x = tl.load(in_addrs, mask=mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / head_dim
     x = x * tl.rsqrt(var + eps)
-    w = tl.load(w_addrs, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_addrs, x * w, mask=mask)
+    if ENABLE_PDL:
+        # All stores issued; let the dependent kernel begin its prologue.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def qk_rmsnorm(
@@ -188,6 +596,7 @@ def qk_rmsnorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     eps: float,
+    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-head RMSNorm of q and k in a single kernel launch.
 
@@ -212,12 +621,16 @@ def qk_rmsnorm(
 
     q_in_stride = q.stride(0) if q.dim() > 1 else q.shape[-1]
     k_in_stride = k.stride(0) if k.dim() > 1 else k.shape[-1]
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
 
     # Allocate fresh contiguous outputs so downstream RoPE/attention kernels
     # — which assume row-major layouts — work without further copies.
     q_out = torch.empty((n_tokens, q.shape[-1]), dtype=q.dtype, device=q.device)
     k_out = torch.empty((n_tokens, k.shape[-1]), dtype=k.dtype, device=k.device)
 
+    kwargs = {}
+    if current_platform().is_nvidia:
+        kwargs["launch_pdl"] = enable_pdl
     _fused_qk_rmsnorm_kernel[(n_tokens, num_q_heads + num_kv_heads)](
         q,
         k,
@@ -234,6 +647,8 @@ def qk_rmsnorm(
         head_dim,
         eps,
         BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **kwargs,
     )
     return q_out, k_out
 
@@ -503,9 +918,165 @@ def rmsnorm_fused_parallel(
     )
 
 
+@triton.jit
+def _fused_qk_rmsnorm_rope_kernel(
+    q_ptr,
+    k_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    q_stride_t,
+    k_stride_t,
+    q_out_stride_t,
+    k_out_stride_t,
+    cache_stride_p,
+    num_q_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    half_dim: tl.constexpr,
+    eps: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+):
+    """Fused per-head QK-RMSNorm + full RoPE kernel (no gate, rotary_dim == head_dim)."""
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    is_k = head >= num_q_heads
+    local_head = tl.where(is_k, head - num_q_heads, head)
+
+    if is_k:
+        in_base = k_ptr + token * k_stride_t + local_head * head_dim
+        w_ptr = k_weight_ptr
+        out_base = k_out_ptr + token * k_out_stride_t + local_head * head_dim
+    else:
+        in_base = q_ptr + token * q_stride_t + local_head * head_dim
+        w_ptr = q_weight_ptr
+        out_base = q_out_ptr + token * q_out_stride_t + local_head * head_dim
+
+    # --- RMSNorm over the full head_dim ---
+    # Load both halves for the variance computation.
+    offs = tl.arange(0, HALF_BLOCK)
+    mask = offs < half_dim
+    x1 = tl.load(in_base + offs, mask=mask, other=0.0).to(tl.float32)
+    x2 = tl.load(in_base + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
+    var = (tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / head_dim
+    inv_rms = tl.rsqrt(var + eps)
+
+    w1 = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    w2 = tl.load(w_ptr + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
+    x1_norm = (x1 * inv_rms * w1).to(INPUT_DTYPE).to(tl.float32)
+    x2_norm = (x2 * inv_rms * w2).to(INPUT_DTYPE).to(tl.float32)
+
+    # --- Full RoPE (rotary_dim == head_dim) ---
+    pos = tl.load(positions_ptr + token).to(tl.int64)
+    cache_offset = pos * cache_stride_p
+    cos = tl.load(cos_sin_cache_ptr + cache_offset + offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    sin = tl.load(
+        cos_sin_cache_ptr + cache_offset + half_dim + offs, mask=mask, other=0.0
+    ).to(tl.float32)
+
+    o1 = x1_norm * cos - x2_norm * sin
+    o2 = x2_norm * cos + x1_norm * sin
+    tl.store(out_base + offs, o1, mask=mask)
+    tl.store(out_base + half_dim + offs, o2, mask=mask)
+
+
+def fused_qk_rmsnorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused split + QK-RMSNorm + full RoPE for DFLASH attention layers.
+
+    Replaces 3 kernel launches (qk_rmsnorm + RoPE) with a single triton
+    kernel.  Assumes rotary_dim == head_dim (full rotation, no pass-through
+    tail).
+
+    Args:
+        q: (n_tokens, num_q_heads * head_dim) — possibly non-contiguous view
+        k: (n_tokens, num_kv_heads * head_dim) — possibly non-contiguous view
+        q_weight: (head_dim,) RMSNorm scale weight (standard: weight; Gemma: weight+1)
+        k_weight: (head_dim,) RMSNorm scale weight (standard: weight; Gemma: weight+1)
+        cos_sin_cache: (max_pos, head_dim) packed [cos|sin], float32
+        positions: (n_tokens,) int32 or int64
+        eps: RMSNorm epsilon
+        num_q_heads: number of Q heads (after TP split)
+        num_kv_heads: number of KV heads (after TP split)
+        head_dim: per-head dimension (must be even)
+
+    Returns:
+        (q_out, k_out) — both contiguous (n_tokens, heads * head_dim)
+    """
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {head_dim}")
+
+    n_tokens = q.shape[0]
+    if n_tokens == 0:
+        q_out = torch.empty((0, num_q_heads * head_dim), dtype=q.dtype, device=q.device)
+        k_out = torch.empty(
+            (0, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
+        )
+        return q_out, k_out
+
+    q_out = torch.empty(
+        (n_tokens, num_q_heads * head_dim), dtype=q.dtype, device=q.device
+    )
+    k_out = torch.empty(
+        (n_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
+    )
+
+    half_dim = head_dim // 2
+    half_block = triton.next_power_of_2(half_dim)
+    num_warps = max(1, half_block // 64)
+
+    q_stride = q.stride(0) if q.dim() > 1 else q.shape[-1]
+    k_stride = k.stride(0) if k.dim() > 1 else k.shape[-1]
+
+    grid = (n_tokens, num_q_heads + num_kv_heads)
+    _fused_qk_rmsnorm_rope_kernel[grid](
+        q,
+        k,
+        q_out,
+        k_out,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        q_stride,
+        k_stride,
+        q_out.stride(0),
+        k_out.stride(0),
+        cos_sin_cache.stride(0),
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        half_dim,
+        eps,
+        INPUT_DTYPE=tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16,
+        HALF_BLOCK=half_block,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return q_out, k_out
+
+
 __all__ = [
+    "grouped_gemma_rmsnorm",
     "rmsnorm",
     "qk_rmsnorm",
     "fused_qk_rmsnorm_rope_gate",
+    "fused_qk_rmsnorm_rope",
     "rmsnorm_fused_parallel",
 ]

@@ -28,10 +28,12 @@ Three sequential phases:
      position in ``input_ids`` that should be filled from an encoder token,
      along with the source range inside the owning item's encoded tensor.
 
-  2. ``_encode`` invokes the model-supplied encoder once per modality with
-     every miss in the batch in a single call, then writes each item's
-     output back onto the item itself (``item.encoded`` /
-     ``item.encoded_deepstack``).
+  2. ``_encode`` invokes the model-supplied encoder once per modality, then
+     writes each item's output back onto the item itself (``item.encoded`` /
+     ``item.encoded_deepstack``). In weight-TP mode every rank encodes the
+     full miss list together. In item-DP mode each rank encodes a deterministic
+     subset of whole items and collects the variable-length results without
+     padding them to the largest rank output.
 
   3. ``_assemble`` runs the text-token embedding lookup and slices the
      encoder-token ranges into the right positions using the plan's
@@ -55,23 +57,30 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
 
+from tokenspeed.runtime.distributed.mapping import VisionTowerMapping
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager,
+)
+from tokenspeed.runtime.multimodal.encoder_feature_transport import (
+    EncoderFeatureTransport,
+)
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
     MultimodalForwardContext,
     MultimodalInputs,
 )
-from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
+EncoderWarmupItemsFactory = Callable[[], list[MultimodalDataItem]]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
@@ -83,11 +92,56 @@ class EncoderSpec:
 
     Bundles the encoder callable with whether its output needs to be
     split into a main + deepstack pair via the model's
-    ``separate_deepstack_embeds`` hook.
+    ``separate_deepstack_embeds`` hook. ``make_warmup_items`` is optional so
+    each encoder family can describe its native startup input without the
+    startup path assuming a particular modality or feature layout.
     """
 
     fn: EncoderFn
     deepstack: bool = False
+    make_warmup_items: EncoderWarmupItemsFactory | None = None
+
+
+def warmup_multimodal_encoders(
+    model: Any,
+    *,
+    device: str | torch.device,
+) -> None:
+    """Run each registered encoder family's native synthetic input."""
+    if not getattr(model, "is_multimodal_active", False):
+        return
+
+    get_specs = getattr(model, "get_multimodal_encoder_specs", None)
+    if not callable(get_specs):
+        return
+
+    warmup_device = torch.device(device)
+    specs: dict[Modality, EncoderSpec] = get_specs()
+    for modality, spec in specs.items():
+        if spec.make_warmup_items is None:
+            continue
+        items = spec.make_warmup_items()
+        if not items:
+            continue
+
+        start = time.perf_counter()
+        try:
+            with torch.inference_mode():
+                output = spec.fn(items)
+                del output
+                if warmup_device.type == "cuda":
+                    torch.cuda.synchronize(warmup_device)
+        except Exception:
+            logger.exception(
+                f"Multimodal encoder warmup failed: modality={modality.name.lower()!s}",
+            )
+            raise
+        logger.info(
+            f"Multimodal encoder warmup complete: modality={modality.name.lower()!s} "
+            "feature_shapes="
+            f"{[tuple(item.feature.shape) if item.feature is not None else None for item in items]!s}"
+            f" elapsed={(time.perf_counter() - start) * 1000.0:.3f} ms",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +228,46 @@ def _item_token_count(item: MultimodalDataItem) -> int:
     return sum(end - start + 1 for start, end in item.offsets)
 
 
+@dataclass(frozen=True)
+class EncoderDPAssignment:
+    """Deterministic ownership and rank-major output sizes for encoder items."""
+
+    item_indices_by_rank: tuple[tuple[int, ...], ...]
+    token_counts_by_rank: tuple[int, ...]
+
+
+def _assign_encoder_items(
+    item_token_counts: Sequence[int], dp_size: int
+) -> EncoderDPAssignment:
+    """Assign whole items with deterministic longest-processing-time packing.
+
+    Encoder DP intentionally never splits one multimodal item. The encoded
+    token count is available before execution from the authored placeholder
+    offsets and is a stable proxy for encoder work across every rank.
+    """
+    rank_loads = [0] * dp_size
+    item_indices_by_rank: list[list[int]] = [[] for _ in range(dp_size)]
+
+    # Stable tie breaks are part of the collective protocol: all ranks must
+    # derive exactly the same owner without exchanging Python objects.
+    for item_index in sorted(
+        range(len(item_token_counts)),
+        key=lambda index: (-item_token_counts[index], index),
+    ):
+        owner = min(range(dp_size), key=lambda rank: (rank_loads[rank], rank))
+        item_indices_by_rank[owner].append(item_index)
+        rank_loads[owner] += item_token_counts[item_index]
+
+    # The encoder concatenates outputs in input order. Keep each rank's local
+    # subset in that order so rank-major gathered rows can be reconstructed.
+    for indices in item_indices_by_rank:
+        indices.sort()
+    return EncoderDPAssignment(
+        item_indices_by_rank=tuple(tuple(indices) for indices in item_indices_by_rank),
+        token_counts_by_rank=tuple(rank_loads),
+    )
+
+
 # ---------------------------------------------------------------------------
 # MultimodalEmbedder
 # ---------------------------------------------------------------------------
@@ -182,8 +276,21 @@ def _item_token_count(item: MultimodalDataItem) -> int:
 class MultimodalEmbedder:
     """Multimodal input embedding pipeline for one model executor."""
 
-    def __init__(self) -> None:
-        self._h2d_stream: torch.cuda.Stream | None = None
+    def __init__(
+        self,
+        encoder_mapping: VisionTowerMapping | None = None,
+    ) -> None:
+        self._encoder_dp_group = (
+            encoder_mapping.dp_group if encoder_mapping is not None else None
+        )
+        self._encoder_dp_rank = (
+            encoder_mapping.dp_rank if encoder_mapping is not None else 0
+        )
+        self._feature_transport = EncoderFeatureTransport(encoder_mapping)
+
+    @property
+    def has_encoder_dp(self) -> bool:
+        return self._encoder_dp_group is not None and len(self._encoder_dp_group) > 1
 
     # --- public entry point ------------------------------------------------
 
@@ -194,15 +301,15 @@ class MultimodalEmbedder:
         ctx: MultimodalForwardContext | None,
         encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
-        is_decode_or_idle: bool = False,
     ) -> tuple[torch.Tensor | None, dict[str, Any]]:
         """Compose LM input embeddings with encoder tokens scattered in.
 
-        Returns ``(None, {})`` when there is nothing multimodal to do this
-        forward (decode iteration, or no active multimodal inputs). The
-        caller falls back to the regular text-only path on that signal.
+        Returns ``(None, {})`` when there is no active multimodal overlap in
+        this forward. The caller falls back to the regular text-only path on
+        that signal. With multimodal timing enabled, CUDA encode time is
+        measured with events on the current stream.
         """
-        if is_decode_or_idle or ctx is None or not ctx.has_extend_inputs():
+        if ctx is None or not ctx.has_extend_inputs():
             return None, {}
 
         total_started = time.perf_counter() if LOG_MM_TIMING else None
@@ -216,13 +323,33 @@ class MultimodalEmbedder:
         if not plan:
             return None, {}
 
-        encode_started = time.perf_counter() if LOG_MM_TIMING else None
-        self._encode(plan, encoders, multimodal_model, input_ids.device)
-        encode_elapsed_ms = (
-            (time.perf_counter() - encode_started) * 1000
-            if encode_started is not None
-            else None
+        encode_started: float | None = None
+        encode_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        encode_elapsed_ms: float | None = None
+        if LOG_MM_TIMING:
+            if input_ids.device.type == "cuda":
+                encode_events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                encode_events[0].record(torch.cuda.current_stream(input_ids.device))
+            else:
+                encode_started = time.perf_counter()
+        self._encode(
+            plan,
+            encoders,
+            multimodal_model,
+            input_ids.device,
+            text_embedding.embedding_dim,
+            text_embedding.weight.dtype,
         )
+        if LOG_MM_TIMING:
+            if encode_events is not None:
+                encode_events[1].record(torch.cuda.current_stream(input_ids.device))
+                encode_events[1].synchronize()
+                encode_elapsed_ms = encode_events[0].elapsed_time(encode_events[1])
+            elif encode_started is not None:
+                encode_elapsed_ms = (time.perf_counter() - encode_started) * 1000
 
         alias_started = time.perf_counter() if LOG_MM_TIMING else None
         released_alias_features = self._share_encoded_aliases(plan)
@@ -256,22 +383,17 @@ class MultimodalEmbedder:
                 if items
             }
             logger.info(
-                "mm_timing multimodal_embedder_apply_ms total=%.3f plan=%.3f "
-                "encode=%.3f alias=%.3f assemble=%.3f feature_cleanup=%.3f "
-                "scatter_ranges=%d misses=%s input_rows=%d aliases=%d "
-                "released_alias_features=%d released_encoded_features=%d",
-                (time.perf_counter() - total_started) * 1000,
-                plan_elapsed_ms,
-                encode_elapsed_ms,
-                alias_elapsed_ms,
-                assemble_elapsed_ms,
-                cleanup_elapsed_ms,
-                len(plan.scatter_ranges),
-                misses,
-                int(input_ids.numel()),
-                sum(len(items) for items in plan.aliases_by_canonical.values()),
-                released_alias_features,
-                released_encoded_features,
+                "mm_timing multimodal_embedder_apply_ms total="
+                f"{(time.perf_counter() - total_started) * 1000:.3f} plan="
+                f"{plan_elapsed_ms:.3f} "
+                f"encode={encode_elapsed_ms:.3f} alias={alias_elapsed_ms:.3f} assemble="
+                f"{assemble_elapsed_ms:.3f} feature_cleanup={cleanup_elapsed_ms:.3f} "
+                f"scatter_ranges={len(plan.scatter_ranges):d} misses={misses!s} "
+                f"input_rows={int(input_ids.numel()):d} aliases="
+                f"{sum((len(items) for items in plan.aliases_by_canonical.values())):d}"
+                " "
+                f"released_alias_features={released_alias_features:d} "
+                f"released_encoded_features={released_encoded_features:d}",
             )
         return input_embeds, kwargs
 
@@ -361,6 +483,8 @@ class MultimodalEmbedder:
         encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
         device: torch.device,
+        embedding_width: int,
+        embedding_dtype: torch.dtype,
     ) -> None:
         for modality, items in plan.misses_by_modality.items():
             if not items:
@@ -371,47 +495,159 @@ class MultimodalEmbedder:
                     f"MultimodalEmbedder: no encoder registered for {modality}"
                 )
 
-            move_started = time.perf_counter() if LOG_MM_TIMING else None
-            self._move_features_to_device(items, device)
-            move_elapsed_ms = (
-                (time.perf_counter() - move_started) * 1000
-                if move_started is not None
-                else None
-            )
-            encoder_started = time.perf_counter() if LOG_MM_TIMING else None
-            output = spec.fn(items)
-            if LOG_MM_TIMING and device.type == "cuda":
-                torch.cuda.synchronize(device)
-            encoder_elapsed_ms = (
-                (time.perf_counter() - encoder_started) * 1000
-                if encoder_started is not None
-                else None
-            )
-            output = output.reshape(-1, output.shape[-1])
-
-            per_item_lens = [_item_token_count(it) for it in items]
-            per_item_embs = torch.split(output, per_item_lens, dim=0)
-
-            if spec.deepstack:
-                for item, emb in zip(items, per_item_embs):
-                    main, deep = multimodal_model.separate_deepstack_embeds(emb)
-                    item.encoded = main
-                    item.encoded_deepstack = deep
-            else:
-                for item, emb in zip(items, per_item_embs):
-                    item.encoded = emb
-            if LOG_MM_TIMING:
-                logger.info(
-                    "mm_timing encoder_ms modality=%s items=%d "
-                    "encoder_output_tokens=%d move_h2d=%.3f encode=%.3f "
-                    "per_item_tokens=%s",
-                    modality.name,
-                    len(items),
-                    int(output.shape[0]),
-                    move_elapsed_ms,
-                    encoder_elapsed_ms,
-                    per_item_lens,
+            if self.has_encoder_dp:
+                output_width = embedding_width
+                if spec.deepstack:
+                    output_width *= 1 + len(multimodal_model.deepstack_visual_indexes)
+                per_item_embs = self._encode_data_parallel(
+                    items,
+                    spec,
+                    device,
+                    output_width,
+                    embedding_dtype,
                 )
+            else:
+                output = self._run_encoder(items, spec, device)
+                per_item_lens = [_item_token_count(it) for it in items]
+                output = output.reshape(-1, output.shape[-1])
+                per_item_embs = list(torch.split(output, per_item_lens, dim=0))
+
+            self._store_encoder_outputs(items, per_item_embs, spec, multimodal_model)
+
+    def _run_encoder(
+        self,
+        items: list[MultimodalDataItem],
+        spec: EncoderSpec,
+        device: torch.device,
+    ) -> torch.Tensor:
+        self._feature_transport.move_to_device(items, device)
+        return spec.fn(items)
+
+    def _encode_data_parallel(
+        self,
+        items: list[MultimodalDataItem],
+        spec: EncoderSpec,
+        device: torch.device,
+        output_width: int,
+        output_dtype: torch.dtype,
+    ) -> list[torch.Tensor]:
+        assert self._encoder_dp_group is not None
+        per_item_lens = tuple(_item_token_count(item) for item in items)
+        assignment = _assign_encoder_items(per_item_lens, len(self._encoder_dp_group))
+        self._feature_transport.route_to_item_owners(
+            items, assignment.item_indices_by_rank
+        )
+        local_indices = assignment.item_indices_by_rank[self._encoder_dp_rank]
+        local_items = [items[index] for index in local_indices]
+        local_rows = assignment.token_counts_by_rank[self._encoder_dp_rank]
+
+        local_output = torch.empty((0, output_width), dtype=output_dtype, device=device)
+        if local_items:
+            local_output = self._run_encoder(local_items, spec, device)
+            local_output = local_output.reshape(local_rows, output_width).to(
+                device=device, dtype=output_dtype
+            )
+
+        gathered = self._gather_encoder_outputs(
+            local_output, assignment.token_counts_by_rank
+        )
+        per_item_embs: list[torch.Tensor | None] = [None] * len(items)
+        cursor = 0
+        for indices, rank_rows in zip(
+            assignment.item_indices_by_rank, assignment.token_counts_by_rank
+        ):
+            rank_output = gathered[cursor : cursor + rank_rows]
+            cursor += rank_rows
+            rank_cursor = 0
+            for item_index in indices:
+                item_rows = per_item_lens[item_index]
+                per_item_embs[item_index] = rank_output[
+                    rank_cursor : rank_cursor + item_rows
+                ]
+                rank_cursor += item_rows
+        return cast(list[torch.Tensor], per_item_embs)
+
+    def _gather_encoder_outputs(
+        self, local_output: torch.Tensor, token_counts_by_rank: Sequence[int]
+    ) -> torch.Tensor:
+        """Collect rank-major item-DP outputs directly into their final buffer.
+
+        A lone owner uses one exact-size broadcast. Equal non-empty outputs use
+        NCCL all-gather directly, while uneven outputs use C10d's coalesced
+        exact-size broadcasts through the uneven ``all_gather`` API. None of
+        the paths pads outputs to the largest rank-local row count.
+        """
+        assert self._encoder_dp_group is not None
+        total_rows = sum(token_counts_by_rank)
+        output_width = local_output.shape[-1]
+        gathered = torch.empty(
+            (total_rows, output_width),
+            dtype=local_output.dtype,
+            device=local_output.device,
+        )
+        process_group = process_group_manager.get_process_group(
+            "nccl", self._encoder_dp_group
+        )
+        nonempty_owner_ranks = [
+            rank for rank, rows in enumerate(token_counts_by_rank) if rows > 0
+        ]
+        if not nonempty_owner_ranks:
+            return gathered
+
+        if len(nonempty_owner_ranks) == 1:
+            owner_rank = nonempty_owner_ranks[0]
+            if owner_rank == self._encoder_dp_rank:
+                gathered.copy_(local_output)
+            # Avoid issuing one zero-count broadcast per idle rank through the
+            # uneven all-gather fallback. This is the common single-item case.
+            torch.distributed.broadcast(
+                gathered,
+                src=self._encoder_dp_group[owner_rank],
+                group=process_group,
+            )
+            return gathered
+
+        local_output = local_output.contiguous()
+        first_rank_rows = token_counts_by_rank[0]
+        if all(rows == first_rank_rows for rows in token_counts_by_rank):
+            # The flat API writes NCCL's equal-size all-gather directly into
+            # the final contiguous rank-major output buffer.
+            torch.distributed.all_gather_single(
+                gathered,
+                local_output,
+                group=process_group,
+            )
+            return gathered
+
+        rank_outputs: list[torch.Tensor] = []
+        cursor = 0
+        for rows in token_counts_by_rank:
+            rank_outputs.append(gathered.narrow(0, cursor, rows))
+            cursor += rows
+        # PyTorch 2.11 implements uneven NCCL all-gather as one C10d call
+        # containing coalesced exact-size broadcasts, including zero-row views.
+        torch.distributed.all_gather(
+            rank_outputs,
+            local_output,
+            group=process_group,
+        )
+        return gathered
+
+    @staticmethod
+    def _store_encoder_outputs(
+        items: list[MultimodalDataItem],
+        per_item_embs: list[torch.Tensor],
+        spec: EncoderSpec,
+        multimodal_model: nn.Module,
+    ) -> None:
+        if spec.deepstack:
+            for item, emb in zip(items, per_item_embs):
+                main, deep = multimodal_model.separate_deepstack_embeds(emb)
+                item.encoded = main
+                item.encoded_deepstack = deep
+        else:
+            for item, emb in zip(items, per_item_embs):
+                item.encoded = emb
 
     def _share_encoded_aliases(self, plan: EncodePlan) -> int:
         released = 0
@@ -477,57 +713,15 @@ class MultimodalEmbedder:
 
         return input_embeds, kwargs
 
-    # --- device helpers ----------------------------------------------------
-
-    def _h2d_stream_on(self, device: torch.device) -> torch.cuda.Stream:
-        if self._h2d_stream is None:
-            self._h2d_stream = torch.cuda.Stream(device=device)
-        return self._h2d_stream
-
-    def _move_features_to_device(
-        self, items: list[MultimodalDataItem], device: torch.device
-    ) -> None:
-        """Stage encoder features onto ``device`` on a dedicated H2D stream.
-
-        Inputs that originate from the SHM transport are pinned, so the
-        H2D copy can actually run async with respect to the LM kernels
-        already queued on the current stream. We synchronise the current
-        stream with the H2D stream before returning so the encode call
-        sees the moved tensors.
-        """
-        pending = [
-            it
-            for it in items
-            if isinstance(it.feature, (torch.Tensor, ShmTensorHandle))
-            and (isinstance(it.feature, ShmTensorHandle) or it.feature.device != device)
-        ]
-        if not pending:
-            return
-
-        for it in pending:
-            if isinstance(it.feature, ShmTensorHandle):
-                it.feature = it.feature.consume()
-
-        if device.type != "cuda":
-            for it in pending:
-                if isinstance(it.feature, torch.Tensor):
-                    it.feature = it.feature.to(device, non_blocking=True)
-            return
-
-        h2d = self._h2d_stream_on(device)
-        current = torch.cuda.current_stream(device)
-        with torch.cuda.stream(h2d):
-            for it in pending:
-                if isinstance(it.feature, torch.Tensor):
-                    it.feature = it.feature.to(device, non_blocking=True)
-        current.wait_stream(h2d)
+    # --- feature cleanup -------------------------------------------------
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:
-        if item.feature is None:
+        if item.feature is None and item.feature_shm is None:
             return False
-        if isinstance(item.feature, ShmTensorHandle):
-            item.feature.release()
+        if item.feature_shm is not None:
+            item.feature_shm.release()
+            item.feature_shm = None
         item.feature = None
         return True
 

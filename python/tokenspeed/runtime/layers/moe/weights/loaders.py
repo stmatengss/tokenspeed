@@ -24,6 +24,7 @@ from collections.abc import Callable
 from functools import partial
 
 import torch
+from tokenspeed_kernel.ops.gemm.fp8_utils import per_block_quant_fp8
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 
@@ -38,6 +39,47 @@ def preserve_e8m0_bytes_for_uint8_param(
     return src
 
 
+def copy_expert_shard(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    scale_dst: torch.Tensor | None = None,
+    block_shape: tuple[int, int] | None = None,
+) -> None:
+    """Write one loaded expert shard into its destination buffer.
+
+    Args:
+        dst: Destination view inside the expert weight buffer.
+        src: Loaded (already sharded) checkpoint values.
+        scale_dst: Destination view inside the block-scale buffer, or ``None``
+            when the checkpoint values need no quantization.
+        block_shape: ``(block_n, block_k)`` of one scale.
+    """
+    if scale_dst is None or dst.dtype == src.dtype:
+        src = preserve_e8m0_bytes_for_uint8_param(dst, src)
+        dst.copy_(src)
+        return
+
+    quantized, scales = per_block_quant_fp8(src.to(dst.device), block_shape)
+    dst.copy_(quantized)
+    scale_dst.copy_(scales)
+
+
+def _narrow_block_scale(
+    scale: torch.Tensor | None,
+    block_shape: tuple[int, int] | None,
+    shard_dim: int,
+    block_start: int,
+    length: int,
+) -> torch.Tensor | None:
+    """Narrow a per-expert block-scale view alongside its weight shard."""
+
+    if scale is None or block_shape is None or shard_dim not in (0, 1):
+        return None
+    block = block_shape[shard_dim]
+    num_blocks = (length + block - 1) // block
+    return scale.narrow(shard_dim, block_start, num_blocks)
+
+
 def load_w13(
     expert_data: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -49,6 +91,8 @@ def load_w13(
     do_transpose: bool,
     tp_size: int = 1,
     load_up_proj_weight_first: bool = False,
+    expert_scale: torch.Tensor | None = None,
+    block_shape: tuple[int, int] | None = None,
 ) -> None:
     if shard_id not in {"w1", "w3", "w13"}:
         raise ValueError(f"Unexpected w13 shard_id: {shard_id}")
@@ -70,22 +114,29 @@ def load_w13(
     if not use_presharded_weights:
         if not is_bias and do_transpose:
             loaded_weight = loaded_weight.transpose(-2, -1)
-        if tp_size > 1:
-            # Derive the unpadded shard size from the checkpoint tensor.
-            # expert_data may be Blackwell-padded; checkpoint is not.
-            load_shard = loaded_weight.shape[shard_dim] // tp_size
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, load_shard * tp_rank, load_shard
-            )
-        else:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+        load_start = min(shard_size * tp_rank, loaded_weight.shape[shard_dim])
+        load_size = min(shard_size, loaded_weight.shape[shard_dim] - load_start)
+        loaded_weight = loaded_weight.narrow(shard_dim, load_start, load_size)
+
+    if loaded_weight.shape[shard_dim] == 0:
+        return
 
     expert_data = expert_data.narrow(shard_dim, start, shard_size)
     dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
-    loaded_weight = preserve_e8m0_bytes_for_uint8_param(dst, loaded_weight)
-    dst.copy_(loaded_weight)
+    scale_dst = None
+    if not is_bias:
+        block_start = 0
+        if start and block_shape is not None and shard_dim in (0, 1):
+            block = block_shape[shard_dim]
+            block_start = round_up(shard_size, block) // block
+        scale_dst = _narrow_block_scale(
+            expert_scale,
+            block_shape,
+            shard_dim,
+            block_start,
+            loaded_weight.shape[shard_dim],
+        )
+    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape)
 
 
 def load_w2(
@@ -98,6 +149,8 @@ def load_w2(
     use_presharded_weights: bool,
     do_transpose: bool,
     tp_size: int = 1,
+    expert_scale: torch.Tensor | None = None,
+    block_shape: tuple[int, int] | None = None,
 ) -> None:
     if not isinstance(expert_data, torch.Tensor) or not isinstance(
         loaded_weight, torch.Tensor
@@ -117,17 +170,26 @@ def load_w2(
         if not is_bias and do_transpose:
             loaded_weight = loaded_weight.transpose(-2, -1)
         if is_bias:
-            load_shard = shard_size
-        elif tp_size > 1:
-            load_shard = loaded_weight.shape[shard_dim] // tp_size
+            loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
         else:
-            load_shard = shard_size
-        start = 0 if is_bias else load_shard * tp_rank
-        loaded_weight = loaded_weight.narrow(shard_dim, start, load_shard)
+            load_start = min(shard_size * tp_rank, loaded_weight.shape[shard_dim])
+            load_size = min(shard_size, loaded_weight.shape[shard_dim] - load_start)
+            loaded_weight = loaded_weight.narrow(shard_dim, load_start, load_size)
+
+    if loaded_weight.shape[shard_dim] == 0:
+        return
 
     dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
-    loaded_weight = preserve_e8m0_bytes_for_uint8_param(dst, loaded_weight)
-    dst.copy_(loaded_weight)
+    scale_dst = None
+    if not is_bias:
+        scale_dst = _narrow_block_scale(
+            expert_scale,
+            block_shape,
+            shard_dim,
+            0,
+            loaded_weight.shape[shard_dim],
+        )
+    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape)
 
 
 def get_shard_dim(param: torch.Tensor, shard_id: str, do_transpose: bool) -> int:
@@ -154,6 +216,9 @@ def load_model_weight(
 ) -> None:
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
+    block_scale = getattr(param, "block_scale_inv", None)
+    block_shape = getattr(param, "block_scale_shape", None)
+    expert_scale = None if block_scale is None else block_scale.data[local_expert_id]
     if shard_id == "w2":
         load_w2(
             expert_data,
@@ -165,6 +230,8 @@ def load_model_weight(
             use_presharded_weights,
             do_transpose,
             tp_size=tp_size,
+            expert_scale=expert_scale,
+            block_shape=block_shape,
         )
     elif shard_id in {"w1", "w3", "w13"}:
         load_w13(
@@ -177,6 +244,8 @@ def load_model_weight(
             use_presharded_weights,
             do_transpose,
             tp_size=tp_size,
+            expert_scale=expert_scale,
+            block_shape=block_shape,
         )
     else:
         raise ValueError(f"Unknown shard_id: {shard_id}")
@@ -223,16 +292,10 @@ def load_per_tensor_input_scale(
     param: torch.nn.Parameter,
     loaded_weight: torch.Tensor,
     shard_id: str,
-    local_expert_id: int,
+    local_expert_id: int | None,
 ) -> None:
-    value = loaded_weight.detach().to(torch.float32).reshape(())
-    if shard_id in {"w1", "w3"}:
-        prev = param.data[local_expert_id]
-        param.data[local_expert_id] = torch.maximum(prev, value)
-    elif shard_id == "w2":
-        param.data[local_expert_id] = value
-    else:
-        raise ValueError(f"Unknown shard_id for input scale: {shard_id}")
+    value = loaded_weight.detach().to(torch.float32).amax().to(param.device)
+    torch.maximum(param.data, value, out=param.data)
 
 
 def make_weight_loader(
@@ -265,18 +328,14 @@ def make_group_scale_loader(
     )
 
 
-def per_tensor_scale_loader() -> Callable:
-    return load_per_tensor_weight_scale
-
-
 def round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
 
 __all__ = [
     "load_per_tensor_input_scale",
+    "load_per_tensor_weight_scale",
     "make_group_scale_loader",
     "make_weight_loader",
-    "per_tensor_scale_loader",
     "round_up",
 ]

@@ -20,62 +20,55 @@
 
 #include "scheduler/operations/cache.h"
 
-#include <cstdint>
-#include <optional>
-#include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
-
-#include "fsm/cache_events.h"
-#include "fsm/forward_states.h"
-#include "resource/kv_prefix_cache/kv_prefix_cache.h"
-#include "resource/types.h"
-#include "scheduler/request.h"
-#include "scheduler/request_spec.h"
-#include "scheduler/scheduler.h"
 #include "scheduler/types.h"
 
 namespace tokenspeed {
 
-std::optional<fsm::SchedulePrefetchEvent> Scheduler::schedulePrefetch(Request* request, const MatchResult& match) {
-    const auto& storage = request->GetStorageInfo();
-    if (config_.disable_prefix_cache || !config_.enable_l3_storage || !request->Is<fsm::Submitted>() ||
-        storage.hit_pages <= config_.prefetch_threshold) {
-        return {};
+std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
+    std::vector<CacheGroupSpec> specs;
+    specs.reserve(config.cache_groups.size());
+    for (const CacheGroupConfig& group : config.cache_groups) {
+        if (group.IsSnapshotStateGroup()) {
+            specs.push_back(CacheGroupSpec{
+                .kind = AttnKind::kMambaState,
+                .sliding_window = 0,
+                .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
+                .block_granularity = group.block_granularity,
+                .shard_count = group.shard_count,
+            });
+            continue;
+        }
+        const bool is_swa = group.retention == CacheGroupConfig::Retention::SlidingWindow;
+        specs.push_back(CacheGroupSpec{
+            .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
+            .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
+            .replayable = group.replayable,
+            .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
+            .block_granularity = group.block_granularity,
+            .shard_count = group.shard_count,
+        });
     }
-
-    const std::int32_t num_pages_to_fetch = storage.hit_pages;
-    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(num_pages_to_fetch)) {
-        return {};
-    }
-
-    std::vector<std::string> hashes(storage.rolling_hashes.begin(),
-                                    storage.rolling_hashes.begin() + num_pages_to_fetch);
-
-    return fsm::SchedulePrefetchEvent{num_pages_to_fetch, std::move(hashes), &host_allocator_, match.host.last_node};
+    return specs;
 }
 
-PrefetchOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefetchEvent event) {
-    // Save rolling hashes BEFORE Apply (event will be moved into the state transition).
-    auto rolling_hashes = event.TakeRollingPageHashes();
+void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables) {
+    if (tables.empty()) {
+        return;  // request never got tables, or a failure path already released them
+    }
+    coordinator.Free(tables);
+}
 
-    // Apply event: Submitted → Prefetching (host pages allocated inside the state transition).
-    request->Apply(event);
-
-    // After Apply, request is in Prefetching state; read back the allocated host pages.
-    cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
-
-    CacheOpSpec spec;
-    spec.request_id = request->Id();
-    cache_op_tracker_[op_id] = std::move(spec);
-
-    PrefetchOperation prefetch_op;
-    prefetch_op.op_id = op_id;
-    prefetch_op.dst_pages = request->GetHostPageIds();
-    prefetch_op.request_id = request->Id();
-    prefetch_op.rolling_page_hashes = std::move(rolling_hashes);
-    return prefetch_op;
+std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const CacheCoordinator& coordinator,
+                                                                  const std::vector<BlockTable>& tables,
+                                                                  std::span<const std::string> group_ids) {
+    _assert(tables.size() == group_ids.size(), "BuildBlockTables: tables/group_ids size mismatch");
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
+            "BuildBlockTables: tables/coordinator size mismatch");
+    std::map<std::string, std::vector<std::int32_t>> out;
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        out.emplace(group_ids[i], coordinator.Allocator(static_cast<std::int32_t>(i)).BlockTablePageIds(tables[i]));
+    }
+    return out;
 }
 
 }  // namespace tokenspeed

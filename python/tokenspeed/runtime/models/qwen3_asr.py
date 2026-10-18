@@ -112,7 +112,9 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 prefix=add_prefix("audio_tower", prefix),
                 mm_attention_backend=mm_attention_backend,
             )
-            self.multimodal_embedder = MultimodalEmbedder()
+            self.multimodal_embedder = MultimodalEmbedder(
+                encoder_mapping=mapping.vision
+            )
             # ModelExecutor may replace this callable with an encoder graph.
             self.audio_encoder = self.get_audio_feature
         else:
@@ -124,6 +126,16 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         if self.audio_tower is None:
             raise RuntimeError("Qwen3-ASR audio tower is disabled")
         return self.audio_tower.encode(items)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.audio_tower is None or self.audio_encoder is None:
+            return {}
+        return {
+            Modality.AUDIO: EncoderSpec(
+                self.audio_encoder,
+                make_warmup_items=self.audio_tower.make_warmup_items,
+            )
+        }
 
     def pad_input_ids(
         self, input_ids: list[int], mm_inputs: MultimodalInputs
@@ -170,7 +182,6 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         ctx,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ):
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -188,14 +199,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 input_ids=input_ids,
                 text_embedding=self.get_input_embeddings(),
                 ctx=multimodal_context,
-                encoders={
-                    Modality.AUDIO: EncoderSpec(
-                        self.audio_encoder,
-                        deepstack=False,
-                    )
-                },
+                encoders=self.get_multimodal_encoder_specs(),
                 multimodal_model=self,
-                is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
             )
             kwargs.update(model_kwargs)
             if input_embeds is not None:
@@ -205,7 +210,6 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 

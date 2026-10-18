@@ -25,8 +25,10 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
+from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
-from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
@@ -290,15 +292,21 @@ class TopKConfig:
     routed_scaling_factor: float | None = None
     output_format: TopKOutputFormat | None = None
     zero_expert_num: int | None = 0
-    topk_indices_dtype: torch.dtype | None = torch.int32
+    topk_indices_dtype: torch.dtype = torch.int32
+    # Weights dtype for the biased-grouped path; bf16 lets consumers skip a cast.
+    topk_weights_dtype: torch.dtype = torch.float32
+    # Shared-expert sink (Inkling)
+    num_sink_experts: int = 0
+    sink_global_scale: torch.Tensor | None = None
 
 
 class StandardTopKOutput(NamedTuple):
-    """Standard top-k output format."""
+    """Precomputed routing; logits may be omitted once IDs and weights suffice."""
 
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    router_logits: torch.Tensor
+    router_logits: torch.Tensor | None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -313,6 +321,7 @@ class BypassedTopKOutput(NamedTuple):
     topk_config: TopKConfig
     num_token_non_padded: torch.Tensor | None = None
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -322,6 +331,11 @@ class BypassedTopKOutput(NamedTuple):
 @runtime_checkable
 class TopKOutput(Protocol):
     """Protocol for top-k outputs in different formats."""
+
+    @property
+    def output_scale(self) -> float | torch.Tensor:
+        """Post-kernel scale to apply to the routed output."""
+        ...
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -345,12 +359,19 @@ class TopK(torch.nn.Module):
         routed_scaling_factor: float | None = None,
         output_format: TopKOutputFormat | None = None,
         zero_expert_num: int | None = 0,
-        topk_indices_dtype=torch.int32,
+        topk_indices_dtype: torch.dtype = torch.int32,
+        topk_weights_dtype: torch.dtype = torch.float32,
+        num_sink_experts: int = 0,
+        sink_global_scale: torch.Tensor | None = None,
     ):
         super().__init__()
 
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
+        if num_sink_experts > 0:
+            assert correction_bias is not None
+            assert sink_global_scale is not None
+            assert routed_scaling_factor is not None
 
         self.topk_config = TopKConfig(
             top_k=top_k,
@@ -365,6 +386,9 @@ class TopK(torch.nn.Module):
             output_format=output_format,
             zero_expert_num=zero_expert_num,
             topk_indices_dtype=topk_indices_dtype,
+            topk_weights_dtype=topk_weights_dtype,
+            num_sink_experts=num_sink_experts,
+            sink_global_scale=sink_global_scale,
         )
 
     def forward(
@@ -372,13 +396,13 @@ class TopK(torch.nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
     ) -> TopKOutput:
-        if self.topk_config.output_format is not None:
-            output_format = self.topk_config.output_format
-        else:
-            output_format = TopKOutputFormat.STANDARD
+        output_format = (
+            output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
+        )
 
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
@@ -456,8 +480,20 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
+    # Shared-expert-sink routing (Inkling)
+    if topk_config.num_sink_experts > 0:
+        assert num_token_non_padded is None
+        assert expert_location_dispatch_info is None
+        topk_weights, topk_ids = inkling_topk(
+            router_logits,
+            correction_bias,
+            topk_config.sink_global_scale,
+            top_k=top_k,
+            n_routed=router_logits.shape[1] - topk_config.num_sink_experts,
+            route_scale=routed_scaling_factor,
+        )
     # DeepSeek V2/V3/R1 series models use grouped_top_k
-    if use_grouped_topk:
+    elif use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
@@ -482,18 +518,45 @@ def select_experts(
                     expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
                 )
                 mapped_in_kernel = True
-            topk_weights, topk_ids = minimax_biased_grouped_topk(
-                hidden_states,
-                router_logits,
-                correction_bias,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                logical_to_physical_map=logical_to_physical_map,
+            num_experts = router_logits.shape[1]
+            use_sigmoid_bias_topk = (
+                0 < top_k <= num_experts
+                and num_expert_group == 1
+                and topk_group == 1
+                and num_fused_shared_experts == 0
+                and routed_scaling_factor is not None
+                and num_token_non_padded is None
+                and (
+                    expert_location_dispatch_info is None
+                    or logical_to_physical_map is not None
+                )
             )
+            if use_sigmoid_bias_topk:
+                topk_weights, topk_ids = moe_topk(
+                    router_logits,
+                    top_k,
+                    score_function="sigmoid",
+                    selection_method="topk",
+                    renormalize=renormalize,
+                    routed_scaling_factor=float(routed_scaling_factor),
+                    correction_bias=correction_bias,
+                    logical_to_physical_map=logical_to_physical_map,
+                    topk_weights_dtype=topk_config.topk_weights_dtype,
+                )
+            else:
+                topk_weights, topk_ids = minimax_biased_grouped_topk(
+                    hidden_states,
+                    router_logits,
+                    correction_bias,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    logical_to_physical_map=logical_to_physical_map,
+                    weights_dtype=topk_config.topk_weights_dtype,
+                )
             if mapped_in_kernel:
                 expert_location_dispatch_info = None
 
@@ -540,14 +603,20 @@ def select_experts(
             renormalize,
         )
     elif custom_routing_function is None:
-        topk_weights, topk_ids = torch_native_fused_topk(
-            hidden_states,
+        assert (
+            hidden_states.shape[0] == router_logits.shape[0]
+        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {router_logits.shape=}"
+        topk_weights, topk_ids = moe_topk(
             router_logits,
-            topk=top_k,
+            top_k,
+            score_function="softmax",
+            selection_method="topk",
             renormalize=renormalize,
+            routed_scaling_factor=(
+                1.0 if routed_scaling_factor is None else routed_scaling_factor
+            ),
+            topk_indices_dtype=topk_config.topk_indices_dtype,
         )
-        if routed_scaling_factor is not None:
-            topk_weights *= routed_scaling_factor
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,
             expert_location_dispatch_info,

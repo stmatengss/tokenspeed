@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
+    fused_topk_topp_available as _FUSED_TOPK_TOPP_AVAILABLE,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_renorm,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
@@ -37,7 +42,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
 )
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -45,12 +49,10 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.backends.flashinfer import (
-    _FUSED_TOPK_TOPP_AVAILABLE,
     FlashInferSamplingBackend,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -169,16 +171,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 f"logit_bias contains out-of-vocab token id(s); "
                 f"vocab_size={vocab}, offending={[t for t in raw_ids if not 0 <= t < vocab]}"
             )
-            token_ids = torch.tensor(
-                raw_ids,
-                device=self._logit_bias.device,
-                dtype=torch.long,
+            token_ids = torch.tensor(raw_ids, dtype=torch.long, pin_memory=True).to(
+                self._logit_bias.device, non_blocking=True
             )
             bias_values = torch.tensor(
-                list(bias_map.values()),
-                device=self._logit_bias.device,
-                dtype=torch.bfloat16,
-            )
+                list(bias_map.values()), dtype=torch.bfloat16, pin_memory=True
+            ).to(self._logit_bias.device, non_blocking=True)
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:
@@ -194,7 +192,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     # ------------------------------------------------------------------
 
     @nvtx_range("sampling:penalties", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _apply_penalties_and_bias(
         self,
         logits: torch.Tensor,
@@ -245,7 +242,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         return logits
 
     @nvtx_range("sampling:accum_counts", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _accumulate_counts(
         self,
         pool_idx: torch.Tensor,
@@ -302,13 +298,10 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 min_p=self._min_p_pool,
                 seed=self._seed_pool,
                 offsets=sampling_info.valid_cache_lengths,
-                enable_pdl=pdl_enabled(),
             )
         )
 
-        probs = softmax(
-            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
-        )
+        probs = softmax(logits, temperature=temperatures.view(-1, 1))
 
         if _FUSED_TOPK_TOPP_AVAILABLE:
             # Fused replacement for the back-to-back top_k_renorm_prob +
@@ -319,7 +312,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 probs,
                 top_ks,
                 top_ps,
-                enable_pdl=pdl_enabled(),
             )
         else:
             probs = top_k_renorm_prob(probs, top_ks)
@@ -411,12 +403,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             top_p=self._top_p_pool,
             min_p=self._min_p_pool,
             n=num_tokens_per_req,
-            enable_pdl=pdl_enabled(),
         )
 
-        target_probs = softmax(
-            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
-        )
+        target_probs = softmax(logits, temperature=temperatures.view(-1, 1))
         if _FUSED_TOPK_TOPP_AVAILABLE:
             # Fused replacement for the back-to-back top_k_renorm_prob +
             # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
@@ -426,7 +415,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 target_probs,
                 top_ks,
                 top_ps,
-                enable_pdl=pdl_enabled(),
             )
         else:
             target_probs = top_k_renorm_prob(target_probs, top_ks)
@@ -434,12 +422,15 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 target_probs, top_ps, is_deterministic=True
             )
 
-        target_probs = min_p_renorm_prob(target_probs, min_ps, enable_pdl=pdl_enabled())
+        target_probs = min_p_renorm_prob(target_probs, min_ps)
 
         target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
 
-        coins = self._coins_buf[:bs, :num_tokens_per_req]
-        coins_for_final_sampling = self._final_coins_buf[:bs]
+        # Coins were filled in the step's full batch order; a MIXED round's
+        # verify sees only the decode suffix (see FlashInferSamplingBackend).
+        row0 = sampling_info.batch_row_offset
+        coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
+        coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
         chain_speculative_sampling_target_only(
             predicts=predict,
@@ -453,7 +444,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,
-            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1
@@ -462,7 +452,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         # For fused top-k + top-p, the results are bit-identical across ranks.
         # So we don't need to broadcast the results.
         if not _FUSED_TOPK_TOPP_AVAILABLE:
-            self.maybe_broadcast(predict, accept_index, accept_length)
+            self.broadcast_verify_outputs()
 
         # Accumulate accepted tokens into counts. accept_index is [bs, N]
         # with -1 in unused slots; clamp to a safe index and mask with a

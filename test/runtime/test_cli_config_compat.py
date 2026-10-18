@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import BLOCK_SPEC_RULES
 
 
 class TestCLIConfigCompat(unittest.TestCase):
@@ -34,6 +35,23 @@ class TestCLIConfigCompat(unittest.TestCase):
     def _from_cli_args_no_init(self, args: argparse.Namespace) -> ServerArgs:
         with patch.object(ServerArgs, "__post_init__"):
             return ServerArgs.from_cli_args(args)
+
+    def _resolve_speculative_config(
+        self,
+        model: str,
+        config: str,
+        *,
+        enable_prefix_caching: bool = True,
+    ) -> ServerArgs:
+        argv = ["--model", model]
+        if not enable_prefix_caching:
+            argv.append("--disable-prefix-caching")
+        argv.extend(["--speculative-config", config])
+        args = self._parse_args(argv)
+        server_args = self._from_cli_args_no_init(args)
+        server_args.resolve_basic_defaults()
+        server_args.resolve_speculative_decoding()
+        return server_args
 
     def _parallelism_snapshot(self, argv: list[str]) -> tuple[int, ...]:
         args = self._parse_args(argv)
@@ -151,6 +169,74 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa = self._from_cli_args_no_init(args)
         self.assertFalse(sa.enable_expert_parallel)
 
+    # ---- Dense TP default ----
+
+    def test_dense_tp_defaults_to_full_world_without_dp(self):
+        # No DP attention: attn_tp == world, so the dense default is unchanged
+        # (still the full world). This is the no-op case for the new default.
+        world, attn_tp = self._parallelism_snapshot(
+            ["--model", "test/model", "--attn-tp-size", "8"]
+        )[:2]
+        dense_tp = self._parallelism_snapshot(
+            ["--model", "test/model", "--attn-tp-size", "8"]
+        )[4]
+        self.assertEqual((world, attn_tp), (8, 8))
+        self.assertEqual(dense_tp, 8)
+
+    def test_dense_tp_defaults_to_attn_replica_width_with_dp(self):
+        # DP attention: the dense default follows the attention replica width
+        # (attn_tp), not the full world, keeping each dense all-reduce local.
+        snap = self._parallelism_snapshot(
+            [
+                "--model",
+                "test/model",
+                "--attn-tp-size",
+                "4",
+                "--data-parallel-size",
+                "2",
+            ]
+        )
+        world, attn_tp, _attn_cp, attn_dp, dense_tp = snap[:5]
+        self.assertEqual((world, attn_tp, attn_dp), (8, 4, 2))
+        self.assertEqual(dense_tp, 4)
+
+    def test_dense_tp_explicit_override_is_respected_under_dp(self):
+        # An explicit --dense-tp-size still wins over the replica-width default.
+        dense_tp = self._parallelism_snapshot(
+            [
+                "--model",
+                "test/model",
+                "--attn-tp-size",
+                "4",
+                "--data-parallel-size",
+                "2",
+                "--dense-tp-size",
+                "8",
+            ]
+        )[4]
+        self.assertEqual(dense_tp, 8)
+
+    def test_dense_tp_default_tracks_replica_width_under_cp(self):
+        # Under ENABLE_CP the attention TP size is reinterpreted as CP, so the
+        # replica width is attn_tp x attn_cp; the dense default must use the
+        # product, not the post-swap attn_tp (which is 1 here).
+        import tokenspeed.runtime.utils.server_args as server_args_mod
+
+        with patch.object(server_args_mod, "ENABLE_CP", True):
+            snap = self._parallelism_snapshot(
+                [
+                    "--model",
+                    "test/model",
+                    "--attn-tp-size",
+                    "4",
+                    "--data-parallel-size",
+                    "2",
+                ]
+            )
+        world, attn_tp, attn_cp, attn_dp, dense_tp = snap[:5]
+        self.assertEqual((world, attn_tp, attn_cp, attn_dp), (8, 1, 4, 2))
+        self.assertEqual(dense_tp, 4)
+
     # ---- vLLM config names ----
 
     def test_tokenizer_arg(self):
@@ -176,12 +262,6 @@ class TestCLIConfigCompat(unittest.TestCase):
     def test_max_num_seqs_arg(self):
         args = self._parse_args(["--model", "test/model", "--max-num-seqs", "256"])
         self.assertEqual(args.max_num_seqs, 256)
-
-    def test_dp_sampling_backend_arg_removed(self):
-        with self.assertRaises(SystemExit):
-            self._parse_args(
-                ["--model", "test/model", "--dp-sampling-backend", "onesided"]
-            )
 
     def test_max_prefill_tokens_arg(self):
         args = self._parse_args(
@@ -249,7 +329,7 @@ class TestCLIConfigCompat(unittest.TestCase):
 
     def test_block_size_arg(self):
         args = self._parse_args(["--model", "test/model", "--block-size", "128"])
-        self.assertEqual(args.block_size, 128)
+        self.assertEqual(args.prefix_granularity, 128)
 
     def test_moe_backend_arg(self):
         args = self._parse_args(["--model", "test/model", "--moe-backend", "triton"])
@@ -267,23 +347,6 @@ class TestCLIConfigCompat(unittest.TestCase):
                 ["--model", "test/model", "--sampling-backend", backend]
             )
             self.assertEqual(args.sampling_backend, backend)
-
-    def test_all2all_backend_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--all2all-backend", "deepep"]
-        )
-        self.assertEqual(args.all2all_backend, "deepep")
-
-    def test_recipe_all2all_backend_alias_arg(self):
-        args = self._parse_args(
-            [
-                "--model",
-                "test/model",
-                "--all2all-backend",
-                "flashinfer_nvlink_one_sided",
-            ]
-        )
-        self.assertEqual(args.all2all_backend, "flashinfer_nvlink_one_sided")
 
     def test_recipe_moe_backend_alias_arg(self):
         args = self._parse_args(
@@ -313,7 +376,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--enable-log-requests"])
         self.assertTrue(args.enable_log_requests)
 
-    def test_no_enable_log_requests_arg(self):
+    def test_disable_log_requests_arg(self):
         args = self._parse_args(["--model", "test/model", "--no-enable-log-requests"])
         self.assertFalse(args.enable_log_requests)
 
@@ -325,8 +388,8 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--enable-prefix-caching"])
         self.assertTrue(args.enable_prefix_caching)
 
-    def test_no_enable_prefix_caching_arg(self):
-        args = self._parse_args(["--model", "test/model", "--no-enable-prefix-caching"])
+    def test_disable_prefix_caching_arg(self):
+        args = self._parse_args(["--model", "test/model", "--disable-prefix-caching"])
         self.assertFalse(args.enable_prefix_caching)
 
     def test_kv_events_config_arg(self):
@@ -338,6 +401,39 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa = self._from_cli_args_no_init(args)
         self.assertEqual(sa.kv_events_config, config)
 
+    def test_l2_cache_options_across_engine_roles(self):
+        for role in ("null", "prefill", "decode", "encode"):
+            for io_backend in ("direct", "kernel"):
+                for disabled in (False, True):
+                    with self.subTest(
+                        role=role, io_backend=io_backend, disabled=disabled
+                    ):
+                        argv = [
+                            "--model",
+                            "test/model",
+                            "--disaggregation-mode",
+                            role,
+                            "--kvstore-io-backend",
+                            io_backend,
+                            "--kvstore-ratio",
+                            "3",
+                            "--kvstore-size",
+                            "8",
+                        ]
+                        if disabled:
+                            argv.append("--disable-kvstore")
+                        if role == "decode":
+                            argv.append("--disable-prefix-caching")
+                        sa = self._from_cli_args_no_init(self._parse_args(argv))
+                        sa.resolve_cache()
+
+                        self.assertEqual(
+                            sa.enable_kvstore, not disabled and role != "encode"
+                        )
+                        self.assertEqual(sa.kvstore_io_backend, io_backend)
+                        self.assertEqual(sa.kvstore_ratio, 3)
+                        self.assertEqual(sa.kvstore_size, 8)
+
     def test_speculative_draft_quantization_defaults_to_unquant(self):
         args = self._parse_args(["--model", "test/model", "--quantization", "nvfp4"])
         self.assertEqual(args.speculative_draft_model_quantization, "unquant")
@@ -345,6 +441,14 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa = self._from_cli_args_no_init(args)
         sa.resolve_speculative_decoding()
         self.assertIsNone(sa.speculative_draft_model_quantization)
+
+    def test_replay_ssm_defaults_to_disabled(self):
+        args = self._parse_args(["--model", "test/model"])
+        self.assertFalse(self._from_cli_args_no_init(args).enable_replay_ssm)
+
+    def test_replay_ssm_can_be_enabled(self):
+        args = self._parse_args(["--model", "test/model", "--enable-replay-ssm"])
+        self.assertTrue(self._from_cli_args_no_init(args).enable_replay_ssm)
 
     def test_mxfp4_quantization_arg(self):
         args = self._parse_args(["--model", "test/model", "--quantization", "mxfp4"])
@@ -478,6 +582,102 @@ class TestCLIConfigCompat(unittest.TestCase):
             config_server_args.speculative_num_draft_tokens,
             explicit_server_args.speculative_num_draft_tokens,
         )
+
+    def test_dspark_same_checkpoint_config_uses_block_plus_bonus_width(self):
+        server_args = self._resolve_speculative_config(
+            "same-checkpoint",
+            (
+                '{"method":"dspark","model":"same-checkpoint",'
+                '"num_speculative_tokens":5}'
+            ),
+            enable_prefix_caching=False,
+        )
+
+        self.assertTrue(server_args.draft_model_path_use_base)
+        self.assertEqual(server_args.speculative_draft_model_path, "same-checkpoint")
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_dspark_redirected_same_checkpoint_uses_block_plus_bonus_width(self):
+        with patch(
+            "tokenspeed.runtime.utils.server_args.maybe_model_redirect",
+            side_effect=lambda model: (
+                "resolved-checkpoint" if model == "model-alias" else model
+            ),
+        ):
+            server_args = self._resolve_speculative_config(
+                "model-alias",
+                (
+                    '{"method":"dspark","model":"model-alias",'
+                    '"num_speculative_tokens":5}'
+                ),
+                enable_prefix_caching=False,
+            )
+
+        self.assertTrue(server_args.draft_model_path_use_base)
+        self.assertEqual(
+            server_args.speculative_draft_model_path, "resolved-checkpoint"
+        )
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_dspark_external_checkpoint_config_uses_verify_width(self):
+        server_args = self._resolve_speculative_config(
+            "target-checkpoint",
+            (
+                '{"method":"dspark","model":"draft-checkpoint",'
+                '"num_speculative_tokens":6}'
+            ),
+        )
+
+        self.assertFalse(server_args.draft_model_path_use_base)
+        self.assertEqual(server_args.speculative_draft_model_path, "draft-checkpoint")
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_block_spec_widths_record_whether_they_were_asked_for(self):
+        """ModelConfig only overwrites the widths the user left defaulted."""
+        for extra, explicit in (
+            ([], False),
+            (["--speculative-num-steps", "7"], True),
+            (["--speculative-num-draft-tokens", "8"], True),
+            (
+                [
+                    "--speculative-config",
+                    '{"method":"dflash","num_speculative_tokens":8}',
+                ],
+                True,
+            ),
+        ):
+            with self.subTest(extra=extra):
+                args = self._parse_args(
+                    ["--model", "test/model", "--speculative-algorithm", "DFLASH"]
+                    + extra
+                )
+                sa = self._from_cli_args_no_init(args)
+                sa.resolve_basic_defaults()
+
+                self.assertEqual(sa._speculative_widths_explicit, explicit)
+
+    def test_block_spec_step_mismatch_states_the_family_rules(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--speculative-num-steps",
+                "7",
+                "--speculative-num-draft-tokens",
+                "7",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+
+        with self.assertRaises(ValueError) as ctx:
+            sa.resolve_speculative_decoding()
+        self.assertIn(BLOCK_SPEC_RULES, str(ctx.exception))
 
     def test_speculative_config_must_be_json_object(self):
         args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])

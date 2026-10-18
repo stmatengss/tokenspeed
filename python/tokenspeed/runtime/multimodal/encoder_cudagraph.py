@@ -20,7 +20,7 @@
 
 """Budget-bucketed CUDA graph capture/replay for multimodal encoders.
 
-The :class:`EncoderCudaGraphWrapper` is the generic manager: it owns budget
+The :class:`EncoderForwardStepRunner` is the generic manager: it owns budget
 selection, graph capture, replay buffer updates, greedy packing, and eager
 fallback. Model/modality-specific input layout is supplied by an adapter object.
 """
@@ -35,7 +35,6 @@ from typing import Any, Protocol
 
 import torch
 
-from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.utils import logger
 
 
@@ -54,7 +53,7 @@ class BudgetGraphMetadata:
 
 
 class EncoderCudaGraphBatch(Protocol):
-    """Minimal batch contract consumed by :class:`EncoderCudaGraphWrapper`."""
+    """Minimal batch contract consumed by :class:`EncoderForwardStepRunner`."""
 
     @property
     def input_tensors(self) -> dict[str, torch.Tensor]: ...
@@ -71,7 +70,7 @@ class EncoderCudaGraphBatch(Protocol):
 
 
 class EncoderCudaGraphAdapter(Protocol):
-    """Model/modality-specific contract used by :class:`EncoderCudaGraphWrapper`."""
+    """Model/modality-specific contract used by :class:`EncoderForwardStepRunner`."""
 
     @property
     def modality_name(self) -> str: ...
@@ -286,7 +285,7 @@ class VisionEncoderCudaGraphAdapter:
         return self.post_encode(encoder_outs, batch.grid)
 
 
-class EncoderCudaGraphWrapper:
+class EncoderForwardStepRunner:
     """Generic budget-based CUDA graph manager for encoder callables.
 
     The wrapper does not know about image/video/audio internals. It only expects
@@ -339,13 +338,11 @@ class EncoderCudaGraphWrapper:
             )
         )
         logger.info(
-            "EncoderCudaGraphWrapper initialized: modality=%s, budgets=%s, "
-            "max_batch_size=%d, max_metadata_sequences_per_batch=%s, encoder_tp=%d",
-            self.modality_name,
-            self.encoder_output_token_budgets,
-            self.max_batch_size,
-            metadata_sequence_budget_log_value,
-            self.capture_tp_size,
+            f"EncoderForwardStepRunner initialized: modality={self.modality_name!s}, "
+            f"budgets={self.encoder_output_token_budgets!s}, "
+            f"max_batch_size={self.max_batch_size:d}, max_metadata_sequences_per_batch="
+            f"{metadata_sequence_budget_log_value!s}, encoder_tp="
+            f"{self.capture_tp_size:d}",
         )
 
     def __call__(self, items: list[Any]) -> torch.Tensor:
@@ -382,9 +379,8 @@ class EncoderCudaGraphWrapper:
         for encoder_output_token_budget in self.encoder_output_token_budgets:
             self._capture_one(encoder_output_token_budget)
         logger.info(
-            "Encoder CUDA graph capture complete: modality=%s, %d budget graphs.",
-            self.modality_name,
-            len(self.budget_graphs),
+            f"Encoder CUDA graph capture complete: modality={self.modality_name!s}, "
+            f"{len(self.budget_graphs):d} budget graphs.",
         )
 
     def _capture_one(self, encoder_output_token_budget: int) -> None:
@@ -412,15 +408,14 @@ class EncoderCudaGraphWrapper:
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer = torch.empty_like(output)
 
-        # Encoder TP > 1: capture must record per-layer all-reduce under the
-        # custom-AR capture context.
-        if self.capture_tp_size > 1 and self.capture_tp_group is not None:
-            ar_ctx: Any = get_global_backend().custom_ar.capture(self.capture_tp_group)
-        else:
-            ar_ctx = contextlib.nullcontext()
+        # Encoder TP > 1 used to capture under the custom-AR context. That
+        # backend never armed (its resources were gated on a flag nothing
+        # set), so this was already a nullcontext; the remaining AR paths
+        # (trtllm one-shot, NCCL) need no capture-time context.
+        ar_ctx: Any = contextlib.nullcontext()
 
         # No pool= argument: each budget graph gets its own private pool. A
-        # shared pool collides custom-AR IPC registrations across budgets.
+        # shared pool collided IPC registrations across budgets.
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), ar_ctx, torch.cuda.graph(graph):
             output = self.adapter.forward(input_buffers, metadata)
@@ -437,13 +432,11 @@ class EncoderCudaGraphWrapper:
             output_buffer=output_buffer,
         )
         logger.debug(
-            "Captured encoder cudagraph: modality=%s, budget=%d, "
-            "max_batch_size=%d, metadata_sequence_budget=%d, buffers=%s",
-            self.modality_name,
-            encoder_output_token_budget,
-            self.max_batch_size,
-            metadata_sequence_budget,
-            {k: (v.dtype, tuple(v.shape)) for k, v in metadata_buffers.items()},
+            f"Captured encoder cudagraph: modality={self.modality_name!s}, budget="
+            f"{encoder_output_token_budget:d}, "
+            f"max_batch_size={self.max_batch_size:d}, metadata_sequence_budget="
+            f"{metadata_sequence_budget:d}, buffers="
+            f"{ {k: (v.dtype, tuple(v.shape)) for k, v in metadata_buffers.items()}!s}",
         )
 
     def _smallest_fitting_budget(

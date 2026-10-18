@@ -20,22 +20,18 @@
 
 """Factories for PD KV transfer helpers."""
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+    build_cache_transfer_schema,
+)
+from tokenspeed.runtime.pd.cache_protocol import (
+    build_arena_cache_transfer_contract,
+    build_cache_fields_by_producer_step,
+)
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.pd.utils import TransferBackend
-
-
-def _get_contiguous_buf_unit_lens(pool, item_lens):
-    getter = getattr(pool, "get_contiguous_buf_unit_lens", None)
-    if getter is None:
-        return [1] * len(item_lens)
-    unit_lens = list(getter())
-    if len(unit_lens) != len(item_lens):
-        raise ValueError(
-            f"contiguous buffer unit count mismatch: units={len(unit_lens)}, items={len(item_lens)}"
-        )
-    return unit_lens
 
 
 def get_kv_args(
@@ -43,85 +39,62 @@ def get_kv_args(
     gpu_id,
     ib_device,
     token_to_kv_pool,
-    draft_token_to_kv_pool,
-    mamba_pool=None,
+    *,
+    model_config,
+    draft_model_config,
+    cache_fields_by_stage: tuple[tuple[str, ...], ...],
+    producer_fields_by_step: tuple[tuple[str, ...], ...],
+    logical_plan: CacheMemoryPlan | None,
 ):
-    kv_data_ptrs, kv_data_lens, kv_item_lens = (
-        token_to_kv_pool.get_contiguous_buf_infos()
+    """Build PD arguments from the arena and explicit cache-placement metadata.
+
+    ``logical_plan`` is the complete layout before PP physical narrowing, or
+    None when the arena already holds the complete plan.
+    """
+    # One big model, one arena: a draft's continuation-layer planes live in
+    # the target pool's merged plan, so exactly one typed slab registration is
+    # published for both target and draft caches.
+    transfer_schema = build_cache_transfer_schema(
+        token_to_kv_pool.arena.plan,
+        model_config=model_config,
+        draft_model_config=draft_model_config,
     )
-    kv_unit_lens = _get_contiguous_buf_unit_lens(token_to_kv_pool, kv_item_lens)
-    # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
-    offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
-    target_layer_num = token_to_kv_pool.layer_num
-    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(target_layer_num)))
+    producer_schedule = build_cache_fields_by_producer_step(
+        token_to_kv_pool.arena.plan,
+        producer_fields_by_step=producer_fields_by_step,
+    )
+    layout, base_addr = build_arena_cache_transfer_contract(
+        token_to_kv_pool.arena,
+        transfer_schema=transfer_schema,
+    )
+    # Chunk-pipeline: the arena holds only this stage's layers (narrowed
+    # plan), which is what local source addressing must use. The WIRE
+    # contract, however, must be the full logical plan: every stage
+    # registers the same layout, and Decode validates + plans stage windows
+    # against the complete field set.
+    wire_layout = None
+    if logical_plan is not None:
+        from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
 
-    if draft_token_to_kv_pool is not None:
-        draft_layer_num = draft_token_to_kv_pool.layer_num
-        # We should also transfer draft model kv cache. The indices are
-        # always shared with a target model.
-        draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-            draft_token_to_kv_pool.get_contiguous_buf_infos()
+        wire_layout = CacheTransferContract(
+            plan=logical_plan,
+            group_specs=token_to_kv_pool.arena.cache_group_specs,
+            transfer_schema=build_cache_transfer_schema(
+                logical_plan,
+                model_config=model_config,
+                draft_model_config=draft_model_config,
+            ),
         )
-        draft_kv_unit_lens = _get_contiguous_buf_unit_lens(
-            draft_token_to_kv_pool, draft_kv_item_lens
-        )
-        draft_offsets = draft_token_to_kv_pool.get_layerwise_buf_info_offsets(
-            len(kv_data_ptrs)
-        )
-
-        kv_data_ptrs += draft_kv_data_ptrs
-        kv_data_lens += draft_kv_data_lens
-        kv_item_lens += draft_kv_item_lens
-        kv_unit_lens += draft_kv_unit_lens
-        offsets += draft_offsets
-        draft_base_layer_id = (
-            max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
-        )
-        kv_layer_ids += list(
-            range(draft_base_layer_id, draft_base_layer_id + draft_layer_num)
-        )
-    else:
-        draft_layer_num = 0
-
-    state_data_ptrs = []
-    state_data_lens = []
-    state_item_lens = []
-    state_unit_lens = []
-    state_type = "none"
-    state_layer_ids = []
-    if mamba_pool is not None:
-        state_data_ptrs, state_data_lens, state_item_lens = (
-            mamba_pool.get_contiguous_buf_infos()
-        )
-        state_unit_lens = _get_contiguous_buf_unit_lens(mamba_pool, state_item_lens)
-        state_layer_ids = mamba_pool.get_contiguous_buf_layer_ids()
-        state_type = "mamba"
-
-    kv_args = KVArgs(
+    return KVArgs(
         engine_rank=engine_rank,
-        kv_data_ptrs=kv_data_ptrs,
-        kv_data_lens=kv_data_lens,
-        kv_item_lens=kv_item_lens,
-        target_layer_num=target_layer_num,
-        draft_layer_num=draft_layer_num,
-        kv_layer_ids=kv_layer_ids,
-        kv_unit_lens=kv_unit_lens,
-        state_data_ptrs=state_data_ptrs,
-        state_data_lens=state_data_lens,
-        state_item_lens=state_item_lens,
-        state_unit_lens=state_unit_lens,
-        state_type=state_type,
-        state_layer_ids=state_layer_ids,
-        mamba_offsets=[],
-        offsets=offsets,
-        aux_data_ptrs=[],
-        aux_data_lens=[],
-        aux_item_lens=[],
+        kv_data_ptr=base_addr,
         ib_device=ib_device,
         gpu_id=gpu_id,
+        cache_layout=layout,
+        cache_producer_schedule=producer_schedule,
+        cache_fields_by_stage=cache_fields_by_stage,
+        wire_cache_layout=wire_layout,
     )
-
-    return kv_args
 
 
 def create_kv_transfer(
@@ -130,11 +103,12 @@ def create_kv_transfer(
     args: KVManagerArgs,
     kv_args: KVArgs,
     gloo_group,
-    page_size,
 ):
+    if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
+        raise NotImplementedError("CachePD supports only the Mooncake backend")
     if mode == "prefill":
-        return DisaggPrefillExecutor(backend, args, kv_args, gloo_group, page_size)
+        return DisaggPrefillExecutor(args, kv_args, gloo_group)
     elif mode == "decode":
-        return DisaggDecodeExecutor(backend, args, kv_args, gloo_group, page_size)
+        return DisaggDecodeExecutor(args, kv_args, gloo_group)
     else:
         raise NotImplementedError(f"Unsupported disaggregation mode: {mode}")

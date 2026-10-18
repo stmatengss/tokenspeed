@@ -29,9 +29,19 @@ from enum import IntEnum
 
 import torch
 import torch.distributed
-from tokenspeed_kernel.ops.communication.trtllm import (
+from tokenspeed_kernel.ops.communication import (
     allgather_dual_rmsnorm,
+)
+from tokenspeed_kernel.ops.communication import (
+    allreduce_lane_latent_norm as kernel_allreduce_lane_latent_norm,
+)
+from tokenspeed_kernel.ops.communication import (
     allreduce_residual_rmsnorm,
+)
+from tokenspeed_kernel.ops.communication import (
+    prepare_allreduce_fusion as kernel_prepare_allreduce_fusion,
+)
+from tokenspeed_kernel.ops.communication import (
     reducescatter_residual_rmsnorm,
 )
 
@@ -40,14 +50,19 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
+
+# Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
+# tensor collections past the one-shot window take an NCCL path.
+from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
+    MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _get_process_group(group: Group):
-    return pg_manager.get_process_group("nccl", group)
+    return pg_manager.get_device_process_group(group)
 
 
 # ---------------------------------------------------------------------------
@@ -110,15 +125,153 @@ class FusionParams:
 
 
 def all_reduce(
-    tensor: torch.Tensor,
+    tensor: torch.Tensor | tuple[torch.Tensor, ...],
     group: Group,
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> torch.Tensor:
-    """All-reduce the tensor across the given communication group."""
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """All-reduce one tensor or independent tensors across a group."""
     if backend is None:
         backend = get_global_backend()
     return backend.all_reduce(tensor, group, op=op)
+
+
+def prepare_all_reduce_lane(
+    group: Group,
+    hidden_dim: int,
+    backend: CommBackend | None = None,
+) -> bool:
+    """Prepare a backend-owned one-shot lane for a wider fused reduction."""
+
+    if backend is None:
+        backend = get_global_backend()
+    # No try/except: "backend can't do it" is already the base-class default
+    # (returns False), and this call is COLLECTIVE — swallowing a real error
+    # on one rank while peers succeed would leave the group disagreeing on
+    # the lane width. Let real failures propagate loudly.
+    return backend.prepare_all_reduce_lane(group, hidden_dim)
+
+
+def prepare_all_reduce_buffers(
+    group: Group,
+    *,
+    staged_max_numel: int,
+    producer_direct_max_numel: int,
+    attnres_max_numel: int,
+    attnres_max_rows: int,
+    enable_lamport: bool,
+    dtype: torch.dtype,
+    backend: CommBackend | None,
+) -> bool:
+    """Ask the active backend to allocate all-reduce buffers before cache planning.
+
+    Args:
+        group: Global ranks participating in the reductions.
+        staged_max_numel: Maximum ordinary all-reduce payload in elements.
+        producer_direct_max_numel: Maximum producer-direct payload in elements.
+        attnres_max_numel: Maximum fused AttnRes payload in elements.
+        attnres_max_rows: Maximum fused AttnRes payload in rows.
+        enable_lamport: Allow Lamport for eligible producer-direct payloads.
+        dtype: Element type shared by the prepared paths.
+        backend: Backend to prepare, or ``None`` to use the global backend.
+
+    Returns:
+        Whether the active backend prepared the requested buffers.
+    """
+
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_all_reduce_buffers(
+        group,
+        staged_max_numel=staged_max_numel,
+        producer_direct_max_numel=producer_direct_max_numel,
+        attnres_max_numel=attnres_max_numel,
+        attnres_max_rows=attnres_max_rows,
+        enable_lamport=enable_lamport,
+        dtype=dtype,
+    )
+
+
+def prepare_all_reduce_fusion(
+    group: Group,
+    hidden_dim: int,
+    max_token_num: int,
+) -> bool:
+    """Prepare fused all-reduce kernels before graph capture."""
+
+    try:
+        process_group = _get_process_group(group)
+        return kernel_prepare_allreduce_fusion(
+            rank=process_group.rank(),
+            group=process_group,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+        )
+    except Exception:
+        return False
+
+
+def all_reduce_latent_norm(
+    lane: torch.Tensor,
+    norm_weight: torch.Tensor,
+    latent_width: int,
+    group: Group,
+    *,
+    eps: float,
+    max_token_num: int,
+) -> torch.Tensor:
+    """All-reduce a routed/shared lane and RMS-normalize its routed prefix."""
+
+    process_group = _get_process_group(group)
+    return kernel_allreduce_lane_latent_norm(
+        lane,
+        norm_weight,
+        latent_width,
+        rank=process_group.rank(),
+        group=process_group,
+        eps=eps,
+        max_token_num=max_token_num,
+        trigger_completion_at_end=True,
+    )
+
+
+def can_acquire_all_reduce_outputs(
+    shapes: tuple[tuple[int, ...], ...],
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> bool:
+    """Whether ``acquire_all_reduce_outputs`` returns producer-direct memory.
+
+    ``acquire_all_reduce_outputs`` always returns writable buffers, falling
+    back to ordinary allocations the collective has to stage. Ask here when the
+    buffers are only worth taking if the reduction consumes them in place.
+
+    This is COLLECTIVE in the same sense the acquire is: every rank of
+    ``group`` must call it with identical arguments, or the group will disagree
+    on which collective the tail runs.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.can_acquire_all_reduce_outputs(shapes, like, group, op=op)
+
+
+def acquire_all_reduce_outputs(
+    shapes: tuple[tuple[int, ...], ...],
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> tuple[torch.Tensor, ...]:
+    """Acquire writable producer outputs for a later all-reduce.
+
+    This function does not launch a collective. Fill the returned outputs,
+    then pass them to ``all_reduce``.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.acquire_all_reduce_outputs(shapes, like, group, op=op)
 
 
 def all_gather(
@@ -133,7 +286,7 @@ def all_gather(
     return backend.all_gather(tensor, group, dim)
 
 
-def all_gather_into_tensor(
+def all_gather_single(
     output: torch.Tensor,
     input: torch.Tensor,
     group: Group,
@@ -142,7 +295,7 @@ def all_gather_into_tensor(
     """All-gather input into a pre-allocated output buffer."""
     if backend is None:
         backend = get_global_backend()
-    backend.all_gather_into_tensor(output, input, group)
+    backend.all_gather_single(output, input, group)
 
 
 def reduce_scatter(
@@ -201,7 +354,6 @@ def fused_all_reduce(
             has_partial_norm_out=fusion_params.has_partial_norm_out,
             trigger_completion_at_end=fusion_params.trigger_completion_at_end,
             max_sm_to_use=fusion_params.max_sm_to_use,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -234,8 +386,8 @@ def fused_reduce_scatter(
             add_in=fusion_params.add_in,
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
+            # Shape-derived growth; post-capture grows are refused -- arm before capture.
             max_token_num=fusion_params.max_token_num or tensor.shape[0],
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -268,11 +420,11 @@ def fused_all_gather(
             rank=rank,
             group=_get_process_group(group),
             total_num_tokens=fusion_params.total_num_tokens,
+            # Shape-derived growth; post-capture grows are refused -- arm before capture.
             max_token_num=fusion_params.max_token_num
             or max(tensor.shape[0], fusion_params.total_num_tokens),
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -317,3 +469,54 @@ def token_reduce_scatter(
     if backend is None:
         backend = get_global_backend()
     return backend.token_reduce_scatter(tensor, group, scattered_num_tokens)
+
+
+def pp_send(
+    tensor: torch.Tensor,
+    dst_group_index: int,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> None:
+    """Send a tensor to another pipeline stage (P2P over the PP group).
+
+    Args:
+        tensor: Contiguous device tensor to send.
+        dst_group_index: Destination position within ``group`` (the PP rank of
+            the receiving stage), not a global rank.
+        group: The PP group (one rank per stage, same intra-stage position).
+        backend: Communication backend; defaults to the global backend.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    backend.send(tensor.contiguous(), dst_group_index, group)
+
+
+def pp_recv(
+    size: torch.Size | tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    src_group_index: int,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Receive a tensor from another pipeline stage (P2P over the PP group).
+
+    The shape/dtype are supplied by the caller: every PP rank runs the same
+    deterministic scheduler, so the receiver derives the payload geometry from
+    its own forward op without a metadata exchange.
+
+    Args:
+        size: Shape of the incoming tensor.
+        dtype: Element type of the incoming tensor.
+        device: Device to allocate the receive buffer on.
+        src_group_index: Source position within ``group`` (the PP rank of the
+            sending stage), not a global rank.
+        group: The PP group (one rank per stage, same intra-stage position).
+        backend: Communication backend; defaults to the global backend.
+
+    Returns:
+        The received tensor.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.recv(torch.Size(size), dtype, device, src_group_index, group)

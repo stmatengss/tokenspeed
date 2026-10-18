@@ -41,14 +41,19 @@ if is_in_amd_ci():
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
-if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
-else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+
+def _gpu_port_offset() -> int:
+    gpu_ids = [
+        int(g)
+        for g in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+        if g.strip().isdigit()
+    ]
+    if not gpu_ids:
+        return 0
+    return min(gpu_ids) * 2 + (1 if len(gpu_ids) > 1 else 0)  # 0-15 on 8-GPU hosts
+
+
+DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 16000 + _gpu_port_offset() * 1040
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
@@ -321,6 +326,7 @@ def run_evalscope(
     eval_batch_size: int = 16,
     generation_config: Optional[dict] = None,
     dataset_args: Optional[dict] = None,
+    dataset_hub: str = "huggingface",
 ) -> dict:
     work_dir = tempfile.mkdtemp(prefix=f"evalscope-{dataset}-", dir="/tmp")
     api_url = base_url.rstrip("/")
@@ -337,6 +343,8 @@ def run_evalscope(
         "EMPTY_TOKEN",
         "--datasets",
         dataset,
+        "--dataset-hub",
+        dataset_hub,
         "--eval-batch-size",
         str(eval_batch_size),
         "--work-dir",
@@ -349,12 +357,17 @@ def run_evalscope(
     if dataset_args:
         cmd.extend(["--dataset-args", json.dumps(dataset_args)])
 
+    eval_env = os.environ.copy()
+    eval_env["HF_HOME"] = os.path.join(
+        os.environ.get("RUNNER_TEMP") or "/tmp", "hf-eval-cache"
+    )
     result = subprocess.run(
         cmd,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=eval_env,
     )
     print(result.stdout)
     score = _load_evalscope_score(work_dir, result.stdout)

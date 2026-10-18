@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -30,14 +31,21 @@ except ImportError as exc:  # pragma: no cover
 
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
+SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
+WORKFLOW_STAGE_TYPES = {
+    "unit-test": {"ut", "server_smoke"},
+    "kernel-benchmark": {"perf"},
+    "model-test": {"eval", "perf"},
+}
+SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
+SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # Lower sort key = dispatched earlier. GitHub Actions starts matrix jobs in
 # include-list order, so `high` entries reach runner pools first when several
-# jobs contend for the same label (typical case: heavy 4gpu evals beating a
-# 1gpu unit-test for the same b300 box).
+# jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
 SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 EXCLUDED_RUNNER_LABELS_ENV = "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"
@@ -51,21 +59,50 @@ STALE_PROCESS_PATTERNS = [
     r"smg_grpc_servicer\.tokenspeed",
     r"run_ci_suite",
 ]
+JIT_CACHE_ENV_SUBDIRS = {
+    "TRITON_CACHE_DIR": "triton",
+    "CUTE_DSL_CACHE_DIR": "cute_dsl",
+    "TORCHINDUCTOR_CACHE_DIR": "torchinductor",
+    "TORCH_EXTENSIONS_DIR": "torch_extensions",
+}
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
-    (("b200", "gb200"), "sm100"),
-    (("b300", "gb300"), "sm103"),
+    (("b200", "gb200", "slurm-gb200"), "sm100"),
+    (("b300", "gb300", "slurm-b300", "slurm-gb300"), "sm103"),
 )
 
-AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
-NVIDIA_ARM_RUNNER_PREFIXES = ("gb200",)
-GB200_RUNNER_PREFIXES = ("gb200",)
+AMD_RUNNER_PREFIXES = (
+    "amd-mi35x-",
+    "amd-mi355-",
+    "amd-mi350-",
+    "amd-mi450-",
+    "amd-mi45x-",
+)
+# A pool whose label names cpu instead of a GPU count holds no accelerator.
+CPU_ONLY_RUNNER_MARKER = "-cpu-"
+NVIDIA_ARM_RUNNER_PREFIXES = (
+    "gb200",
+    "gb300",
+    "slurm-b300",
+    "slurm-gb200",
+    "slurm-gb300",
+)
+GB200_RUNNER_PREFIXES = ("gb200", "slurm-gb200")
+ISOLATED_JIT_CACHE_RUNNER_PREFIXES = (
+    *GB200_RUNNER_PREFIXES,
+    "slurm-b300",
+    "slurm-gb300",
+)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
 
 def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
+
+
+def is_cpu_only_runner(runner: str) -> bool:
+    return CPU_ONLY_RUNNER_MARKER in runner
 
 
 def is_nvidia_arm_runner(runner: str) -> bool:
@@ -88,6 +125,10 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
 
 def is_gb200_runner(runner: str) -> bool:
     return runner.startswith(GB200_RUNNER_PREFIXES)
+
+
+def uses_isolated_jit_cache(runner: str) -> bool:
+    return runner.startswith(ISOLATED_JIT_CACHE_RUNNER_PREFIXES)
 
 
 def should_run_nvidia_gpu_cleanup(runner: str) -> bool:
@@ -115,6 +156,15 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         raise ValueError(f"{path}: unsupported api_version {data['api_version']!r}")
     if data["type"] not in SUPPORTED_TYPES:
         raise ValueError(f"{path}: unsupported type {data['type']!r}")
+    workflow_stage = data.get("workflow_stage")
+    if workflow_stage is not None:
+        if workflow_stage not in WORKFLOW_STAGE_TYPES:
+            raise ValueError(f"{path}: unsupported workflow_stage {workflow_stage!r}")
+        if data["type"] not in WORKFLOW_STAGE_TYPES[workflow_stage]:
+            raise ValueError(
+                f"{path}: type {data['type']!r} is incompatible with "
+                f"workflow_stage {workflow_stage!r}"
+            )
     triggers = data["triggers"]
     if not isinstance(triggers, list) or not triggers:
         raise ValueError(f"{path}: triggers must be a non-empty list")
@@ -206,6 +256,56 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
+    if "retries" in data:
+        retries = data["retries"]
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ValueError(f"{path}: retries must be a non-negative integer")
+        if retries > 0 and data["type"] not in {"eval", "perf"}:
+            raise ValueError(
+                f"{path}: retries is only supported for eval and perf tasks"
+            )
+    if "slurm" in data:
+        slurm = data["slurm"]
+        if not isinstance(slurm, dict):
+            raise ValueError(f"{path}: slurm must be a mapping")
+        unknown = sorted(set(slurm) - {"nodes", "gpus_per_node"})
+        if unknown:
+            raise ValueError(f"{path}: unsupported slurm keys: {unknown}")
+        missing_slurm = sorted({"nodes", "gpus_per_node"} - set(slurm))
+        if missing_slurm:
+            raise ValueError(f"{path}: missing slurm keys: {missing_slurm}")
+        for key in ("nodes", "gpus_per_node"):
+            value = slurm[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{path}: slurm.{key} must be a positive integer")
+        if slurm["nodes"] > 1:
+            if data["type"] not in {"eval", "perf"}:
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks must have type 'eval' or 'perf'"
+                )
+            if len(data["triggers"]) != 1 or data["triggers"][0] not in {
+                "nightly",
+                "per-commit",
+                "slurm",
+            }:
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks must use exactly one of the "
+                    "'nightly', 'per-commit', or 'slurm' triggers"
+                )
+            if not all(label.startswith("slurm-") for label in labels):
+                raise ValueError(
+                    f"{path}: multi-node Slurm runner labels must start with 'slurm-'"
+                )
+            server = data.get("server", {})
+            if not isinstance(server, dict) or not server.get("command"):
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks require server.command"
+                )
+            ready = server.get("ready", {})
+            if not isinstance(ready, dict) or not ready.get("url"):
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks require server.ready.url"
+                )
 
 
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
@@ -285,13 +385,30 @@ def build_matrix(
     repo_root: Path,
     trigger: str | None,
     runner_group: str = "all",
+    workflow_stage: str | None = None,
+    multi_node: str = "exclude",
 ) -> Dict[str, Any]:
+    if multi_node not in SUPPORTED_MULTI_NODE_FILTERS:
+        raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
             continue
+        is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
+        if multi_node == "only" and not is_multi_node:
+            continue
+        if multi_node == "exclude" and is_multi_node:
+            continue
+        task_workflow_stage = task.get("workflow_stage")
+        if workflow_stage:
+            if task_workflow_stage is None:
+                raise ValueError(
+                    f"{path}: workflow_stage is required when filtering by stage"
+                )
+            if workflow_stage != task_workflow_stage:
+                continue
         priority = task.get("priority")
         optional = task.get("optional")
         for label in task["runner"]["labels"]:
@@ -305,16 +422,17 @@ def build_matrix(
                 continue
             if not runner_matches_group(runner, runner_group):
                 continue
-            include.append(
-                {
-                    "name": task["name"],
-                    "type": task["type"],
-                    "config": task["_source_path"],
-                    "runner": runner,
-                    "priority": effective,
-                    "optional": is_optional,
-                }
-            )
+            entry = {
+                "name": task["name"],
+                "type": task["type"],
+                "config": task["_source_path"],
+                "runner": runner,
+                "priority": effective,
+                "optional": is_optional,
+            }
+            if task_workflow_stage is not None:
+                entry["workflow_stage"] = task_workflow_stage
+            include.append(entry)
     # Stable sort: tasks at the same priority keep their file-path / label
     # order, so tasks that omit `priority` see no change from the previous
     # behaviour.
@@ -386,6 +504,59 @@ def get_runner_specific_env(task: Dict[str, Any], runner: str) -> Dict[str, str]
     return {}
 
 
+def validate_gb300_runner_alias(declared_runner: str, effective_runner: str) -> str:
+    """Validate a B200/GB200-to-GB300 alias with an unchanged topology."""
+    declared_slurm = declared_runner.startswith("slurm-")
+    effective_slurm = effective_runner.startswith("slurm-")
+    declared_base = declared_runner.removeprefix("slurm-")
+    effective_base = effective_runner.removeprefix("slurm-")
+
+    if declared_runner == effective_runner and effective_base.startswith("gb300-"):
+        return effective_runner
+    if declared_slurm != effective_slurm:
+        raise ValueError("runner alias must preserve the slurm- prefix")
+
+    declared_family = next(
+        (
+            family
+            for family in ("b200", "gb200")
+            if declared_base.startswith(f"{family}-")
+        ),
+        None,
+    )
+    if declared_family is None or not effective_base.startswith("gb300-"):
+        raise ValueError(
+            "runner alias must map [slurm-]b200-* or [slurm-]gb200-* "
+            "to [slurm-]gb300-*"
+        )
+
+    declared_suffix = declared_base.removeprefix(f"{declared_family}-")
+    effective_suffix = effective_base.removeprefix("gb300-")
+    gpu_pattern = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
+    declared_gpus = gpu_pattern.findall(declared_suffix)
+    effective_gpus = gpu_pattern.findall(effective_suffix)
+    if len(declared_gpus) != 1 or declared_gpus != effective_gpus:
+        raise ValueError("runner alias GPU counts must match")
+    if declared_suffix != effective_suffix:
+        raise ValueError("runner alias suffixes must match")
+    return effective_runner
+
+
+def apply_slurm_runner_override(
+    declared_runner: str,
+    runner_override: str | None,
+    setup_mode: str,
+) -> str:
+    if runner_override is None:
+        return declared_runner
+    if setup_mode != "slurm":
+        raise ValueError("--runner-override requires --setup-mode=slurm")
+    try:
+        return validate_gb300_runner_alias(declared_runner, runner_override)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("runner alias", "runner override")) from exc
+
+
 def create_ci_venv_name(runner_name: str | None = None) -> str:
     if runner_name:
         # Fixed path per runner so flashinfer JIT cache (which embeds the
@@ -395,6 +566,50 @@ def create_ci_venv_name(runner_name: str | None = None) -> str:
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
     run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "0")
     return f"/tmp/ci-env-{run_id}-{run_attempt}-{os.getpid()}"
+
+
+def create_ci_jit_cache_root(runner_name: str | None = None) -> str:
+    if runner_name:
+        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", runner_name)
+        return f"/tmp/ci-jit-cache-{safe_name}"
+    return "/tmp/ci-jit-cache-local"
+
+
+def get_jit_cache_env(env: Dict[str, str]) -> Dict[str, str]:
+    runner_name = (
+        env.get("RUNNER_NAME") or env.get("CI_RUNNER_NAME") or env.get("HOSTNAME")
+    )
+    root = create_ci_jit_cache_root(runner_name)
+    return {
+        variable: os.path.join(root, subdir)
+        for variable, subdir in JIT_CACHE_ENV_SUBDIRS.items()
+        if not env.get(variable)
+    }
+
+
+def remove_stale_torch_extension_builds(env: Dict[str, str], dry_run: bool) -> None:
+    cache_root = env.get("TORCH_EXTENSIONS_DIR")
+    if not cache_root:
+        return
+
+    # Setup runs before new work on this runner, so any existing lock is stale.
+    for lock_path in sorted(Path(cache_root).glob("*/lock")):
+        extension_dir = lock_path.parent
+        if dry_run:
+            print(
+                f"[dry-run] remove stale torch extension build: {extension_dir}",
+                flush=True,
+            )
+            continue
+        print(
+            f"removing stale torch extension build: {extension_dir}",
+            flush=True,
+        )
+        shutil.rmtree(extension_dir, ignore_errors=True)
+        if lock_path.exists():
+            raise RuntimeError(
+                f"failed to remove stale torch extension build: {extension_dir}"
+            )
 
 
 def _pkill(
@@ -431,6 +646,14 @@ def get_ready_port(ready: Dict[str, Any]) -> int | None:
     return parsed.port
 
 
+def configure_slurm_server_command(command: str, timeout: int) -> str:
+    """Keep the TokenSpeed engine deadline aligned with Slurm readiness."""
+    tokens = shlex.split(command)
+    if tokens[:2] != ["ts", "serve"] or "--engine-startup-timeout" in tokens:
+        return command
+    return f"{command} --engine-startup-timeout {timeout}"
+
+
 def kill_port_listeners(
     port: int,
     env: Dict[str, str],
@@ -465,15 +688,57 @@ def kill_ready_port_listener(
     kill_port_listeners(port, env, cwd, dry_run)
 
 
+def ensure_ready_port_available(ready: Dict[str, Any], dry_run: bool) -> None:
+    """Fail without mutating the host when a task's readiness port is occupied."""
+    port = get_ready_port(ready)
+    if port is None:
+        return
+    host = urlparse(str(ready["url"])).hostname or "127.0.0.1"
+    if dry_run:
+        print(f"[dry-run] check readiness port is available: {host}:{port}", flush=True)
+        return
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            pass
+    except OSError:
+        return
+    raise RuntimeError(
+        f"readiness port {host}:{port} is already in use; "
+        "Slurm mode will not terminate another job's listener"
+    )
+
+
 def setup_runner(
     runner: str,
     env: Dict[str, str],
     cwd: Path,
     dry_run: bool,
     reuse_state: bool = False,
-) -> Dict[str, str]:
+    setup_mode: str = "ci",
+) -> tuple[Dict[str, str], Optional[ProcessGroupManager]]:
     local_env = dict(env)
     pgm: Optional[ProcessGroupManager] = None
+
+    if setup_mode == "slurm":
+        job_id = local_env.get("SLURM_JOB_ID")
+        if not job_id:
+            raise RuntimeError(
+                "SLURM_JOB_ID is required when --setup-mode=slurm is used"
+            )
+        runner_id = f"slurm-{job_id}"
+        step_id = local_env.get("SLURM_STEP_ID")
+        proc_id = local_env.get("SLURM_PROCID")
+        if step_id:
+            runner_id += f"-step-{step_id}"
+        if proc_id:
+            runner_id += f"-proc-{proc_id}"
+        pgm = ProcessGroupManager(runner_id=runner_id)
+        local_env["CI_RUNNER_ID"] = pgm.runner_id
+        print(f"[slurm] runner_id={pgm.runner_id}", flush=True)
+        return local_env, pgm
+    if setup_mode != "ci":
+        raise ValueError(f"unsupported setup mode: {setup_mode!r}")
 
     if is_gb200_runner(runner):
         pgm = make_manager()
@@ -482,6 +747,7 @@ def setup_runner(
 
         # Kill stale processes from previous run
         pgm.cleanup_stale(dry_run=dry_run)
+        remove_stale_torch_extension_builds(local_env, dry_run)
         shell_run(
             "bash test/ci_system/cleanup_nvidia_gpu_state.sh",
             env=local_env,
@@ -534,9 +800,41 @@ def setup_runner(
             dry_run=dry_run,
             check=False,
         )
-    shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
+    if runner.startswith("b200v2-"):
+        # b200v2 nodes do not have a usable IPv6 default route. Persist the
+        # setting for every apt invocation in this runner, including the
+        # later install_deps.sh step.
+        shell_run(
+            "echo 'Acquire::ForceIPv4 \"true\";' | "
+            "sudo tee /etc/apt/apt.conf.d/99tokenspeed-force-ipv4 >/dev/null",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+        )
+        # The b200v2 network path intermittently replaces Ubuntu HTTP
+        # InRelease responses with a short non-clearsigned payload, which
+        # apt reports as NOSPLIT. HTTPS bypasses that HTTP interception.
+        shell_run(
+            "find /etc/apt -maxdepth 2 -type f "
+            "\\( -path /etc/apt/sources.list -o -name '*.sources' \\) "
+            "-exec sudo sed -i "
+            "'s|http://archive.ubuntu.com/ubuntu|"
+            "https://archive.ubuntu.com/ubuntu|g; "
+            "s|http://security.ubuntu.com/ubuntu|"
+            "https://security.ubuntu.com/ubuntu|g' "
+            "{} +",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+        )
+    # Runner images normally provide ninja. Avoid refreshing every apt index on
+    # each ephemeral runner when the required executable is already available;
+    # slow package mirrors otherwise hold GPUs idle before task installation.
     shell_run(
-        "sudo apt-get install -y ninja-build",
+        "if ! command -v ninja >/dev/null 2>&1; then "
+        "sudo apt-get -o Acquire::Retries=5 update -q && "
+        "sudo apt-get install -y ninja-build; "
+        "fi",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,
@@ -552,19 +850,20 @@ def setup_runner(
         )
 
     if is_amd_runner(runner):
-        # Best-effort: kill any GPU-holding processes left over by a
-        # previous pod scheduled on the same node. Cluster admins flagged
-        # a known race where the device plugin releases a GPU back to the
-        # pool before the previous pod's processes have actually
-        # relinquished VRAM, so we can land in a pod with ~0 GiB free
-        # VRAM. Cleanup script never fails the task.
-        shell_run(
-            "bash test/ci_system/cleanup_amd_gpu_state.sh",
-            env=local_env,
-            cwd=cwd,
-            dry_run=dry_run,
-            check=False,
-        )
+        if not is_cpu_only_runner(runner):
+            # Best-effort: kill any GPU-holding processes left over by a
+            # previous pod scheduled on the same node. Cluster admins flagged
+            # a known race where the device plugin releases a GPU back to the
+            # pool before the previous pod's processes have actually
+            # relinquished VRAM, so we can land in a pod with ~0 GiB free
+            # VRAM. Cleanup script never fails the task.
+            shell_run(
+                "bash test/ci_system/cleanup_amd_gpu_state.sh",
+                env=local_env,
+                cwd=cwd,
+                dry_run=dry_run,
+                check=False,
+            )
         return local_env, pgm
     if dry_run:
         return local_env, pgm
@@ -760,6 +1059,10 @@ def summarize_command_output(command: str, output: str) -> Dict[str, Any]:
     if evalscope_perf_table:
         result["evalscope_perf_table"] = evalscope_perf_table
 
+    inspect_score = extract_inspect_score(output)
+    if inspect_score is not None:
+        result["inspect_score"] = inspect_score
+
     perf_summary_rows = extract_perf_summary_rows(output)
     if perf_summary_rows:
         result["perf_summary_rows"] = perf_summary_rows
@@ -772,6 +1075,27 @@ _ACCEPT_RATE_RE = re.compile(r"\baccept_rate:\s*([0-9]+(?:\.[0-9]+)?)")
 
 def extract_accept_rates(output: str) -> List[float]:
     return [float(value) for value in _ACCEPT_RATE_RE.findall(output)]
+
+
+def parse_evalscope_score_cell(cell: str) -> float | None:
+    """Read one Score cell as a fraction of 1, or None when it is not a score.
+
+    evalscope reports the score as a bare fraction ("0.9667") up to 1.10 and
+    as a percentage ("96.67%") from 1.11. Both mean the same thing, and the
+    thresholds in the task configs are fractions, so normalize percentages
+    back to fractions here rather than teaching every caller two formats.
+    """
+    text = cell.strip()
+    if not text:
+        return None
+    percent = text.endswith("%")
+    if percent:
+        text = text[:-1].strip()
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value / 100.0 if percent else value
 
 
 def extract_evalscope_score(report_table: str) -> float | None:
@@ -794,11 +1118,22 @@ def extract_evalscope_score(report_table: str) -> float | None:
             continue
         if score_index is None or len(cells) <= score_index:
             continue
-        try:
-            score = float(cells[score_index])
-        except ValueError:
-            continue
+        parsed = parse_evalscope_score_cell(cells[score_index])
+        if parsed is not None:
+            score = parsed
 
+    return score
+
+
+def extract_inspect_score(output: str) -> float | None:
+    score: float | None = None
+    for line in output.splitlines():
+        match = re.fullmatch(
+            r"\s*accuracy\s+([0-9]+(?:\.[0-9]+)?)\s*",
+            clean_log_line(line),
+        )
+        if match:
+            score = float(match.group(1))
     return score
 
 
@@ -886,16 +1221,17 @@ def check_eval_score_threshold(
         )
         return None
 
-    scores = [
-        float(result["evalscope_score"])
-        for result in command_results
-        if "evalscope_score" in result
-    ]
+    scores = []
+    for result in command_results:
+        if result.get("stage") != "eval":
+            continue
+        for key in ("evalscope_score", "inspect_score"):
+            if key in result:
+                scores.append(float(result[key]))
+                break
     if not scores:
-        print("[eval-score] no evalscope score found in command output", flush=True)
-        raise ValueError(
-            "eval.score_threshold is configured but no evalscope score was found"
-        )
+        print("[eval-score] no eval score found in command output", flush=True)
+        raise ValueError("eval.score_threshold is configured but no score was found")
 
     score = scores[-1]
     min_score, max_score = parse_eval_score_threshold(threshold)
@@ -1192,6 +1528,8 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
                 lines.append(f"  failed files: `{', '.join(item['failed_files'])}`")
             if "evalscope_score" in item:
                 lines.append(f"  evalscope score: `{item['evalscope_score']:g}`")
+            if "inspect_score" in item:
+                lines.append(f"  inspect score: `{item['inspect_score']:g}`")
             if item.get("evalscope_report_table"):
                 lines.extend(
                     [
@@ -1226,8 +1564,14 @@ def write_detailed_step_summary(result: Dict[str, Any]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
-    with open(summary_path, "a") as handle:
-        handle.write("\n".join(build_step_summary_lines(result)))
+    try:
+        with open(summary_path, "a") as handle:
+            handle.write("\n".join(build_step_summary_lines(result)))
+    except OSError as exc:
+        print(
+            f"warning: could not write GitHub step summary: {exc}",
+            file=sys.stderr,
+        )
 
 
 def write_result(path: str | None, payload: Dict[str, Any]) -> None:
@@ -1238,7 +1582,26 @@ def write_result(path: str | None, payload: Dict[str, Any]) -> None:
     result_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
+def server_exit_error(
+    process: subprocess.Popen[str], log_path: Path | None
+) -> str | None:
+    returncode = process.poll()
+    if returncode is None:
+        return None
+    detail = ""
+    if log_path is not None and log_path.exists():
+        lines = log_path.read_text(errors="replace").splitlines()
+        if lines:
+            detail = "\nLast server log lines:\n" + "\n".join(lines[-20:])
+    return f"server exited before readiness with exit code {returncode}{detail}"
+
+
+def poll_readiness(
+    ready: Dict[str, Any],
+    dry_run: bool,
+    process: subprocess.Popen[str] | None = None,
+    log_path: Path | None = None,
+) -> None:
     url = str(ready["url"])
     timeout_seconds = int(ready.get("timeout", 600))
     interval_seconds = int(ready.get("interval", 10))
@@ -1250,13 +1613,24 @@ def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if process is not None:
+            error = server_exit_error(process, log_path)
+            if error is not None:
+                raise RuntimeError(error)
         try:
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
                     return
-        except URLError:
+        except (URLError, ConnectionError, TimeoutError):
+            # Restarting servers can reset or stall an accepted HTTP connection.
             pass
-        time.sleep(interval_seconds)
+        sleep_deadline = min(deadline, time.time() + interval_seconds)
+        while time.time() < sleep_deadline:
+            if process is not None:
+                error = server_exit_error(process, log_path)
+                if error is not None:
+                    raise RuntimeError(error)
+            time.sleep(min(0.5, sleep_deadline - time.time()))
 
     raise RuntimeError(f"server readiness probe timed out: {url}")
 
@@ -1276,7 +1650,10 @@ def wrap_command_with_log(
     command: str, log_path: Path, *, login_shell: bool = True
 ) -> str:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    wrapped = f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+    wrapped = (
+        "set -o pipefail; "
+        f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+    )
     flag = "-lc" if login_shell else "-c"
     return f"bash {flag} {shlex.quote(wrapped)}"
 
@@ -1378,6 +1755,7 @@ def execute_task(
     *,
     config: str,
     runner: str,
+    runner_override: str | None = None,
     work_dir: str,
     dry_run: bool,
     print_plan: bool,
@@ -1386,13 +1764,32 @@ def execute_task(
     skip_stages: set[str] | None = None,
     keep_runner_state: bool = False,
     reuse_runner_state: bool = False,
+    setup_mode: str = "ci",
+    serve_only: bool = False,
+    external_server: bool = False,
 ) -> int:
+    if setup_mode not in SUPPORTED_SETUP_MODES:
+        raise ValueError(f"unsupported setup mode: {setup_mode!r}")
+    if setup_mode == "slurm" and (keep_runner_state or reuse_runner_state):
+        raise ValueError(
+            "--keep-runner-state and --reuse-runner-state are not supported "
+            "with --setup-mode=slurm"
+        )
+    if serve_only and external_server:
+        raise ValueError("--serve-only and --external-server cannot be combined")
+    if (serve_only or external_server) and setup_mode != "slurm":
+        raise ValueError(
+            "--serve-only and --external-server require --setup-mode=slurm"
+        )
+
     repo_root = Path(work_dir).resolve()
     task = normalize_task(repo_root / config, repo_root)
     if runner not in resolve_runner_labels(task["runner"]["labels"]):
         raise ValueError(
             f"{config}: runner {runner!r} is not declared in runner.labels"
         )
+    declared_runner = runner
+    runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -1400,10 +1797,31 @@ def execute_task(
     env["CI_TASK_TYPE"] = str(task["type"])
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
-    env.update(get_runner_specific_env(task, runner))
+    env.update(get_runner_specific_env(task, declared_runner))
 
+    jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
+    env.update(jit_cache_env)
+    if not dry_run:
+        for cache_dir in jit_cache_env.values():
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    task_stages = get_stage_commands(task)
+    if serve_only or external_server:
+        if task["type"] not in {"eval", "perf"} or not any(
+            name == "server" for name, _ in task_stages
+        ):
+            raise ValueError(
+                "--serve-only and --external-server require an eval/perf task "
+                "with a server stage"
+            )
+    if serve_only:
+        task_stages = [
+            (name, payload)
+            for name, payload in task_stages
+            if name in {"install", "server"}
+        ]
     stages = filter_stage_commands(
-        get_stage_commands(task),
+        task_stages,
         only_stages=only_stages,
         skip_stages=skip_stages or set(),
     )
@@ -1416,6 +1834,12 @@ def execute_task(
                     "type": task["type"],
                     "config": config,
                     "runner": runner,
+                    "setup_mode": setup_mode,
+                    "server_mode": (
+                        "serve-only"
+                        if serve_only
+                        else "external" if external_server else "managed"
+                    ),
                     "stages": [name for name, _ in stages],
                     "targets": targets,
                 },
@@ -1426,7 +1850,12 @@ def execute_task(
             return 0
 
     runner_env, pgm = setup_runner(
-        runner, env, repo_root, dry_run, reuse_state=reuse_runner_state
+        runner,
+        env,
+        repo_root,
+        dry_run,
+        reuse_state=reuse_runner_state,
+        setup_mode=setup_mode,
     )
     enable_perf_diagnostics = should_run_perf_diagnostics(task, runner)
     stages_run: List[str] = []
@@ -1438,13 +1867,50 @@ def execute_task(
     server_log_path: Path | None = None
     error: str | None = None
     error_reported = False
+    max_attempts = 1 + int(task.get("retries") or 0)
 
-    try:
-        if enable_perf_diagnostics:
-            run_perf_diagnostics("before stages", runner_env, repo_root, dry_run)
+    def _stop_managed_server() -> None:
+        nonlocal server_process
+        if pgm is not None:
+            pgm.terminate_all(dry_run=dry_run)
+        else:
+            stop_server(server_process)
+        server_process = None
+
+    def _run_task_stages() -> None:
+        nonlocal server_process, server_log_path
+        nonlocal eval_score_check, eval_accept_rate, stages_run, command_results
         for stage_name, stage_payload in stages:
             stages_run.append(stage_name)
             if stage_name == "server":
+                ready = dict(stage_payload["ready"])
+                server_command = stage_payload["command"]
+                if setup_mode == "slurm":
+                    ready["timeout"] = max(int(ready.get("timeout", 600)), 7200)
+                    server_command = configure_slurm_server_command(
+                        server_command, int(ready["timeout"])
+                    )
+                if serve_only:
+                    if pgm is not None:
+                        command_result = pgm.run(
+                            server_command,
+                            cwd=repo_root,
+                            env=runner_env,
+                            dry_run=dry_run,
+                        )
+                    else:
+                        command_result = shell_run(
+                            server_command,
+                            env=runner_env,
+                            cwd=repo_root,
+                            dry_run=dry_run,
+                        )
+                    command_result["stage"] = stage_name
+                    command_results.append(command_result)
+                    continue
+                if external_server:
+                    poll_readiness(ready, dry_run)
+                    continue
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "before server", runner_env, repo_root, dry_run
@@ -1453,13 +1919,14 @@ def execute_task(
                 server_log_path.parent.mkdir(parents=True, exist_ok=True)
                 if not dry_run:
                     server_log_path.write_text("")
-                kill_ready_port_listener(
-                    stage_payload["ready"], runner_env, repo_root, dry_run
-                )
+                if setup_mode == "slurm":
+                    ensure_ready_port_available(ready, dry_run)
+                else:
+                    kill_ready_port_listener(ready, runner_env, repo_root, dry_run)
                 if pgm is not None:
                     server_process = pgm.start(
                         wrap_command_with_log(
-                            stage_payload["command"],
+                            server_command,
                             server_log_path,
                             login_shell=False,
                         ),
@@ -1469,14 +1936,17 @@ def execute_task(
                     )
                 else:
                     server_process = start_server(
-                        wrap_command_with_log(
-                            stage_payload["command"], server_log_path
-                        ),
+                        wrap_command_with_log(server_command, server_log_path),
                         runner_env,
                         repo_root,
                         dry_run,
                     )
-                poll_readiness(stage_payload["ready"], dry_run)
+                poll_readiness(
+                    ready,
+                    dry_run,
+                    process=server_process,
+                    log_path=server_log_path,
+                )
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "after server ready", runner_env, repo_root, dry_run
@@ -1514,23 +1984,42 @@ def execute_task(
             task, command_results, stages_run, server_log_path
         )
         eval_score_check = check_eval_score_threshold(
-            task, command_results, stages_run, runner
+            task, command_results, stages_run, declared_runner
         )
         if eval_score_check is not None and not eval_score_check["passed"]:
             raise RuntimeError(
                 f"eval score {eval_score_check['score']:g} does not satisfy "
                 f"threshold {eval_score_check['threshold']}"
             )
-    except Exception as exc:
-        error = str(exc)
+
+    try:
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("before stages", runner_env, repo_root, dry_run)
+        for attempt in range(1, max_attempts + 1):
+            stages_run = []
+            command_results = []
+            eval_score_check = None
+            eval_accept_rate = None
+            try:
+                _run_task_stages()
+                error = None
+                break
+            except Exception as exc:
+                error = str(exc)
+                if attempt >= max_attempts:
+                    break
+                print(
+                    f"[CI Retry] {task['name']} failed "
+                    f"(attempt {attempt}/{max_attempts}): {error}",
+                    flush=True,
+                )
+            finally:
+                _stop_managed_server()
     finally:
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
-        if pgm is not None:
-            pgm.terminate_all(dry_run=dry_run)
-        else:
-            stop_server(server_process)
-        if not keep_runner_state:
+        _stop_managed_server()
+        if setup_mode == "ci" and not keep_runner_state:
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
@@ -1553,6 +2042,10 @@ def execute_task(
         "task": task["name"],
         "type": task["type"],
         "runner": runner,
+        "setup_mode": setup_mode,
+        "server_mode": (
+            "serve-only" if serve_only else "external" if external_server else "managed"
+        ),
         "executed_stages": stages_run,
         "targets": targets,
         "command_results": command_results,
@@ -1565,9 +2058,9 @@ def execute_task(
         result["perf_reference_check"] = perf_reference_check
     if eval_accept_rate is not None:
         result["eval_accept_rate"] = eval_accept_rate
+    write_result(result_json, result)
     if task.get("report", {}).get("github_step_summary"):
         write_detailed_step_summary(result)
-    write_result(result_json, result)
     if error is not None:
         if not error_reported:
             print(f"error: {error}", file=sys.stderr)
@@ -1581,6 +2074,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
     scan_parser = subparsers.add_parser("scan", help="Scan CI task specs into a matrix")
     scan_parser.add_argument("--root", default="test/ci", help="Task root directory")
+    scan_parser.add_argument(
+        "--changed-files",
+        type=Path,
+        help="Optional changed-path list; only task-YAML-only diffs narrow the matrix",
+    )
     scan_parser.add_argument(
         "--trigger",
         choices=sorted(SUPPORTED_TRIGGERS),
@@ -1598,6 +2096,18 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default="all",
         help="Optional runner group filter",
     )
+    scan_parser.add_argument(
+        "--workflow-stage",
+        choices=SUPPORTED_WORKFLOW_STAGES,
+        default=None,
+        help="Optional workflow stage filter",
+    )
+    scan_parser.add_argument(
+        "--multi-node",
+        choices=SUPPORTED_MULTI_NODE_FILTERS,
+        default="exclude",
+        help="Optionally select only or exclude multi-node Slurm tasks",
+    )
 
     execute_parser = subparsers.add_parser("execute", help="Execute one CI task")
     execute_parser.add_argument(
@@ -1605,6 +2115,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     execute_parser.add_argument(
         "--runner", required=True, help="Runner label selected by the matrix"
+    )
+    execute_parser.add_argument(
+        "--runner-override",
+        help="Slurm-only effective GB300 runner for a declared B200/GB200 runner.",
     )
     execute_parser.add_argument(
         "--work-dir", default=".", help="Repository work directory"
@@ -1638,6 +2152,23 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Reuse runner setup state left by an earlier execute invocation.",
     )
+    execute_parser.add_argument(
+        "--setup-mode",
+        choices=SUPPORTED_SETUP_MODES,
+        default="ci",
+        help="Runner setup policy. Slurm mode avoids host-wide CI mutations.",
+    )
+    server_mode = execute_parser.add_mutually_exclusive_group()
+    server_mode.add_argument(
+        "--serve-only",
+        action="store_true",
+        help="Run install and the server in the foreground for a Slurm server step.",
+    )
+    server_mode.add_argument(
+        "--external-server",
+        action="store_true",
+        help="Wait for an externally managed server before running eval or perf.",
+    )
 
     return parser.parse_args(argv)
 
@@ -1647,7 +2178,24 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "scan":
         repo_root = Path(args.repo_root).resolve()
         root = (repo_root / args.root).resolve()
-        matrix = build_matrix(root, repo_root, args.trigger, args.runner_group)
+        matrix = build_matrix(
+            root,
+            repo_root,
+            args.trigger,
+            args.runner_group,
+            args.workflow_stage,
+            args.multi_node,
+        )
+        if args.changed_files is not None:
+            changed = args.changed_files.read_text(encoding="utf-8").splitlines()
+            # GitHub comparisons may truncate the file list at 300 entries.
+            if 0 < len(changed) < 300 and all(
+                path.startswith("test/ci/") and path.endswith(".yaml")
+                for path in changed
+            ):
+                matrix["include"] = [
+                    entry for entry in matrix["include"] if entry["config"] in changed
+                ]
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 
@@ -1655,6 +2203,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         return execute_task(
             config=args.config,
             runner=args.runner,
+            runner_override=args.runner_override,
             work_dir=args.work_dir,
             dry_run=args.dry_run,
             print_plan=args.print_plan,
@@ -1663,6 +2212,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             skip_stages=set(args.skip_stage),
             keep_runner_state=args.keep_runner_state,
             reuse_runner_state=args.reuse_runner_state,
+            setup_mode=args.setup_mode,
+            serve_only=args.serve_only,
+            external_server=args.external_server,
         )
 
     raise ValueError(f"unsupported command: {args.command}")

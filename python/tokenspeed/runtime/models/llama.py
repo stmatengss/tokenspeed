@@ -57,7 +57,6 @@ from tokenspeed.runtime.models.utils import (
     validate_attention_partition,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class LlamaMLP(nn.Module):
@@ -199,7 +198,6 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         # Skip the QKV projection, RoPE, attention, and o_proj kernels when
         # the batch row is empty (e.g. idle ranks under DP attention). Matches
@@ -210,7 +208,7 @@ class LlamaAttention(nn.Module):
             )
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self._attn(positions, q, k, v, ctx, out_cache_loc)
+        attn_output = self._attn(positions, q, k, v, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -221,7 +219,6 @@ class LlamaAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """RoPE + attention (pre-o_proj), with optional fused KV pre-write.
 
@@ -235,7 +232,7 @@ class LlamaAttention(nn.Module):
         behaviour around the same scaffolding.
         """
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            fused_kv_arg = self._build_fused_kv_arg(v, ctx, out_cache_loc)
+            fused_kv_arg = self._build_fused_kv_arg(v, ctx)
             if fused_kv_arg is not None:
                 q_rope = self._fused_rope_kv_write(positions, q, k, fused_kv_arg)
                 return self.attn(
@@ -244,16 +241,14 @@ class LlamaAttention(nn.Module):
                     None,
                     save_kv_cache=False,
                     ctx=ctx,
-                    out_cache_loc=out_cache_loc,
                 )
         q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
+        return self.attn(q, k, v, ctx=ctx)
 
     def _build_fused_kv_arg(
         self,
         v: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ):
         """Try to build the fused RoPE+KV-write descriptor; returns ``None`` if
         the helper rejects the layer (e.g. non-trivial k/v scales)."""
@@ -261,7 +256,9 @@ class LlamaAttention(nn.Module):
         return create_fused_set_kv_buffer_arg(
             value=v.view(n, self.num_kv_heads, self.head_dim),
             layer=self.attn,
-            out_cache_loc=out_cache_loc,
+            # Prewrite at this layer's group locations, fetched from the
+            # backend (the one owner of KV write slots).
+            out_cache_loc=ctx.attn_backend.write_locations(self.attn, ctx.forward_mode),
             token_to_kv_pool=ctx.token_to_kv_pool,
         )
 
@@ -282,7 +279,6 @@ class LlamaAttention(nn.Module):
             k,
             fused_set_kv_buffer_arg=fused_kv_arg,
             output_q_rope=q_rope,
-            enable_pdl=pdl_enabled(),
         )
         return q_rope
 

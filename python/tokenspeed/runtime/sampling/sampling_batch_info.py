@@ -23,7 +23,6 @@ from __future__ import annotations
 import dataclasses
 import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -32,22 +31,14 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-if TYPE_CHECKING:
-    from tokenspeed.runtime.engine.schedule_batch import ScheduleBatch
-
-
 @dataclasses.dataclass
 class SamplingBatchInfo:
-    # Basic batched sampling params. Disaggregated decode populates these via
-    # from_schedule_batch. The standard hot path leaves them None; sampling
-    # backends gather params from their own pool-indexed buffers.
+    # Basic batched sampling params. The standard hot path leaves them None;
+    # sampling backends gather params from their own pool-indexed buffers.
     temperatures: torch.Tensor | None = None
     top_ps: torch.Tensor | None = None
     top_ks: torch.Tensor | None = None
     min_ps: torch.Tensor | None = None
-
-    # Whether all requests use greedy sampling
-    is_all_greedy: bool = False
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int = 0
@@ -74,6 +65,12 @@ class SamplingBatchInfo:
     # index_select inside the captured graph.
     valid_cache_lengths: torch.Tensor | None = None
 
+    # First batch row this info covers, relative to the step's full batch.
+    # Per-step row-indexed backend buffers (the coin buffers a mixed round's
+    # prepare_step filled in prefill-then-decode order) must be read at this
+    # offset — a MIXED round's verify() sees only the decode suffix.
+    batch_row_offset: int = 0
+
     # Device
     device: str = "cuda"
 
@@ -84,10 +81,6 @@ class SamplingBatchInfo:
         different sampler ops to a prefix vs suffix of rows. Only ``slice``
         is supported — int indexing would yield 0-dim tensors and break
         downstream gathers.
-
-        ``is_all_greedy`` is inherited from the parent; when ``top_ks`` is
-        populated the slice refines it from the sliced tensor (one GPU
-        sync, only on the disagg slice path).
         """
         if not isinstance(s, slice):
             raise TypeError(
@@ -103,38 +96,8 @@ class SamplingBatchInfo:
             top_ps=_slice(self.top_ps),
             top_ks=_slice(self.top_ks),
             min_ps=_slice(self.min_ps),
-            is_all_greedy=self.is_all_greedy,
             req_pool_indices=_slice(self.req_pool_indices),
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
+            batch_row_offset=self.batch_row_offset + (s.start or 0),
         )
-
-    @classmethod
-    def from_schedule_batch(
-        cls, batch: ScheduleBatch, vocab_size: int
-    ) -> SamplingBatchInfo:
-        reqs = batch.reqs
-        device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
-        top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
-        ).to(device, non_blocking=True)
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
-
-        ret = cls(
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-            min_ps=min_ps,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            vocab_size=vocab_size,
-            device=device,
-        )
-        return ret

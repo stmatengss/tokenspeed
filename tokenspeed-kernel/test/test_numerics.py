@@ -23,7 +23,14 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
-from tokenspeed_kernel.numerics.inputs import get_input_generator
+from tokenspeed_kernel.numerics.inputs import get_input_generator, shape_traits
+from tokenspeed_kernel.numerics.reference.gemm import (
+    torch_bmm_fp8_blockscale,
+    torch_bmm_fp8_scaled,
+    torch_mm_fp8_blockscale,
+    torch_mm_fp8_scaled_mnk,
+    torch_mm_fp8_scaled_nkm,
+)
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import (
     _verification_signature_and_reference,
@@ -31,9 +38,15 @@ from tokenspeed_kernel.numerics.verify import (
 )
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 
 
 class TestCompareOutputs:
@@ -115,6 +128,187 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
         generator.generate(M=4, N=256, K=128)
 
 
+def test_gemm_input_generator_preserves_kn_weight_layout() -> None:
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=torch.bfloat16,
+        traits={"b_layout": frozenset({"KN"})},
+        device="cpu",
+    )
+
+    inputs = generator.generate(M=4, N=256, K=128)
+
+    assert inputs["B"].shape == (128, 256)
+
+
+def test_bmm_input_generator_honors_n_contiguous_weight_trait() -> None:
+    generator = get_input_generator(
+        "gemm",
+        "bmm",
+        dtype=torch.bfloat16,
+        traits={"b_n_stride_one": frozenset({True})},
+        device="cpu",
+    )
+
+    inputs = generator.generate(batch=12, M=1, N=512, K=128)
+
+    assert inputs["B"].shape == (12, 512, 128)
+    assert inputs["B"].stride(1) == 1
+
+
+def test_shape_traits_lowercases_gemm_dimensions() -> None:
+    assert shape_traits({"M": 16, "N": 32, "K": 64}) == {"m": 16, "n": 32, "k": 64}
+    assert shape_traits({"batch": 2, "M": 4, "N": 8, "K": 16}) == {
+        "batch": 2,
+        "m": 4,
+        "n": 8,
+        "k": 16,
+    }
+    assert shape_traits({"B": 2, "M": 4}) == {"batch": 2, "m": 4}
+    assert shape_traits({"seq_len": 128, "num_heads": 8}) == {}
+
+
+def test_quantized_reference_gemm_supports_out() -> None:
+    A = torch.empty((2, 128), dtype=_fp8_dtype)
+    B = torch.empty((256, 128), dtype=_fp8_dtype)
+    tensor_scale = torch.ones((1,), dtype=torch.float32)
+    block_a_scale = torch.ones((2, 1), dtype=torch.float32)
+    block_b_scale = torch.ones((2, 1), dtype=torch.float32)
+    out = torch.empty((2, 256), dtype=torch.bfloat16)
+
+    blockscale = torch_mm_fp8_blockscale(
+        A,
+        B,
+        block_a_scale,
+        block_b_scale,
+        torch.bfloat16,
+        block_size=[128, 128],
+        out=out,
+    )
+    assert blockscale is out
+
+    scaled_mnk = torch_mm_fp8_scaled_mnk(
+        A,
+        B,
+        tensor_scale,
+        tensor_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert scaled_mnk is out
+
+    scaled_nkm = torch_mm_fp8_scaled_nkm(
+        A,
+        B.T,
+        tensor_scale,
+        tensor_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert scaled_nkm is out
+
+
+def test_quantized_reference_bmm_supports_out() -> None:
+    A = torch.empty((2, 4, 128), dtype=_fp8_dtype)
+    B = torch.empty((2, 256, 128), dtype=_fp8_dtype)
+    tensor_scale = torch.ones((1,), dtype=torch.float32)
+    channel_a_scale = torch.ones((2, 4), dtype=torch.float32)
+    channel_b_scale = torch.ones((2, 256), dtype=torch.float32)
+    block_a_scale = torch.ones((2, 4, 1), dtype=torch.float32)
+    block_b_scale = torch.ones((2, 2, 1), dtype=torch.float32)
+    out = torch.empty((2, 4, 256), dtype=torch.bfloat16)
+
+    blockscale = torch_bmm_fp8_blockscale(
+        A,
+        B,
+        block_a_scale,
+        block_b_scale,
+        torch.bfloat16,
+        block_size=[128, 128],
+        out=out,
+    )
+    assert blockscale is out
+
+    tensor_scaled = torch_bmm_fp8_scaled(
+        A,
+        B,
+        tensor_scale,
+        tensor_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert tensor_scaled is out
+
+    channel_scaled = torch_bmm_fp8_scaled(
+        A,
+        B,
+        channel_a_scale,
+        channel_b_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert channel_scaled is out
+
+
+def test_bmm_input_generator_uses_signature_scale_metadata() -> None:
+    scale = ScaleFormat(
+        storage_dtype=torch.float32,
+        granularity="block",
+        block_shape=(128, 128),
+    )
+    signature = next(
+        iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "bmm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(batch=2, M=4, N=256, K=128)
+
+    assert inputs["A"].shape == (2, 4, 128)
+    assert inputs["B"].shape == (2, 256, 128)
+    assert inputs["A"].dtype == _fp8_dtype
+    assert inputs["B"].dtype == _fp8_dtype
+    assert inputs["A_scales"].shape == (2, 4, 1)
+    assert inputs["B_scales"].shape == (2, 2, 1)
+    assert inputs["A_scales"].dtype == torch.float32
+    assert inputs["B_scales"].dtype == torch.float32
+    assert inputs["block_size"] == [128, 128]
+
+
+def test_bmm_input_generator_supports_scaled_fp8_channel_scales() -> None:
+    scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+    signature = next(
+        iter(format_signatures(("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "bmm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(batch=2, M=4, N=256, K=128)
+
+    assert inputs["A"].shape == (2, 4, 128)
+    assert inputs["B"].shape == (2, 256, 128)
+    assert inputs["A"].dtype == _fp8_dtype
+    assert inputs["B"].dtype == _fp8_dtype
+    assert inputs["A_scales"].shape == (2, 4)
+    assert inputs["B_scales"].shape == (2, 256)
+    assert inputs["A_scales"].dtype == torch.float32
+    assert inputs["B_scales"].dtype == torch.float32
+    assert inputs["block_size"] is None
+
+
 def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:
     tensor_scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
     channel_scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
@@ -171,27 +365,74 @@ class TestNumericsVerification:
         for family_name, mode in registry.list_operators():
             if family and family_name != family:
                 continue
-            # Only run kernels that have a paired reference for this dtype;
-            # otherwise verify_kernel raises ValueError and the test errors.
-            op_specs = registry.get_for_operator(family_name, mode)
-            dtype_specs = [
-                s
-                for s in op_specs
-                if s.format_signatures_for_storage_dtype(dtype, dtype_role)
-            ]
-            has_reference = any(s.solution == "reference" for s in dtype_specs)
-            if not has_reference:
-                continue
-            for spec in dtype_specs:
+            for spec in registry.get_for_operator(family_name, mode, platform=platform):
                 if spec.solution == "reference":
                     continue
                 if spec.solution == "deep_gemm":
                     continue
-                if not spec.capability.satisfied_by(platform):
+                _, reference = _verification_signature_and_reference(
+                    registry, spec, dtype, dtype_role
+                )
+                if reference is None:
                     continue
                 specs.append(spec)
         specs.sort(key=lambda s: (s.family, s.mode, s.name))
         return specs
+
+    def test_collector_requires_exact_compatible_reference(self, fresh_registry):
+        dense_signature = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.bfloat16),
+        )
+        mixed_signature = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=tensor_format(
+                "nvfp4",
+                torch.uint8,
+                scale=ScaleFormat(
+                    storage_dtype=torch.float8_e4m3fn,
+                    granularity="block",
+                    block_shape=(16,),
+                ),
+            ),
+        )
+        registry = KernelRegistry.get()
+        for spec in (
+            KernelSpec(
+                name="test_dense_reference",
+                family="gemm",
+                mode="collector_mm",
+                solution="reference",
+                format_signatures=frozenset({dense_signature}),
+            ),
+            KernelSpec(
+                name="test_dense_candidate",
+                family="gemm",
+                mode="collector_mm",
+                solution="triton",
+                format_signatures=frozenset({dense_signature}),
+            ),
+            KernelSpec(
+                name="test_mixed_candidate",
+                family="gemm",
+                mode="collector_mm",
+                solution="flashinfer",
+                format_signatures=frozenset({mixed_signature}),
+            ),
+        ):
+            registry.register(spec, lambda **_kwargs: None)
+
+        names = {
+            spec.name
+            for spec in TestNumericsVerification._get_verifiable_specs(
+                torch.bfloat16,
+                "a",
+                family="gemm",
+            )
+        }
+
+        assert "test_dense_candidate" in names
+        assert "test_mixed_candidate" not in names
 
     def _verify(self, spec: KernelSpec, dtype: torch.dtype, dtype_role: str) -> None:
         if not torch.cuda.is_available():

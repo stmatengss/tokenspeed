@@ -20,111 +20,371 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from abc import ABC, abstractmethod
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+    cache_field_plane,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 
 logger = get_colorful_logger(__name__)
 
 
-class BaseTokenToKVPool:
-    """A memory pool that maps a token location to its kv cache data."""
+def _layer_plane(
+    field_id: str, first_layer: int, num_layers: int
+) -> tuple[int, str] | None:
+    """Split a planned field id into this view's local layer id and plane.
 
-    paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
-    paged_cache_group_page_counts: dict[str, int] = {}
-    supports_hierarchical_kv_cache: bool = True
+    Returns None for fields outside the view's layer window.
+    """
+    local_layer = cache_field_layer_id(field_id) - first_layer
+    if not 0 <= local_layer < num_layers:
+        return None
+    return local_layer, cache_field_plane(field_id)
+
+
+def derive_state_groups_by_layer(
+    arena: CacheArena,
+    *,
+    first_layer: int,
+    num_layers: int,
+    state_layer_ids: Iterable[int],
+    state_field_suffixes: Iterable[str],
+) -> dict[int, str]:
+    """Map each recurrent layer to the state-family group holding its fields.
+
+    The memory plan is the single record of which group a layer's fields were
+    declared in, so the mapping is read back from the planned fields rather
+    than carried as a parallel per-layer tuple.
+
+    Args:
+        arena: The cache arena whose plan and group specs to read.
+        first_layer: This view's first layer in the merged plan.
+        num_layers: Number of layers in this view's window.
+        state_layer_ids: View-local ids of the recurrent (state) layers.
+        state_field_suffixes: Field ID suffixes that make up the pool's
+            recurrent state.
+
+    Returns:
+        View-local layer id -> state-family group id, one entry per state
+        layer whose fields the plan declares inside this view's window.
+
+    Raises:
+        ValueError: a state layer's fields span more than one state group.
+    """
+    state_groups = {
+        spec.group_id for spec in arena.cache_group_specs if spec.family == "state"
+    }
+    wanted = set(state_layer_ids)
+    wanted_suffixes = set(state_field_suffixes)
+    mapping: dict[int, str] = {}
+    for field in arena.plan.fields:
+        located = _layer_plane(field.field_id, first_layer, num_layers)
+        if located is None:
+            continue
+        layer_id, suffix = located
+        if layer_id not in wanted or suffix not in wanted_suffixes:
+            continue
+        if field.group_id not in state_groups:
+            continue
+        existing = mapping.setdefault(layer_id, field.group_id)
+        if existing != field.group_id:
+            raise ValueError(
+                f"layer {layer_id} has state fields in more than one cache "
+                f"group: {existing!r} and {field.group_id!r}"
+            )
+    return mapping
+
+
+def derive_history_groups_by_layer(
+    arena: CacheArena,
+    *,
+    first_layer: int,
+    num_layers: int,
+    kv_planes: Iterable[str],
+) -> dict[int, str]:
+    """Map each attention layer to the history-family group holding its KV.
+
+    The counterpart of :func:`derive_state_groups_by_layer` for the paged
+    side: read back from the planned fields, restricted to the planes this
+    view's kernels write KV through (``layer_plane_bindings``), so a layer
+    that also owns indexer or state planes in other groups still resolves to
+    the one group its ``PagedAttention`` rides.
+
+    Args:
+        arena: The cache arena whose plan and group specs to read.
+        first_layer: This view's first layer in the merged plan.
+        num_layers: Number of layers in this view's window.
+        kv_planes: Plane names of the KV fields (e.g. ``k``/``v`` or
+            ``latent_kv``).
+
+    Returns:
+        View-local layer id -> history-family group id, one entry per layer
+        whose KV planes the plan declares inside this view's window.
+
+    Raises:
+        ValueError: a layer's KV planes span more than one history group.
+    """
+    history = {
+        str(spec.group_id)
+        for spec in arena.cache_group_specs
+        if spec.family == "history"
+    }
+    wanted_planes = set(kv_planes)
+    mapping: dict[int, str] = {}
+    for field in arena.plan.fields:
+        located = _layer_plane(field.field_id, first_layer, num_layers)
+        if located is None:
+            continue
+        layer_id, plane = located
+        if plane not in wanted_planes or str(field.group_id) not in history:
+            continue
+        existing = mapping.setdefault(layer_id, str(field.group_id))
+        if existing != str(field.group_id):
+            raise ValueError(
+                f"layer {layer_id} has KV planes in more than one history "
+                f"cache group: {existing!r} and {field.group_id!r}"
+            )
+    return mapping
+
+
+def derive_paged_group_ids(
+    arena: CacheArena, *, first_layer: int, num_layers: int
+) -> tuple[str, ...]:
+    """The history-family cache groups this view's layers deposit KV in.
+
+    Read back from the planned fields like the state mapping above: a
+    group counts when some per-layer field inside the view's layer window
+    is declared in it. This is the group set a ``CacheGroupRouter`` builds
+    one paged leaf for — a draft view over a shared arena sees only the
+    groups its own layers use, never the target's whole set.
+
+    Args:
+        arena: The cache arena whose plan and group specs to read.
+        first_layer: This view's first layer in the merged plan.
+        num_layers: Number of layers in this view's window.
+
+    Returns:
+        Sorted group ids, possibly empty (a view with no paged layers).
+    """
+    history = {
+        str(spec.group_id)
+        for spec in arena.cache_group_specs
+        if spec.family == "history"
+    }
+    found: set[str] = set()
+    for field in arena.plan.fields:
+        if _layer_plane(field.field_id, first_layer, num_layers) is None:
+            continue
+        if field.group_id in history:
+            found.add(str(field.group_id))
+    return tuple(sorted(found))
+
+
+class CachePool(ABC):
+    """One model's typed layer window onto a shared cache arena.
+
+    A pool owns no memory and no geometry: ``self.arena`` owns the
+    allocation, the field views, the plan and the scheduler contract, and
+    callers that want any of those ask the arena directly. What a pool
+    adds is per-view: the dtype its kernels read these bytes as, where its
+    layer window starts in the merged plan, and the per-layer buffers its
+    kernels index. Target and draft are therefore two pools over one
+    arena -- and may read it as different dtypes.
+    """
+
+    # Pools that alias recurrent-state bytes and KV in one buffer must
+    # zero physical pages on reuse to avoid poisoned tails. Pure-attention
+    # pools do not alias state, so reused pages need no sanitization.
+    requires_page_zeroing: bool = False
 
     def __init__(
         self,
-        size: int,
+        arena: CacheArena,
         dtype: torch.dtype,
-        device: str,
-        max_batch_size: int,
-        max_context_len: int,
-        page_size: int,
         rank: int,
+        *,
+        field_layer_offset: int = 0,
     ):
+        self.arena = arena
         self.dtype = dtype
         self.rank = rank
-        self.size = size
-        self.page_size = page_size
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             #  Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
-        self.device = device
-        self.offload_chunk_page_num = 1024
-        self.token_slot_refs = None
-
+        self._field_layer_offset = int(field_layer_offset)
+        if self._field_layer_offset < 0:
+            raise ValueError("field_layer_offset must be non-negative")
         # default state for optional layer-wise transfer control
-        self.layer_transfer_counter = None
+        self.layerwise_load_tracker = None
         logger.info(
-            f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}"
+            f"Initialized cache view over {arena.size:d} slots as {dtype!s}, layers "
+            f"from {self._field_layer_offset:d}, rank {rank:d}",
         )
 
-    @classmethod
-    def cell_size(self) -> int:
-        raise NotImplementedError()
+    @property
+    def paged_group_ids(self) -> tuple[str, ...]:
+        """History-family groups this view's layers write KV into (sorted);
+        the router builds one paged leaf per id."""
+        return derive_paged_group_ids(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
+        )
 
-    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
-        self.layer_transfer_counter = layer_transfer_counter
+    def history_group_by_layer(self) -> dict[int, str]:
+        """View-local layer id -> the history-family group its KV planes
+        ride; what ``bind_cache_groups`` stamps onto the model's
+        ``PagedAttention`` layers."""
+        return derive_history_groups_by_layer(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
+            kv_planes=self.layer_plane_bindings,
+        )
 
-    def set_token_slot_refs(self, token_slot_refs: torch.Tensor):
-        self.token_slot_refs = token_slot_refs
+    def _field_layer_id(self, layer_id: int) -> int:
+        """Map this compute view's local layer id into the merged plan.
 
-    def bind_paged_cache_scheduler(self, scheduler: object) -> None:
-        """Optional hook for model-specific paged-cache diagnostics."""
-        return None
+        Callers pass the id their own model numbers the layer with, which for a
+        draft view means ``0..num_draft_layers-1``. Reject anything outside the
+        window: a global id offset a second time would silently address another
+        model's planes.
+        """
+        if not 0 <= layer_id < self.layer_num:
+            raise ValueError(
+                f"layer {layer_id} is outside this cache view's window of "
+                f"{self.layer_num} layers (ids are local to the view)"
+            )
+        return self._field_layer_offset + layer_id
+
+    @property
+    def field_layer_range(self) -> range:
+        """Global model-layer ids owned by this compute view.
+
+        Cache-plan field ids use global layer numbers, while target and draft
+        pools expose local layer numbers to their models.  Consumers that
+        inspect the shared plan use this range to keep only fields belonging
+        to their own view instead of accidentally including the adjacent
+        target or draft window.
+        """
+
+        return range(
+            self._field_layer_offset,
+            self._field_layer_offset + self.layer_num,
+        )
+
+    # Per-layer plane name -> the attribute holding its per-layer list.
+    # Subclasses declare only the planes their kernels read; a plane they do
+    # not name is not this view's concern.
+    layer_plane_bindings: ClassVar[dict[str, str]] = {}
+
+    def _bind_layer_planes(self) -> None:
+        """Arrange this view's planned per-layer fields into kernel buffers.
+
+        The plan names every field, its dtype, its shape and which layer it
+        belongs to, and the arena already materialized every view in the
+        shape it is addressed by. Walk the plan once, keep the fields inside
+        this view's layer window, and file each under the attribute its
+        kernels read.
+        """
+        lists = {
+            attribute: [None] * self.layer_num
+            for attribute in self.layer_plane_bindings.values()
+        }
+        for field in self.arena.plan.fields:
+            located = _layer_plane(
+                field.field_id, self._field_layer_offset, self.layer_num
+            )
+            if located is None:
+                continue
+            layer_id, plane = located
+            attribute = self.layer_plane_bindings.get(plane)
+            if attribute is None:
+                continue
+            lists[attribute][layer_id] = self.arena.field(field.field_id)
+        for attribute, values in lists.items():
+            setattr(self, attribute, values)
+
+    def register_layerwise_load_tracker(
+        self, layerwise_load_tracker: LayerwiseLoadTracker
+    ) -> None:
+        self.layerwise_load_tracker = layerwise_load_tracker
+
+    def cache_transfer_layout(self):
+        """Return the transfer layout consumed by this compute view."""
+        from tokenspeed.runtime.cache.transfer.layout import (
+            select_layer_fields,
+        )
+
+        try:
+            field_ids, consumers = select_layer_fields(
+                self.arena.plan.fields,
+                first_layer=self._field_layer_offset,
+                num_layers=self.layer_num,
+            )
+        except (AttributeError, IndexError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
+        return self._build_cache_transfer_layout(field_ids, consumers)
+
+    def _build_cache_transfer_layout(self, field_ids, consumers):
+        from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
+
+        local_group_ids = {
+            field.group_id
+            for field in self.arena.plan.fields
+            if field.field_id in field_ids
+        }
+        scheduler_group_ids = tuple(
+            spec.group_id
+            for spec in self.arena.cache_group_specs
+            if spec.group_id in local_group_ids
+        )
+        return layout_from_lcm_plan(
+            self.arena.plan,
+            self.arena.buffer,
+            consumers=consumers,
+            group_ids=scheduler_group_ids or None,
+            field_ids=field_ids,
+        )
 
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:
-        """Zero the KV buffers in place.
+        """Zero the shared cache arena after sleep/wake remaps its storage."""
+        # The event loop visits both target and draft pools; both name the
+        # same arena, and zeroing it twice is harmless.
+        self.arena.clear()
 
-        Used by sleep/wake: after resume_memory_occupation re-maps the KV region
-        its pages hold garbage, so zero them. Subclasses store buffers under
-        different attributes (``k_buffer``/``v_buffer`` for MHA, ``kv_buffer`` —
-        possibly tuples — for MLA); introspect the known names so every pool is
-        covered without per-class overrides. For non-quantized KV this is
-        belt-and-suspenders (paging overwrites); for FP8 KV it removes garbage.
-        """
-        attrs = (
-            "k_buffer",
-            "v_buffer",
-            "kv_buffer",
-            # DeepSeek V4 pool buffer names.
-            "swa_kv_buffer",
-            "compressed_kv_buffer",
-            "compressor_state_buffer",
-            "indexer_kv_buffer",
-            "indexer_state_buffer",
-        )
-        for attr in attrs:
-            for entry in getattr(self, attr, None) or []:
-                items = entry if isinstance(entry, (tuple, list)) else (entry,)
-                for t in items:
-                    if torch.is_tensor(t):
-                        t.zero_()
+    # ------------------------------------------------------------------
+    # What every cache view owes its kernels. Abstract, so a subclass that
+    # forgets one fails at construction instead of at the first write.
+    # ------------------------------------------------------------------
 
-    def maybe_log_paged_cache_group_pages(self) -> None:
-        return None
-
+    @abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError()
+        """This layer's K plane, in the shape its kernels read."""
 
+    @abstractmethod
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError()
+        """This layer's V plane, in the shape its kernels read."""
 
+    @abstractmethod
     def get_kv_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError()
+        """Both of this layer's planes at once."""
 
+    @abstractmethod
     def set_kv_buffer(
         self,
         layer: PagedAttention,
@@ -132,28 +392,4 @@ class BaseTokenToKVPool:
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ) -> None:
-        raise NotImplementedError()
-
-    def get_cpu_copy(self, page_indices: list[int]) -> torch.Tensor:
-        raise NotImplementedError()
-
-    def load_cpu_copy(
-        self, kv_cache_cpu: torch.Tensor, page_indices: list[int]
-    ) -> None:
-        raise NotImplementedError()
-
-    @property
-    def prefix_cache_required_group_ids(self) -> tuple[str, ...] | None:
-        """None means adjunct disabled; subclasses return required group ids."""
-        return None
-
-    # Buffer metadata used by prefill/decode disaggregation.
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError()
-
-    def get_contiguous_buf_unit_lens(self):
-        return [1] * len(self.get_contiguous_buf_infos()[2])
-
-    # Layerwise buffer offsets used by prefill/decode disaggregation.
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        raise NotImplementedError()
+        """Scatter one forward pass's K/V into this layer's planes."""

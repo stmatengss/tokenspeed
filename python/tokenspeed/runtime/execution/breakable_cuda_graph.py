@@ -54,7 +54,7 @@ from __future__ import annotations
 import functools
 import gc
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -67,6 +67,7 @@ __all__ = [
     "break_here",
     "break_point",
     "current_forward_ctx",
+    "current_valid_rows",
     "is_breakable_capture_active",
     "scrub_padding_tail",
     "slice_to_real_tokens",
@@ -76,10 +77,12 @@ __all__ = [
 
 # Ambient per-forward ctx; plain module state (one launch thread per rank).
 _ambient_ctx: Any = None
+# Real leading rows of the replay in progress; see current_valid_rows.
+_replay_valid_rows: int | None = None
 
 
 @contextmanager
-def active_forward(ctx: Any) -> Iterator[None]:
+def active_forward(ctx: Any) -> Generator[None]:
     """Publish ``ctx`` as the ambient forward context for the enclosed block.
 
     An eager break runs once at capture and again on every replay, and the args
@@ -103,6 +106,23 @@ def active_forward(ctx: Any) -> Iterator[None]:
 def current_forward_ctx() -> Any:
     """The ambient forward context, or ``None`` outside an :func:`active_forward`."""
     return _ambient_ctx
+
+
+def current_valid_rows() -> int | None:
+    """Real leading row count of the replay in progress, or ``None`` when unpadded.
+
+    A padded-bucket replay hands every break ``bucket`` rows whose tail is filler.
+    Breaks whose kernels are indexed by the live metadata's token count -- and so
+    would read past the real batch -- narrow their token-shaped inputs to this
+    prefix via :func:`slice_to_real_tokens`. ``None`` during capture and on the
+    eager path, where the rows already are exactly the real ones.
+    """
+    return _replay_valid_rows
+
+
+def _set_replay_valid_rows(valid_rows: int | None) -> None:
+    global _replay_valid_rows
+    _replay_valid_rows = valid_rows
 
 
 def weak_ref_tensor(t: Any) -> Any:
@@ -245,13 +265,24 @@ class BreakableCapture:
 
     # -- replay ------------------------------------------------------------
 
-    def replay(self) -> None:
+    def replay(self, valid_rows: int | None = None) -> None:
         """Replay all segments in order.
 
         Breaks read the live forward context from the ambient :func:`active_forward`
-        scope (the runner wraps replay in it), so this stays a pure graph primitive.
+        scope (the runner wraps replay in it).
+
+        Args:
+            valid_rows: Number of valid leading rows in a padded replay. After
+                each eager break, handoff rows beyond this prefix are cleared
+                before the following graph segment consumes them. ``None``
+                leaves handoff buffers unchanged.
         """
-        deque((run() for run in self.segments), maxlen=0)
+        previous_valid_rows = _replay_valid_rows
+        _set_replay_valid_rows(valid_rows)
+        try:
+            deque((run() for run in self.segments), maxlen=0)
+        finally:
+            _set_replay_valid_rows(previous_valid_rows)
 
     @property
     def num_segments(self) -> int:
@@ -309,6 +340,8 @@ def _record_break(
         if dst is None:
             dst = state["dst"] = resolve_dst(result)
         _land_in(dst, result)
+        if _replay_valid_rows is not None:
+            scrub_padding_tail(_replay_valid_rows, dst)
         return dst
 
     return cap.add_eager(replay_fn)
@@ -441,8 +474,10 @@ def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:
     ``dst`` is the (possibly token-padded) handoff buffer the next graph segment
     reads. ``result`` may cover only the real (unpadded) leading rows -- e.g. a
     varlen attention kernel writes only ``sum(cu_seqlens_q)`` rows -- so we copy
-    into the matching leading slice. Padded rows are left as-is (discarded by the
-    final output slice). No-op when the op already wrote ``dst`` in place.
+    into the matching leading slice. Padded rows are otherwise left as-is;
+    :meth:`BreakableCapture.replay` clears them before the following graph segment
+    when it is given the valid prefix length. No-op when the op already wrote
+    ``dst`` in place.
     """
     if result is dst:
         return

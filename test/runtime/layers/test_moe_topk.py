@@ -4,7 +4,73 @@ import pytest
 import torch
 
 from tokenspeed.runtime.layers.moe import topk as topk_module
-from tokenspeed.runtime.layers.moe.topk import TopKConfig, select_experts
+from tokenspeed.runtime.layers.moe.topk import (
+    TopK,
+    TopKConfig,
+    TopKOutputFormat,
+    select_experts,
+)
+
+
+def test_topk_call_can_override_configured_output_format() -> None:
+    topk = TopK(top_k=2, output_format=TopKOutputFormat.STANDARD)
+    hidden_states = torch.empty((3, 4))
+    router_logits = torch.empty((3, 8))
+
+    output = topk(
+        hidden_states,
+        router_logits,
+        output_format=TopKOutputFormat.BYPASSED,
+    )
+
+    assert output.format.is_bypassed()
+    assert output.hidden_states is hidden_states
+    assert output.router_logits is router_logits
+
+
+def test_plain_route_uses_kernel_package_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, torch.dtype, bool, float, str | None]] = []
+
+    def fake_topk(
+        router_logits: torch.Tensor,
+        top_k: int,
+        score_function: str,
+        selection_method: str,
+        renormalize: bool,
+        routed_scaling_factor: float,
+        topk_indices_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert score_function == "softmax"
+        assert selection_method == "topk"
+        calls.append(
+            (
+                top_k,
+                topk_indices_dtype,
+                renormalize,
+                routed_scaling_factor,
+                None,
+            )
+        )
+        shape = (router_logits.shape[0], top_k)
+        return torch.ones(shape), torch.zeros(shape, dtype=topk_indices_dtype)
+
+    monkeypatch.setattr(topk_module, "moe_topk", fake_topk)
+    output = select_experts(
+        hidden_states=torch.empty((2, 4), dtype=torch.float32),
+        router_logits=torch.empty((2, 8), dtype=torch.float32),
+        topk_config=TopKConfig(
+            top_k=2,
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            topk_indices_dtype=torch.int32,
+        ),
+    )
+
+    assert calls == [(2, torch.int32, True, 2.5, None)]
+    assert output.topk_weights.shape == output.topk_ids.shape == (2, 2)
+    assert output.topk_ids.dtype == torch.int32
 
 
 @pytest.mark.parametrize("renormalize", [False, True])

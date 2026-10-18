@@ -25,7 +25,6 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Callable, Generator
 
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
@@ -37,7 +36,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "NoKernelFoundError",
     "SelectedKernel",
-    "SelectionObjective",
     "SelectionStrategy",
     "ScoreBreakdown",
     "SelectionOracle",
@@ -47,8 +45,6 @@ __all__ = [
     "set_selection_policy",
     "register_oracle",
     "kernel_override",
-    "load_config_overrides",
-    "clear_config_overrides",
     "explain_selection",
     "spec_matches_traits",
     "ref_compatible_with_spec",
@@ -79,19 +75,6 @@ class SelectedKernel:
         return f"SelectedKernel(name={self.name!r})"
 
 
-class SelectionObjective(Enum):
-    """Objectives are a closed enum — they directly control scoring logic,
-    so an unknown value would silently fall through with no effect.
-    """
-
-    DEFAULT = "default"  # Balanced heuristic (priority-weighted)
-    LATENCY = "latency"  # Minimize per-call latency
-    THROUGHPUT = "throughput"  # Maximize tokens/second for large batches
-    PORTABILITY = "portability"  # Prefer solutions that work across vendors (Triton)
-    DETERMINISM = "determinism"  # Prefer bit-reproducible implementations
-    DEBUG = "debug"  # Prefer readable implementations (reference, Triton)
-
-
 class SelectionStrategy(Enum):
     HEURISTIC = "heuristic"  # Score-based ranking (default, instant)
     AUTOTUNE = "autotune"  # Benchmark candidates, pick fastest
@@ -101,21 +84,20 @@ class SelectionStrategy(Enum):
 class ScoreBreakdown:
     """Per-kernel scoring breakdown across all dimensions.
 
-    Ranking is lexicographic on ``(oracle, objective, priority)`` — the oracle's
-    per-family knowledge wins first, then objective alignment, with the kernel's
-    declared priority band as the final tiebreaker.
+    Ranking is lexicographic on ``(oracle, priority)`` — the oracle's
+    per-family knowledge wins first, with the kernel's declared priority band
+    as the tiebreaker.
     """
 
     priority: int  # [0, 20) — from KernelSpec.priority
-    objective: int  # 0 or 1 — 1 if the kernel matches the requested objective
     oracle: int  # [0, 20) — per-family oracle adjustment
 
-    def sort_key(self) -> tuple[int, int, int]:
+    def sort_key(self) -> tuple[int, int]:
         """Lex sort key (descending — higher is better)."""
-        return (self.oracle, self.objective, self.priority)
+        return (self.oracle, self.priority)
 
     def __str__(self) -> str:
-        return f"ora={self.oracle} obj={self.objective} pri={self.priority}"
+        return f"ora={self.oracle} pri={self.priority}"
 
 
 class SelectionOracle:
@@ -161,19 +143,9 @@ class SelectionPolicy:
         return self.op_strategies.get((family, mode), self.default_strategy)
 
 
-@dataclass
-class _ConfigOverrideEntry:
-    """A single override entry parsed from overrides.yaml."""
-
-    name: str | None = None  # Exact kernel name
-    solution: str | None = None  # Solution backend to match
-    objective: str | None = None  # SelectionObjective value string
-
-
 _policy = SelectionPolicy()
 _oracles: dict[str, SelectionOracle] = {}
 _global_overrides: dict[tuple[str, str], str] = {}
-_config_overrides: dict[tuple[str, str], _ConfigOverrideEntry] | None = None
 
 
 def set_selection_policy(policy: SelectionPolicy) -> None:
@@ -192,130 +164,11 @@ def _get_oracle(family: str) -> SelectionOracle | None:
     return _oracles.get(family)
 
 
-def _parse_overrides(
-    raw: dict,
-) -> dict[tuple[str, str], _ConfigOverrideEntry]:
-    """Parse the ``overrides`` section of the YAML config.
-
-    Accepted formats::
-
-        overrides:
-          attention.decode:
-            solution: flashinfer
-          gemm.mm:
-            name: gluon_gemm_mm_fp8
-          moe.experts:
-            objective: determinism
-          norm.rmsnorm: triton_rmsnorm   # shorthand: treated as kernel name
-    """
-    result: dict[tuple[str, str], _ConfigOverrideEntry] = {}
-    if not isinstance(raw, dict):
-        return result
-
-    for op_key, entry in raw.items():
-        parts = str(op_key).split(".", 1)
-        if len(parts) != 2:
-            logger.warning("Invalid override key '%s' (expected 'family.mode')", op_key)
-            continue
-        family, mode = parts
-
-        if isinstance(entry, str):
-            result[(family, mode)] = _ConfigOverrideEntry(name=entry)
-        elif isinstance(entry, dict):
-            name = entry.get("name")
-            solution = entry.get("solution")
-            objective = entry.get("objective")
-            result[(family, mode)] = _ConfigOverrideEntry(
-                name=str(name) if name else None,
-                solution=str(solution) if solution else None,
-                objective=str(objective) if objective else None,
-            )
-        else:
-            logger.warning("Invalid override value for '%s': %r", op_key, entry)
-
-    return result
-
-
-def load_config_overrides(path: str | os.PathLike[str] | None = None) -> None:
-    """Load kernel overrides from a YAML config file.
-
-    Args:
-        path: Path to the YAML file.  If *None*, uses the
-            ``TOKENSPEED_KERNEL_OVERRIDES_FILE`` env var or falls back to
-            ``~/.config/tokenspeed-kernel/overrides.yaml``.
-    """
-    global _config_overrides
-
-    if path is None:
-        env_path = os.environ.get("TOKENSPEED_KERNEL_OVERRIDES_FILE")
-        if env_path:
-            path = Path(env_path)
-        else:
-            path = Path("~/.config/tokenspeed-kernel/overrides.yaml").expanduser()
-    else:
-        path = Path(path)
-
-    _config_overrides = {}
-
-    if not path.exists():
-        return
-
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except ImportError:
-        logger.warning(
-            "PyYAML not installed; cannot load overrides from %s. "
-            "Install with: pip install pyyaml",
-            path,
-        )
-        return
-
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f)
-    except Exception:
-        logger.warning("Failed to load overrides from %s", path, exc_info=True)
-        return
-
-    if not isinstance(data, dict):
-        return
-
-    _config_overrides = _parse_overrides(data.get("overrides", {}))
-
-    if _config_overrides:
-        logger.debug(
-            "Loaded %d config override(s) from %s",
-            len(_config_overrides),
-            path,
-        )
-        KernelRegistry.get().clear_cache()
-
-
-def clear_config_overrides() -> None:
-    """Clear loaded config overrides.
-
-    After this call no config-file overrides are active.  Call
-    :func:`load_config_overrides` again to reload from a file.
-    """
-    global _config_overrides
-    _config_overrides = {}
-
-
-def _get_config_override(family: str, mode: str) -> _ConfigOverrideEntry | None:
-    """Return the config-file override for *(family, mode)*, lazily loading
-    from the default path on first access."""
-    global _config_overrides
-    if _config_overrides is None:
-        load_config_overrides()
-    return _config_overrides.get((family, mode))  # type: ignore[union-attr]
-
-
 def _make_cache_key(
     family: str,
     mode: str,
     format_signature: FormatSignature,
     arch: str,
-    objective: SelectionObjective,
     features: frozenset[str] | None,
     traits: dict[str, Any] | None,
     solution: str | None = None,
@@ -328,7 +181,6 @@ def _make_cache_key(
         mode,
         format_signature,
         arch,
-        objective,
         mods_key,
         traits_key,
         solution,
@@ -338,25 +190,6 @@ def _make_cache_key(
 def _score_priority(spec: KernelSpec) -> int:
     """Priority dimension: kernel's inherent quality/maturity."""
     return max(0, min(19, spec.priority))
-
-
-_OBJECTIVE_TAG: dict[SelectionObjective, str] = {
-    SelectionObjective.LATENCY: "latency",
-    SelectionObjective.THROUGHPUT: "throughput",
-    SelectionObjective.PORTABILITY: "portability",
-    SelectionObjective.DETERMINISM: "determinism",
-    SelectionObjective.DEBUG: "determinism",
-}
-
-
-def _score_objective(spec: KernelSpec, objective: SelectionObjective) -> int:
-    """Objective dimension: 1 if the kernel declares the matching tag, else 0.
-
-    DEFAULT returns 0 so every kernel ties on this dimension and ranking
-    falls through to oracle/priority.
-    """
-    tag = _OBJECTIVE_TAG.get(objective)
-    return 1 if tag is not None and tag in spec.tags else 0
 
 
 def _score_oracle(
@@ -374,31 +207,28 @@ def _score_oracle(
 
 def _score(
     spec: KernelSpec,
-    objective: SelectionObjective,
     platform: PlatformInfo,
     traits: dict[str, Any] | None,
 ) -> ScoreBreakdown:
     """Score a kernel across all ranking dimensions."""
     return ScoreBreakdown(
         priority=_score_priority(spec),
-        objective=_score_objective(spec, objective),
         oracle=_score_oracle(spec, platform, traits),
     )
 
 
-def _rank_by_objective(
+def _rank(
     specs: list[KernelSpec],
-    objective: SelectionObjective,
     platform: PlatformInfo,
     traits: dict[str, Any] | None,
 ) -> list[tuple[KernelSpec, ScoreBreakdown]]:
-    """Rank kernels lexicographically by (oracle, objective, priority).
+    """Rank kernels lexicographically by (oracle, priority).
 
     Higher is better. Oracle wins first because per-family oracles encode the
-    most domain knowledge; objective alignment breaks ties next; the kernel's
-    declared priority band is the final tiebreaker.
+    most domain knowledge; the kernel's declared priority band is the
+    tiebreaker.
     """
-    scored = [(spec, _score(spec, objective, platform, traits)) for spec in specs]
+    scored = [(spec, _score(spec, platform, traits)) for spec in specs]
     scored.sort(key=lambda x: x[1].sort_key(), reverse=True)
     return scored
 
@@ -409,16 +239,30 @@ def _trait_value_matches(spec_values: frozenset[Any], trait_value: Any) -> bool:
     return trait_value.issubset(spec_values)
 
 
-def _ispp_satisfies_alignment(spec: KernelSpec, ispp: Any) -> bool:
-    alignments = spec.traits.get("ispp_alignment")
-    if alignments is None:
-        return True
+# MoE size traits a kernel may constrain either exactly (``<name>`` lists the
+# accepted sizes) or by divisibility (``<name>_alignment`` lists accepted
+# multiples). ``ispp`` is the intermediate size per partition; ``hidden`` the
+# MoE input width. Both are geometry a kernel's weight layout may reject, so
+# they must veto selection rather than fail later in weight preprocessing.
+_ALIGNED_SIZE_TRAITS = {
+    "ispp": "ispp_alignment",
+    "hidden": "hidden_alignment",
+}
+
+
+def _size_satisfies_alignment(spec: KernelSpec, name: str, size: Any) -> bool:
     try:
-        ispp_value = int(ispp)
+        size_value = int(size)
     except (TypeError, ValueError):
         return False
+    exact_sizes = spec.traits.get(name)
+    if exact_sizes is not None and size_value not in exact_sizes:
+        return False
+    alignments = spec.traits.get(_ALIGNED_SIZE_TRAITS[name])
+    if alignments is None:
+        return True
     return any(
-        int(alignment) > 0 and ispp_value % int(alignment) == 0
+        int(alignment) > 0 and size_value % int(alignment) == 0
         for alignment in alignments
     )
 
@@ -439,14 +283,16 @@ def spec_matches_traits(
             the spec are ignored. When ``True`` (reference compatibility checks),
             every requested trait must be explicitly present on the spec.
     """
+    # Size traits (see _ALIGNED_SIZE_TRAITS) match against the kernel's
+    # declared exact sizes and supported alignments (if any), so a MoE kernel
+    # whose weight layout cannot take the layer's geometry is never selected.
+    # A kernel pinned to exact sizes needs the request to state the size.
+    for size_name in _ALIGNED_SIZE_TRAITS:
+        if size_name in spec.traits and size_name not in traits:
+            return False
     for trait_name, trait_value in traits.items():
-        # ispp stands for "intermediate size per partition" and has special
-        # alignment requirements that depend on the kernel's declared
-        # supported alignments (if any). It is used in some MoE ops to ensure
-        # the intermediate buffer sizes are compatible with the kernel's
-        # requirements.
-        if trait_name == "ispp":
-            if not _ispp_satisfies_alignment(spec, trait_value):
+        if trait_name in _ALIGNED_SIZE_TRAITS:
+            if not _size_satisfies_alignment(spec, trait_name, trait_value):
                 return False
             continue
 
@@ -477,23 +323,69 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
     return True
 
 
-def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
-    """Return whether a spec's alignment traits match a concrete shape."""
-    alignment_traits: dict[str, tuple[str, int]] = {
-        "n_align_16": ("N", 16),
-        "n_align_64": ("N", 64),
-        "n_align_128": ("N", 128),
-        "k_align_16": ("K", 16),
-        "k_align_64": ("K", 64),
-        "k_align_128": ("K", 128),
-    }
-    for trait_name, (dim_name, alignment) in alignment_traits.items():
-        values = spec.traits.get(trait_name)
-        if values is None or True not in values:
-            continue
+# GEMM problem-shape dimensions. Their exact value sets are enforced here as
+# well as by ``spec_matches_traits`` so that shape-only callers (numerics,
+# benchmarks) see the full envelope, and a spec that constrains one of them
+# rejects a request that omits it.
+_SHAPE_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
 
-        dim = shape.get(dim_name)
-        if isinstance(dim, int) and dim % alignment != 0:
+# Suffixes that turn a dimension trait ``<dim>`` into a bound on a spec.
+_BOUND_SUFFIXES: tuple[tuple[str, Callable[[int, int], bool]], ...] = (
+    ("_align", lambda value, alignment: value % alignment == 0),
+    ("_min", lambda value, minimum: value >= minimum),
+)
+
+
+def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
+    """Return whether a spec's problem-shape traits accept the requested shape.
+
+    A request describes its shape with integer traits such as ``m``, ``k`` or
+    ``batch_size``. For any such dimension ``<dim>`` a spec may declare:
+
+    * ``<dim>``: the exact supported values.
+    * ``<dim>_align``: the value must be a multiple of one declared alignment.
+    * ``<dim>_min``: the value must reach one declared minimum.
+
+    Rules those cannot express go in ``mnk_problem_filter``, a set of
+    ``(m, n, k) -> bool`` predicates of which at least one must accept.
+
+    A declared bound is a hard requirement: a spec that declares
+    ``<dim>_align`` or ``<dim>_min`` rejects any request that does not supply
+    ``<dim>``, and a ``mnk_problem_filter`` rejects a request missing any of
+    ``m``, ``n`` or ``k``. Exact sets are matched by value membership; for the
+    GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that is also enforced
+    here and a spec constraining one of them rejects a request that omits it.
+    Dimensions a spec does not constrain are ignored.
+
+    By convention a trait dict lists the shape traits first, each ``_align``
+    and ``_min`` bound right after the dimension it bounds and
+    ``mnk_problem_filter`` last, followed by the remaining traits in
+    alphabetical order.
+    """
+    for trait_name, bounds in spec.traits.items():
+        for suffix, satisfies in _BOUND_SUFFIXES:
+            if not trait_name.endswith(suffix):
+                continue
+            value = traits.get(trait_name[: -len(suffix)])
+            if not isinstance(value, int):
+                return False
+            if not any(satisfies(value, bound) for bound in bounds):
+                return False
+
+    for dim in _SHAPE_DIMS:
+        exact = spec.traits.get(dim)
+        if exact is None:
+            continue
+        value = traits.get(dim)
+        if not isinstance(value, int) or value not in exact:
+            return False
+
+    problem_filters = spec.traits.get("mnk_problem_filter")
+    if problem_filters is not None:
+        m, n, k = traits.get("m"), traits.get("n"), traits.get("k")
+        if not all(isinstance(dim, int) for dim in (m, n, k)):
+            return False
+        if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
             return False
 
     return True
@@ -504,7 +396,11 @@ def _filter_by_traits(
     traits: dict[str, Any],
 ) -> list[KernelSpec]:
     """Filter kernels by op-specific trait compatibility."""
-    return [spec for spec in specs if spec_matches_traits(spec, traits)]
+    return [
+        spec
+        for spec in specs
+        if spec_matches_traits(spec, traits) and spec_matches_shape_traits(spec, traits)
+    ]
 
 
 def _resolve_override(
@@ -538,7 +434,6 @@ def _log_selection(
     winner: KernelSpec,
     scored: list[tuple[KernelSpec, ScoreBreakdown]],
     platform: PlatformInfo,
-    objective: SelectionObjective,
 ) -> None:
     """Log selection result if verbose mode is enabled."""
     if not os.environ.get("TOKENSPEED_KERNEL_VERBOSE"):
@@ -547,22 +442,13 @@ def _log_selection(
     breakdown = next((s for spec, s in scored if spec.name == winner.name), None)
     if breakdown:
         logger.info(
-            "[tokenspeed_kernel] %s.%s(%s) -> %s (%s, %s)",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            breakdown,
-            platform.arch,
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({breakdown!s}, {platform.arch!s})",
         )
     else:
         logger.info(
-            "[tokenspeed_kernel] %s.%s(%s) -> %s (%s)",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            platform.arch,
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({platform.arch!s})",
         )
 
 
@@ -573,15 +459,13 @@ def select_kernel(
     *,
     features: frozenset[str] | None = None,
     platform: PlatformInfo | None = None,
-    objective: SelectionObjective = SelectionObjective.DEFAULT,
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
     override: str | None = None,
-    expected_kernel_name: str | None = None,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
-    On first call for a given (family, mode, format_signature, platform, objective, traits,
+    On first call for a given (family, mode, format_signature, platform, traits,
     solution) combination, runs the full selection pipeline. Subsequent calls
     with the same arguments return the cached result — a single dict lookup.
 
@@ -591,15 +475,11 @@ def select_kernel(
         format_signature: Role-indexed tensor format signature
         features: Required operator features (e.g., {"paged"})
         platform: Hardware to match (auto-detected if None)
-        objective: Selection objective (see SelectionObjective enum)
         traits: Op-specific trait values that affect kernel applicability
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
             normal platform, format signature, and trait filtering.
         override: Force a specific kernel name or solution string
-        expected_kernel_name: Debug-only hint. When set, a warning is
-            logged if the selected kernel differs from this name. The
-            selected kernel is still used regardless of the mismatch.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -607,33 +487,12 @@ def select_kernel(
     """
     platform = platform or current_platform()
 
-    # --- Override resolution (lowest → highest priority) ---
-
-    # 1. Config file (lowest priority)
-    config_entry = _get_config_override(family, mode)
-    if config_entry is not None:
-        if override is None and solution is None:
-            if config_entry.name:
-                override = config_entry.name
-            elif config_entry.solution:
-                solution = config_entry.solution
-        if config_entry.objective and objective == SelectionObjective.DEFAULT:
-            try:
-                objective = SelectionObjective(config_entry.objective)
-            except ValueError:
-                logger.warning(
-                    "Invalid objective '%s' in overrides config for %s.%s",
-                    config_entry.objective,
-                    family,
-                    mode,
-                )
-
-    # 2. Context-manager global overrides
+    # Context-manager global overrides
     global_override = _global_overrides.get((family, mode))
     if global_override:
         override = global_override
 
-    # 3. Environment variable
+    # Environment variables take precedence over context-manager overrides.
     env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
     env_override = os.environ.get(env_key)
     if env_override:
@@ -646,7 +505,6 @@ def select_kernel(
         mode,
         format_signature,
         platform.arch,
-        objective,
         features,
         traits,
         solution,
@@ -701,22 +559,10 @@ def select_kernel(
             _policy.autotune_params,
         )
     else:
-        scored = _rank_by_objective(candidates, objective, platform, traits)
+        scored = _rank(candidates, platform, traits)
         winner = scored[0][0]
 
-    _log_selection(family, mode, format_signature, winner, scored, platform, objective)
-
-    if expected_kernel_name and winner.name != expected_kernel_name:
-        logger.warning(
-            "[tokenspeed_kernel] select_kernel(%s.%s, %s) chose '%s' but "
-            "expected '%s'. Score breakdown — selected: %s",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            expected_kernel_name,
-            next((s for sp, s in scored if sp.name == winner.name), "N/A"),
-        )
+    _log_selection(family, mode, format_signature, winner, scored, platform)
 
     impl = registry.get_impl(winner.name)
     result = SelectedKernel(name=winner.name, impl=impl)
@@ -738,15 +584,11 @@ def _autotune_select(
     Falls back to heuristic ranking when the autotuning infrastructure
     (input generators, benchmark runner) is not yet available.
     """
-    scored = _rank_by_objective(
-        candidates, SelectionObjective.DEFAULT, platform, traits
-    )
+    scored = _rank(candidates, platform, traits)
     winner = scored[0][0]
     logger.debug(
-        "[tokenspeed_kernel:autotune] falling back to heuristic for %s.%s(%s)",
-        family,
-        mode,
-        format_signature,
+        f"[tokenspeed_kernel:autotune] falling back to heuristic for {family!s}."
+        f"{mode!s}({format_signature!s})",
     )
     return winner, scored
 
@@ -775,7 +617,6 @@ def explain_selection(
     *,
     features: frozenset[str] | None = None,
     platform: PlatformInfo | None = None,
-    objective: SelectionObjective = SelectionObjective.DEFAULT,
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
 ) -> str:
@@ -785,14 +626,13 @@ def explain_selection(
 
         Op: attention.decode (bfloat16)
         Platform: NVIDIA H100 (sm_90)
-        Objective: default
-        Ranking: lex (oracle, objective, priority); higher wins
+        Ranking: lex (oracle, priority); higher wins
 
         Candidates (3 matched, 5 registered):
           1. flashinfer_decode  [SELECTED]
-             ora=16 obj=1 pri=14
+             ora=16 pri=14
           2. triton_decode
-             ora=10 obj=0 pri=10
+             ora=10 pri=10
 
         Filtered out:
           - aiter_decode: vendor mismatch (requires amd)
@@ -813,7 +653,7 @@ def explain_selection(
     if traits:
         candidates = _filter_by_traits(candidates, traits)
 
-    scored = _rank_by_objective(candidates, objective, platform, traits)
+    scored = _rank(candidates, platform, traits)
 
     filtered_names = {s.name for s in candidates}
     filtered_out = [s for s in all_specs if s.name not in filtered_names]
@@ -822,8 +662,7 @@ def explain_selection(
         f"Op: {family}.{mode} ({format_signature})",
         f"Platform: {platform.device_name} ({platform.arch})",
         f"Solution: {solution or 'any'}",
-        f"Objective: {objective.value}",
-        "Ranking: lex (oracle, objective, priority); higher wins",
+        "Ranking: lex (oracle, priority); higher wins",
         "",
         f"Candidates ({len(scored)} matched, {len(all_specs)} registered):",
     ]
@@ -904,8 +743,6 @@ def warmup_selection(
             select_kernel(family, mode, format_signature, traits=traits)
         except NoKernelFoundError:
             logger.debug(
-                "[tokenspeed_kernel] warmup: no kernel for %s.%s(%s)",
-                family,
-                mode,
-                format_signature,
+                f"[tokenspeed_kernel] warmup: no kernel for {family!s}.{mode!s}("
+                f"{format_signature!s})",
             )

@@ -29,33 +29,33 @@ import threading
 import pytest
 import torch
 
-import tokenspeed.runtime.pd.epd.encode_loop as encode_loop
+import tokenspeed.runtime.epd.encode_loop as encode_loop
 from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
+from tokenspeed.runtime.epd.encode_executor import (
+    DisaggEncodeExecutor,
+    assign_encoded_embeddings,
+)
+from tokenspeed.runtime.epd.encode_loop import (
+    _embedding_cache_bytes,
+    _make_embedding_cache,
+)
+from tokenspeed.runtime.epd.encode_scheduler import (
+    EncodeScheduler,
+    PendingEncodeItem,
+)
+from tokenspeed.runtime.epd.encode_worker import (
+    EncodeRequest,
+    EncodeWorker,
+)
+from tokenspeed.runtime.multimodal.embedder import EncoderSpec
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
 )
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.epd.encode_executor import (
-    DisaggEncodeExecutor,
-    assign_encoded_embeddings,
-)
-from tokenspeed.runtime.pd.epd.encode_loop import (
-    _embedding_cache_bytes,
-    _make_embedding_cache,
-    _maybe_install_encoder_cudagraph,
-)
-from tokenspeed.runtime.pd.epd.encode_scheduler import (
-    EncodeScheduler,
-    PendingEncodeItem,
-)
-from tokenspeed.runtime.pd.epd.encode_worker import (
-    EncodeRequest,
-    EncodeWorker,
-)
 
 
 class _FakeExecutor:
@@ -74,6 +74,9 @@ class _FakeExecutor:
 
     def send_item(self, rid, item):
         self.sent_direct.append(item.hash)
+
+    def reap_concluded_senders(self, _pending_request_ids):
+        pass
 
     def drain_deferred(self):
         pass
@@ -96,7 +99,13 @@ def _worker(max_tokens=10_000, max_items=99, cap_bytes=10**6):
 
 
 def _req(rid, items, room=0):
-    return EncodeRequest(rid, "h", 1, room, items)
+    return EncodeRequest(
+        request_id=rid,
+        bootstrap_host="h",
+        bootstrap_port=1,
+        bootstrap_room=room,
+        items=items,
+    )
 
 
 def test_miss_runs_tower_and_caches():
@@ -167,6 +176,9 @@ class _RaisingExecutor:
         raise self._exc
 
     def send_item(self, rid, item):
+        pass
+
+    def reap_concluded_senders(self, _pending_request_ids):
         pass
 
     def drain_deferred(self):
@@ -403,15 +415,22 @@ class _FeatureFnModel:
 
     def __init__(self):
         # In a real model image_encoder defaults to get_image_feature and is
-        # swapped to the cudagraph wrapper by _maybe_install_encoder_cudagraph;
+        # swapped to the cudagraph wrapper during multimodal runtime preparation;
         # use a distinct sentinel so the test proves IMAGE routes via the seam.
         self.image_encoder = lambda items: "via-image_encoder-seam"
+        self.video_encoder = lambda items: "via-video_encoder-seam"
         self.get_image_feature = lambda items: "eager-get_image_feature"
-        self.get_video_feature = lambda items: "video"
+        self.get_video_feature = lambda items: "eager-get_video_feature"
+
+    def get_multimodal_encoder_specs(self):
+        return {
+            Modality.IMAGE: EncoderSpec(self.image_encoder),
+            Modality.VIDEO: EncoderSpec(self.video_encoder),
+        }
 
 
 def test_feature_fn_image_routes_through_image_encoder_seam():
-    from tokenspeed.runtime.pd.epd.encode_executor import (
+    from tokenspeed.runtime.epd.encode_executor import (
         DisaggEncodeExecutor,
     )
 
@@ -421,8 +440,8 @@ def test_feature_fn_image_routes_through_image_encoder_seam():
     # get_image_feature directly -- else the captured graph would be bypassed.
     assert exe._feature_fn(Modality.IMAGE) is model.image_encoder
     assert exe._feature_fn(Modality.IMAGE) is not model.get_image_feature
-    # VIDEO has no captured graph and stays on the eager entry point.
-    assert exe._feature_fn(Modality.VIDEO) is model.get_video_feature
+    assert exe._feature_fn(Modality.VIDEO) is model.video_encoder
+    assert exe._feature_fn(Modality.VIDEO) is not model.get_video_feature
 
 
 def _sched_item(rid: str, idx: int, cost: int) -> PendingEncodeItem:
@@ -499,50 +518,3 @@ def test_make_cache_l2_enabled_is_tiered_with_caps_and_device():
     assert cache.l1.capacity_bytes == (4 << 30)
     assert cache.l2.capacity_bytes == (8 << 30)
     assert cache._device == "cuda:0"
-
-
-# --------------------------------------------------------------------------- #
-# _maybe_install_encoder_cudagraph (gate parity with the aggregated ModelExecutor
-# install; the actual capture is GPU-only and validated at e2e)
-# --------------------------------------------------------------------------- #
-_WRAPPER = object()  # stands in for the EncoderCudaGraphWrapper
-
-
-class _FakeModel:
-    """Minimal multimodal model surface the install gate touches."""
-
-    def __init__(self, *, multimodal=True):
-        self.is_multimodal_active = multimodal
-        self.mapping = object()
-        # The model leaves image_encoder == get_image_feature by default; the
-        # wrapper install overrides it.
-        self.image_encoder = self.get_image_feature
-        self.built_with = None
-
-    def get_image_feature(self, items):
-        return "eager"
-
-    def make_encoder_cudagraph_wrapper(self, mapping):
-        self.built_with = mapping
-        return _WRAPPER
-
-
-class _FakeServerArgs:
-    def __init__(self, backend="trtllm_ragged"):
-        self.mm_attention_backend = backend
-
-
-def _set_graph_flag(monkeypatch, value):
-    monkeypatch.setattr(
-        encode_loop.envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH,
-        "get",
-        lambda: value,
-    )
-
-
-def test_encoder_cudagraph_installed_when_enabled(monkeypatch):
-    _set_graph_flag(monkeypatch, True)
-    m = _FakeModel()
-    assert _maybe_install_encoder_cudagraph(m, _FakeServerArgs()) is True
-    assert m.image_encoder is _WRAPPER
-    assert m.built_with is m.mapping

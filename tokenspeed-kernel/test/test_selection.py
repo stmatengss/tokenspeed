@@ -32,22 +32,16 @@ from tokenspeed_kernel.selection import (
     AutotuneParams,
     NoKernelFoundError,
     ScoreBreakdown,
-    SelectionObjective,
     SelectionOracle,
     SelectionPolicy,
     SelectionStrategy,
     _filter_by_traits,
-    _get_config_override,
     _make_cache_key,
-    _parse_overrides,
-    _rank_by_objective,
+    _rank,
     _score,
-    _score_objective,
     _score_priority,
-    clear_config_overrides,
     explain_selection,
     kernel_override,
-    load_config_overrides,
     register_oracle,
     select_kernel,
     set_selection_policy,
@@ -77,24 +71,14 @@ GEMM_FP16 = next(iter(format_signatures(("a", "b"), "dense", {torch.float16})))
 INPUT_BF16 = next(iter(format_signatures("input", "dense", {torch.bfloat16})))
 
 
-class TestSelectionObjective:
-    def test_all_enum_values(self):
-        assert SelectionObjective.DEFAULT.value == "default"
-        assert SelectionObjective.LATENCY.value == "latency"
-        assert SelectionObjective.THROUGHPUT.value == "throughput"
-        assert SelectionObjective.PORTABILITY.value == "portability"
-        assert SelectionObjective.DETERMINISM.value == "determinism"
-        assert SelectionObjective.DEBUG.value == "debug"
-
-
 class TestScoreBreakdown:
     def test_str_format(self):
-        bd = ScoreBreakdown(priority=10, objective=12, oracle=14)
-        assert str(bd) == "ora=14 obj=12 pri=10"
+        bd = ScoreBreakdown(priority=10, oracle=14)
+        assert str(bd) == "ora=14 pri=10"
 
     def test_sort_key(self):
-        bd = ScoreBreakdown(priority=10, objective=12, oracle=14)
-        assert bd.sort_key() == (14, 12, 10)
+        bd = ScoreBreakdown(priority=10, oracle=14)
+        assert bd.sort_key() == (14, 10)
 
 
 class TestAutotuneParams:
@@ -132,58 +116,6 @@ class TestScorePriority:
         assert _score_priority(spec) == 19
 
 
-class TestScoreObjective:
-    def _spec(self, solution="triton", tags=frozenset()):
-        return KernelSpec(name="k", family="f", mode="m", solution=solution, tags=tags)
-
-    def test_default_ties_everyone(self):
-        assert _score_objective(self._spec(), SelectionObjective.DEFAULT) == 0
-        assert (
-            _score_objective(
-                self._spec(tags=frozenset({"latency"})),
-                SelectionObjective.DEFAULT,
-            )
-            == 0
-        )
-
-    def test_latency_tag_match(self):
-        spec = self._spec(tags=frozenset({"latency"}))
-        assert _score_objective(spec, SelectionObjective.LATENCY) == 1
-
-    def test_latency_no_match(self):
-        spec = self._spec(tags=frozenset({"throughput"}))
-        assert _score_objective(spec, SelectionObjective.LATENCY) == 0
-
-    def test_throughput_tag_match(self):
-        spec = self._spec(tags=frozenset({"throughput"}))
-        assert _score_objective(spec, SelectionObjective.THROUGHPUT) == 1
-
-    def test_throughput_no_match(self):
-        assert _score_objective(self._spec(), SelectionObjective.THROUGHPUT) == 0
-
-    def test_portability_tag_match(self):
-        spec = self._spec(tags=frozenset({"portability"}))
-        assert _score_objective(spec, SelectionObjective.PORTABILITY) == 1
-
-    def test_portability_no_match(self):
-        assert (
-            _score_objective(
-                self._spec(solution="triton"), SelectionObjective.PORTABILITY
-            )
-            == 0
-        )
-
-    def test_determinism_tag_match(self):
-        spec = self._spec(tags=frozenset({"determinism"}))
-        assert _score_objective(spec, SelectionObjective.DETERMINISM) == 1
-
-    def test_debug_uses_determinism_tag(self):
-        det = self._spec(tags=frozenset({"determinism"}))
-        plain = self._spec()
-        assert _score_objective(det, SelectionObjective.DEBUG) == 1
-        assert _score_objective(plain, SelectionObjective.DEBUG) == 0
-
-
 class TestScore:
     def test_score_returns_per_dimension_breakdown(self, h100_platform):
         spec = KernelSpec(
@@ -192,11 +124,9 @@ class TestScore:
             mode="m",
             solution="cutlass",
             priority=15,
-            tags=frozenset({"latency"}),
         )
-        bd = _score(spec, SelectionObjective.LATENCY, h100_platform, None)
+        bd = _score(spec, h100_platform, None)
         assert bd.priority == 15
-        assert bd.objective == 1  # latency tag matches
         assert bd.oracle == 10  # neutral, no oracle registered
 
 
@@ -211,30 +141,17 @@ class TestRanking:
             platform=h100_platform,
             format_signature=ATTN_DECODE_BF16,
         )
-        scored = _rank_by_objective(
-            candidates,
-            SelectionObjective.DEFAULT,
-            h100_platform,
-            None,
-        )
+        scored = _rank(candidates, h100_platform, None)
         keys = [bd.sort_key() for _, bd in scored]
         assert keys == sorted(keys, reverse=True)
 
-    def test_oracle_outranks_objective_and_priority(self, h100_platform):
+    def test_oracle_outranks_priority(self, h100_platform):
         oracle_winner = KernelSpec(
             name="oracle_winner",
             family="f",
             mode="m",
             solution="reference",
             priority=0,
-        )
-        objective_winner = KernelSpec(
-            name="objective_winner",
-            family="f",
-            mode="m",
-            solution="triton",
-            priority=0,
-            tags=frozenset({"latency"}),
         )
         priority_winner = KernelSpec(
             name="priority_winner",
@@ -250,28 +167,14 @@ class TestRanking:
 
         register_oracle("f", BoostOracleWinner())
 
-        scored = _rank_by_objective(
-            [priority_winner, objective_winner, oracle_winner],
-            SelectionObjective.LATENCY,
-            h100_platform,
-            None,
-        )
-        assert [s.name for s, _ in scored] == [
-            "oracle_winner",
-            "objective_winner",
-            "priority_winner",
-        ]
+        scored = _rank([priority_winner, oracle_winner], h100_platform, None)
+        assert [s.name for s, _ in scored] == ["oracle_winner", "priority_winner"]
 
     def test_priority_breaks_ties(self, h100_platform):
         low = KernelSpec(name="low", family="f", mode="m", priority=5)
         high = KernelSpec(name="high", family="f", mode="m", priority=15)
 
-        scored = _rank_by_objective(
-            [low, high],
-            SelectionObjective.DEFAULT,
-            h100_platform,
-            None,
-        )
+        scored = _rank([low, high], h100_platform, None)
         assert [s.name for s, _ in scored] == ["high", "low"]
 
 
@@ -379,41 +282,220 @@ class TestSpecMatchesTraits:
             require_all_traits=True,
         )
 
-
-class TestSpecMatchesShapeTraits:
-    def test_required_alignment_trait_matches(self):
+    def test_exact_ispp_requires_and_matches_requested_size(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"n_align_16": frozenset({True})},
+            traits={"ispp": frozenset({384}), "ispp_alignment": frozenset({128})},
         )
 
-        assert spec_matches_shape_traits(spec, {"N": 32})
-        assert not spec_matches_shape_traits(spec, {"N": 30})
+        assert not spec_matches_traits(spec, {})
+        assert spec_matches_traits(spec, {"ispp": 384})
+        assert not spec_matches_traits(spec, {"ispp": 512})
 
-    def test_missing_shape_dim_is_ignored(self):
+    def test_hidden_alignment_vetoes_misaligned_widths(self):
+        # Same contract as ispp_alignment, for the MoE input width: a kernel
+        # whose weight layout needs hidden % 128 == 0 drops out of selection
+        # for other widths instead of failing in weight preprocessing.
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"k_align_128": frozenset({True})},
+            traits={"hidden_alignment": frozenset({128})},
+        )
+
+        assert spec_matches_traits(spec, {"hidden": 5120})
+        assert not spec_matches_traits(spec, {"hidden": 2880})
+        # Without a declared constraint the width is unconstrained; without a
+        # requested width an alignment-only kernel stays eligible.
+        assert spec_matches_traits(spec, {})
+        plain = KernelSpec(name="p", family="f", mode="m", traits={})
+        assert spec_matches_traits(plain, {"hidden": 2880})
+
+
+class TestSpecMatchesShapeTraits:
+    def test_exact_dimension_traits_match(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "batch": frozenset({12, 16}),
+                "m": frozenset({1}),
+                "n": frozenset({512}),
+                "k": frozenset({128}),
+            },
+        )
+
+        assert spec_matches_shape_traits(
+            spec, {"batch": 12, "m": 1, "n": 512, "k": 128}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch": 8, "m": 1, "n": 512, "k": 128}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch": 12, "m": 2, "n": 512, "k": 128}
+        )
+
+    def test_alignment_trait_accepts_any_declared_alignment(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"n_align": frozenset({16}), "k_align": frozenset({64, 96})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"n": 32, "k": 128})
+        assert spec_matches_shape_traits(spec, {"n": 32, "k": 96})
+        assert not spec_matches_shape_traits(spec, {"n": 30, "k": 128})
+        assert not spec_matches_shape_traits(spec, {"n": 32, "k": 80})
+
+    def test_minimum_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"n_min": frozenset({128}), "k_min": frozenset({128})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"n": 128, "k": 4096})
+        assert not spec_matches_shape_traits(spec, {"n": 64, "k": 4096})
+        assert not spec_matches_shape_traits(spec, {"n": 128, "k": 96})
+
+    def test_constrained_dim_must_be_supplied(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "m": frozenset({1}),
+                "k_align": frozenset({128}),
+                "k_min": frozenset({128}),
+            },
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 4096})
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 4096, "n": 30})
+        assert not spec_matches_shape_traits(spec, {})
+        assert not spec_matches_shape_traits(spec, {"m": 1})
+        assert not spec_matches_shape_traits(spec, {"k": 4096})
+        assert not spec_matches_shape_traits(spec, {"m": 1, "k": None})
+
+    def test_unconstrained_dim_is_ignored(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"m": frozenset({1})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 1})
+        assert spec_matches_shape_traits(spec, {"m": 1, "n": 30, "k": 70})
+
+    def test_bounds_apply_to_any_request_dimension(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "batch_size_align": frozenset({64}),
+                "num_q_heads_min": frozenset({16}),
+            },
+        )
+
+        assert spec_matches_shape_traits(spec, {"batch_size": 128, "num_q_heads": 64})
+        assert not spec_matches_shape_traits(
+            spec, {"batch_size": 96, "num_q_heads": 64}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch_size": 128, "num_q_heads": 12}
+        )
+        assert not spec_matches_shape_traits(spec, {"batch_size": 128})
+        assert not spec_matches_shape_traits(spec, {"num_q_heads": 64})
+
+    def test_exact_non_gemm_dimension_is_left_to_value_matching(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"batch_size": frozenset({1})},
         )
 
         assert spec_matches_shape_traits(spec, {})
+        assert spec_matches_shape_traits(spec, {"batch_size": 2})
+        assert not spec_matches_traits(spec, {"batch_size": 2})
+        assert not _filter_by_traits([spec], {"batch_size": 2})
 
-    def test_required_k64_alignment_trait_matches(self):
+    def test_uppercase_shape_keys_are_not_traits(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"k_align_64": frozenset({True})},
+            traits={"m": frozenset({1}), "k_align": frozenset({128})},
         )
 
-        assert spec_matches_shape_traits(spec, {"K": 128})
-        assert not spec_matches_shape_traits(spec, {"K": 96})
+        assert not spec_matches_shape_traits(spec, {"M": 1, "K": 128})
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 128})
 
-    def test_non_alignment_traits_do_not_affect_shape_matching(self):
+    def test_mnk_problem_filter_matches_concrete_shape(self):
+        def is_tuned_problem(m: int, n: int, k: int) -> bool:
+            return (
+                m % 256 == 0
+                and n % 256 == 0
+                and k >= 512
+                and k % 256 == 0
+                and (m >= 1024 or (n >= 4096 and k <= 1280))
+            )
+
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"mnk_problem_filter": frozenset({is_tuned_problem})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 1024, "n": 1792, "k": 5120})
+        assert spec_matches_shape_traits(spec, {"m": 256, "n": 4096, "k": 1280})
+        assert not spec_matches_shape_traits(spec, {"m": 256, "n": 1792, "k": 5120})
+        assert not spec_matches_shape_traits(spec, {"m": 1024, "n": 1664, "k": 5120})
+        assert not spec_matches_shape_traits(spec, {"m": 1024, "n": 1792, "k": 256})
+        assert _filter_by_traits([spec], {"m": 1024, "n": 1792, "k": 5120}) == [spec]
+        assert not _filter_by_traits([spec], {"m": 256, "n": 1792, "k": 5120})
+
+    def test_mnk_problem_filter_requires_complete_shape(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"mnk_problem_filter": frozenset({lambda m, n, k: True})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 256, "n": 4096, "k": 1280})
+        assert not spec_matches_shape_traits(spec, {"m": 256, "n": 4096})
+        assert not spec_matches_shape_traits(spec, {})
+
+    def test_filter_by_traits_applies_shape_and_value_traits(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "m": frozenset({1}),
+                "n_min": frozenset({128}),
+                "k_align": frozenset({128}),
+                "out_dtype": frozenset({"bf16"}),
+            },
+        )
+        request = {"m": 1, "n": 256, "k": 4096, "out_dtype": "bf16"}
+
+        assert _filter_by_traits([spec], request) == [spec]
+        assert not _filter_by_traits([spec], {**request, "m": 2})
+        assert not _filter_by_traits([spec], {**request, "n": 64})
+        assert not _filter_by_traits([spec], {**request, "k": 4000})
+        assert not _filter_by_traits([spec], {**request, "out_dtype": "fp16"})
+
+    def test_non_shape_traits_do_not_affect_shape_matching(self):
         spec = KernelSpec(
             name="k",
             family="f",
@@ -421,7 +503,7 @@ class TestSpecMatchesShapeTraits:
             traits={"persistent": frozenset({True})},
         )
 
-        assert spec_matches_shape_traits(spec, {"N": 30, "K": 70})
+        assert spec_matches_shape_traits(spec, {"n": 30, "k": 70})
 
 
 class TestMakeCacheKey:
@@ -431,7 +513,6 @@ class TestMakeCacheKey:
             "dec",
             INPUT_BF16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
         )
@@ -440,32 +521,10 @@ class TestMakeCacheKey:
             "dec",
             INPUT_BF16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
         )
         assert k1 == k2
-
-    def test_different_objective(self):
-        k1 = _make_cache_key(
-            "attn",
-            "dec",
-            INPUT_BF16,
-            "sm_90",
-            SelectionObjective.DEFAULT,
-            None,
-            None,
-        )
-        k2 = _make_cache_key(
-            "attn",
-            "dec",
-            INPUT_BF16,
-            "sm_90",
-            SelectionObjective.LATENCY,
-            None,
-            None,
-        )
-        assert k1 != k2
 
     def test_traits_order_independent(self):
         k1 = _make_cache_key(
@@ -473,7 +532,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             {"a": 1, "b": 2},
         )
@@ -482,7 +540,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             {"b": 2, "a": 1},
         )
@@ -491,12 +548,8 @@ class TestMakeCacheKey:
     def test_features_order_independent(self):
         f1 = frozenset({"paged", "mla"})
         f2 = frozenset({"mla", "paged"})
-        k1 = _make_cache_key(
-            "a", "d", GEMM_FP16, "sm_90", SelectionObjective.DEFAULT, f1, None
-        )
-        k2 = _make_cache_key(
-            "a", "d", GEMM_FP16, "sm_90", SelectionObjective.DEFAULT, f2, None
-        )
+        k1 = _make_cache_key("a", "d", GEMM_FP16, "sm_90", f1, None)
+        k2 = _make_cache_key("a", "d", GEMM_FP16, "sm_90", f2, None)
         assert k1 == k2
 
     def test_solution_is_selection_relevant(self):
@@ -505,7 +558,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
             "fa3",
@@ -515,7 +567,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
             "fa4",
@@ -766,46 +817,7 @@ class TestSelectKernel:
             )
             assert impl() == "reference_decode"
 
-    def test_portability_objective_prefers_triton(self, sample_specs, h100_platform):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=h100_platform,
-            objective=SelectionObjective.PORTABILITY,
-        )
-        assert impl() == "triton_decode"
-
-    def test_debug_objective_prefers_reference(self, sample_specs, h100_platform):
-        """DEBUG ranks the determinism-tagged reference kernel above others."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=h100_platform,
-            objective=SelectionObjective.DEBUG,
-        )
-        assert impl() == "reference_decode"
-
-    def test_amd_platform_selects_aiter(self, sample_specs, mi300_platform):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=mi300_platform,
-        )
-        assert impl() == "aiter_decode"
-
-    def test_amd_mi350_platform_selects_aiter(self, sample_specs, mi350_platform):
+    def test_amd_platform_selects_aiter(self, sample_specs, mi350_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
@@ -1009,339 +1021,6 @@ class TestAutotuneStrategy:
         assert callable(impl)
 
 
-class TestParseOverrides:
-    """Unit tests for _parse_overrides (YAML dict → _ConfigOverrideEntry)."""
-
-    def test_name_override(self):
-        raw = {"gemm.mm": {"name": "gluon_gemm_mm_fp8"}}
-        result = _parse_overrides(raw)
-        assert ("gemm", "mm") in result
-        entry = result[("gemm", "mm")]
-        assert entry.name == "gluon_gemm_mm_fp8"
-        assert entry.solution is None
-        assert entry.objective is None
-
-    def test_solution_override(self):
-        raw = {"attention.decode": {"solution": "flashinfer"}}
-        result = _parse_overrides(raw)
-        entry = result[("attention", "decode")]
-        assert entry.name is None
-        assert entry.solution == "flashinfer"
-
-    def test_objective_override(self):
-        raw = {"moe.experts": {"objective": "determinism"}}
-        result = _parse_overrides(raw)
-        entry = result[("moe", "experts")]
-        assert entry.name is None
-        assert entry.solution is None
-        assert entry.objective == "determinism"
-
-    def test_both_name_and_solution(self):
-        raw = {"gemm.mm": {"name": "exact_name", "solution": "triton"}}
-        result = _parse_overrides(raw)
-        entry = result[("gemm", "mm")]
-        assert entry.name == "exact_name"
-        assert entry.solution == "triton"
-
-    def test_shorthand_string_value(self):
-        raw = {"norm.rmsnorm": "triton_rmsnorm"}
-        result = _parse_overrides(raw)
-        entry = result[("norm", "rmsnorm")]
-        assert entry.name == "triton_rmsnorm"
-        assert entry.solution is None
-
-    def test_combined_solution_and_objective(self):
-        raw = {"attention.decode": {"solution": "flashinfer", "objective": "latency"}}
-        result = _parse_overrides(raw)
-        entry = result[("attention", "decode")]
-        assert entry.solution == "flashinfer"
-        assert entry.objective == "latency"
-
-    def test_invalid_key_without_dot(self):
-        raw = {"attention_decode": {"name": "foo"}}
-        result = _parse_overrides(raw)
-        assert len(result) == 0
-
-    def test_non_dict_input_returns_empty(self):
-        assert _parse_overrides("not a dict") == {}
-        assert _parse_overrides(42) == {}
-        assert _parse_overrides(None) == {}
-
-    def test_multiple_entries(self):
-        raw = {
-            "attention.decode": {"solution": "flashinfer"},
-            "gemm.mm": {"name": "cutlass_gemm"},
-            "moe.fused": {"objective": "throughput"},
-        }
-        result = _parse_overrides(raw)
-        assert len(result) == 3
-
-
-class TestLoadConfigOverrides:
-    """Tests for load_config_overrides / clear_config_overrides."""
-
-    def test_load_from_file(self, tmp_path):
-        yaml_content = (
-            "overrides:\n"
-            "  attention.decode:\n"
-            "    solution: flashinfer\n"
-            "  gemm.mm:\n"
-            "    name: cutlass_gemm\n"
-        )
-        config_file = tmp_path / "overrides.yaml"
-        config_file.write_text(yaml_content)
-
-        load_config_overrides(config_file)
-
-        entry = _get_config_override("attention", "decode")
-        assert entry is not None
-        assert entry.solution == "flashinfer"
-        entry2 = _get_config_override("gemm", "mm")
-        assert entry2 is not None
-        assert entry2.name == "cutlass_gemm"
-
-    def test_load_nonexistent_file(self, tmp_path):
-        load_config_overrides(tmp_path / "does_not_exist.yaml")
-        assert _get_config_override("attention", "decode") is None
-
-    def test_load_invalid_yaml(self, tmp_path):
-        config_file = tmp_path / "bad.yaml"
-        config_file.write_text(": : : not valid yaml [[[")
-
-        load_config_overrides(config_file)
-        assert _get_config_override("attention", "decode") is None
-
-    def test_load_empty_file(self, tmp_path):
-        config_file = tmp_path / "empty.yaml"
-        config_file.write_text("")
-
-        load_config_overrides(config_file)
-        assert _get_config_override("attention", "decode") is None
-
-    def test_load_no_overrides_section(self, tmp_path):
-        config_file = tmp_path / "no_overrides.yaml"
-        config_file.write_text("some_other_key: value\n")
-
-        load_config_overrides(config_file)
-        assert _get_config_override("attention", "decode") is None
-
-    def test_clear_config_overrides(self, tmp_path):
-        yaml_content = (
-            "overrides:\n" "  attention.decode:\n" "    solution: flashinfer\n"
-        )
-        config_file = tmp_path / "overrides.yaml"
-        config_file.write_text(yaml_content)
-
-        load_config_overrides(config_file)
-        assert _get_config_override("attention", "decode") is not None
-
-        clear_config_overrides()
-        assert _get_config_override("attention", "decode") is None
-
-    def test_env_var_overrides_file_path(self, tmp_path):
-        yaml_content = "overrides:\n" "  gemm.mm:\n" "    name: custom_gemm\n"
-        config_file = tmp_path / "custom_overrides.yaml"
-        config_file.write_text(yaml_content)
-
-        with mock.patch.dict(
-            os.environ,
-            {"TOKENSPEED_KERNEL_OVERRIDES_FILE": str(config_file)},
-        ):
-            load_config_overrides()
-
-        entry = _get_config_override("gemm", "mm")
-        assert entry is not None
-        assert entry.name == "custom_gemm"
-
-
-class TestConfigOverrideIntegration:
-    """Integration tests: config overrides affect select_kernel()."""
-
-    def _write_overrides(self, tmp_path, yaml_text):
-        config_file = tmp_path / "overrides.yaml"
-        config_file.write_text(yaml_text)
-        load_config_overrides(config_file)
-
-    def test_config_override_by_name(self, sample_specs, h100_platform, tmp_path):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    name: reference_decode\n",
-        )
-
-        impl = select_kernel(
-            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-        )
-        assert impl() == "reference_decode"
-
-    def test_config_override_by_solution(self, sample_specs, h100_platform, tmp_path):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    solution: triton\n",
-        )
-
-        impl = select_kernel(
-            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-        )
-        assert impl() == "triton_decode"
-
-    def test_config_override_objective(self, sample_specs, h100_platform, tmp_path):
-        """Config objective override changes selection without forcing a kernel."""
-        set_selection_policy(SelectionPolicy())
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    objective: debug\n",
-        )
-
-        impl = select_kernel(
-            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-        )
-        assert impl() == "reference_decode"
-
-    def test_api_override_takes_priority_over_config(
-        self, sample_specs, h100_platform, tmp_path
-    ):
-        """Runtime API override= param has higher priority than config file."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    name: reference_decode\n",
-        )
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=h100_platform,
-            override="triton_decode",
-        )
-        assert impl() == "triton_decode"
-
-    def test_env_var_override_takes_priority_over_config(
-        self, sample_specs, h100_platform, tmp_path
-    ):
-        """Env var override has higher priority than config file."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    name: reference_decode\n",
-        )
-
-        with mock.patch.dict(
-            os.environ,
-            {"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE": "triton_decode"},
-        ):
-            impl = select_kernel(
-                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-            )
-            assert impl() == "triton_decode"
-
-    def test_context_manager_override_takes_priority_over_config(
-        self, sample_specs, h100_platform, tmp_path
-    ):
-        """kernel_override() context manager has higher priority than config."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    name: reference_decode\n",
-        )
-
-        with kernel_override("attention", "decode", "triton_decode"):
-            impl = select_kernel(
-                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-            )
-            assert impl() == "triton_decode"
-
-    def test_explicit_objective_takes_priority_over_config(
-        self, sample_specs, h100_platform, tmp_path
-    ):
-        """Caller-supplied non-DEFAULT objective beats config objective."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    objective: debug\n",
-        )
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=h100_platform,
-            objective=SelectionObjective.PORTABILITY,
-        )
-        assert impl() == "triton_decode"
-
-    def test_config_override_not_found_raises(
-        self, sample_specs, h100_platform, tmp_path
-    ):
-        """Config pointing to nonexistent kernel raises NoKernelFoundError."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    name: nonexistent_kernel\n",
-        )
-
-        with pytest.raises(NoKernelFoundError, match="Override"):
-            select_kernel(
-                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-            )
-
-    def test_config_with_invalid_objective_falls_back(
-        self, sample_specs, h100_platform, tmp_path
-    ):
-        """Invalid objective string in config is warned and ignored."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n"
-            "  attention.decode:\n"
-            "    objective: nonexistent_objective\n",
-        )
-
-        impl = select_kernel(
-            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-        )
-        assert callable(impl)
-
-    def test_unrelated_ops_unaffected(self, sample_specs, h100_platform, tmp_path):
-        """Config override for one op doesn't affect other ops."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        self._write_overrides(
-            tmp_path,
-            "overrides:\n" "  attention.decode:\n" "    name: reference_decode\n",
-        )
-
-        attn_impl = select_kernel(
-            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
-        )
-        assert attn_impl() == "reference_decode"
-
-        gemm_impl = select_kernel("gemm", "mm", GEMM_BF16, platform=h100_platform)
-        assert gemm_impl() != "reference_decode"
-
-
 class TestGemmDispatchProfiling:
     @staticmethod
     def _make_gemm_kernel(name: str, call_log: list[str]):
@@ -1354,6 +1033,7 @@ class TestGemmDispatchProfiling:
             *,
             alpha: torch.Tensor | None = None,
             block_size: list[int] | None = None,
+            out: torch.Tensor | None = None,
         ) -> torch.Tensor:
             _ = A_scales, B_scales, alpha, block_size
             call_log.append(name)
@@ -1428,6 +1108,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]
@@ -1465,6 +1146,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]

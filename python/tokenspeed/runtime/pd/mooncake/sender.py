@@ -20,12 +20,12 @@
 
 import time
 
-import numpy as np
-import numpy.typing as npt
-
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.cache_protocol import (
+    CachePDBlockManifest,
+    CachePDLayerwiseBlockSelection,
+)
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
-from tokenspeed.runtime.pd.utils import PageTransferMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -41,117 +41,77 @@ class MooncakeKVSender:
         self.kv_mgr = mgr
         self.bootstrap_server_url = bootstrap_addr
         self.bootstrap_room = bootstrap_room
-        self.kv_mgr.update_status(bootstrap_room, TransferPoll.Bootstrapping)
+        self.kv_mgr.begin_room(bootstrap_room)
         logger.info(
-            "[MooncakeKVSender.__init__] bootstrap_room=%s bootstrap_addr=%s status=Bootstrapping",
-            bootstrap_room,
-            bootstrap_addr,
+            f"[MooncakeKVSender.__init__] bootstrap_room={bootstrap_room!s} "
+            f"bootstrap_addr={bootstrap_addr!s} status=Bootstrapping",
         )
 
         # inner state
-        self.init_time = None
+        self.init_time = time.time()
         self.conclude_state = None
-        self.curr_idx = 0
-        self._layerwise_transfer_started = False
+        self._layerwise_chunk_submitted = False
+        self._layerwise_final_chunk_submitted = False
 
-    def has_layerwise_transfer(self) -> bool:
-        return self._layerwise_transfer_started
+    def layerwise_chunk_submitted(self) -> bool:
+        return self._layerwise_chunk_submitted
+
+    def layerwise_final_chunk_submitted(self) -> bool:
+        return self._layerwise_final_chunk_submitted
 
     def send(
         self,
-        kv_indices: npt.NDArray[np.int64],
-        aux_index,
         is_last,
-        mla_l1_5_args: PageTransferMetadata | None = None,
         bootstrap_token: int = -1,
         spec_candidate_ids: list[int] | None = None,
-        mamba_indices: npt.NDArray[np.int64] | None = None,
+        block_manifest: CachePDBlockManifest | None = None,
     ):
-        """
-        Send the kv cache at the given kv indices to the decoder server
-        mla_l1_5_args: optional (page_transfer_mask, page_local_indices)
-            page_transfer_mask: boolean mask to select decode pages that will receive data from this prefill rank
-            page_local_indices: remapped local page indices that this prefill rank will send
-        bootstrap_token: first output token produced by prefill (shipped via ZMQ status msg).
-        """
-        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        self.curr_idx += len(kv_indices)
+        """Submit one final, manifest-backed CachePD transfer."""
+        if not is_last:
+            raise ValueError("CachePD full-manifest transfer must be final")
 
         logger.info(
-            "[MooncakeKVSender.send] bootstrap_room=%s kv_indices_len=%d is_last=%s curr_idx=%d bootstrap_token=%s",
-            self.bootstrap_room,
-            len(kv_indices),
-            is_last,
-            self.curr_idx,
-            bootstrap_token,
+            f"[MooncakeKVSender.send] bootstrap_room={self.bootstrap_room!s} is_last="
+            f"{is_last!s} bootstrap_token={bootstrap_token!s}",
         )
 
-        if not is_last:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                False,
-                mla_l1_5_args=mla_l1_5_args,
-                mamba_indices=mamba_indices,
-            )
-        else:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                True,
-                aux_index=aux_index,
-                mla_l1_5_args=mla_l1_5_args,
-                bootstrap_token=bootstrap_token,
-                spec_candidate_ids=spec_candidate_ids,
-                mamba_indices=mamba_indices,
-            )
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            True,
+            bootstrap_token=bootstrap_token,
+            spec_candidate_ids=spec_candidate_ids,
+            block_manifest=block_manifest,
+        )
 
     def send_layerwise(
         self,
-        kv_indices: npt.NDArray[np.int64],
-        index_slice: slice,
-        aux_index,
         is_last,
         begin_cache_step: int,
         layerwise_interval: int,
-        mla_l1_5_args: PageTransferMetadata | None = None,
         bootstrap_token: int = -1,
         wait_for_bootstrap_token: bool = False,
         spec_candidate_ids: list[int] | None = None,
-        mamba_indices: npt.NDArray[np.int64] | None = None,
+        cache_block_selection: CachePDLayerwiseBlockSelection | None = None,
     ):
-        self._layerwise_transfer_started = True
-        self.curr_idx = max(self.curr_idx, index_slice.stop)
-
-        if len(kv_indices) == 0 and not is_last:
-            return
+        self._layerwise_chunk_submitted = True
+        self._layerwise_final_chunk_submitted = (
+            self._layerwise_final_chunk_submitted or is_last
+        )
 
         logger.info(
-            "[MooncakeKVSender.send_layerwise] bootstrap_room=%s kv_indices_len=%d "
-            "slice=(%s,%s) is_last=%s begin_cache_step=%s interval=%s",
-            self.bootstrap_room,
-            len(kv_indices),
-            index_slice.start,
-            index_slice.stop,
-            is_last,
-            begin_cache_step,
-            layerwise_interval,
+            f"[MooncakeKVSender.send_layerwise] bootstrap_room={self.bootstrap_room!s} "
+            f"is_last={is_last!s} begin_cache_step={begin_cache_step!s} interval="
+            f"{layerwise_interval!s}",
         )
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
-            kv_indices,
-            index_slice,
             is_last,
-            aux_index=aux_index if is_last else None,
-            mla_l1_5_args=mla_l1_5_args,
             bootstrap_token=bootstrap_token,
             begin_cache_step=begin_cache_step,
             layerwise_interval=layerwise_interval,
             wait_for_bootstrap_token=wait_for_bootstrap_token,
             spec_candidate_ids=spec_candidate_ids,
-            mamba_indices=mamba_indices,
+            cache_block_selection=cache_block_selection,
         )
 
     def poll(self) -> TransferPoll:
@@ -166,7 +126,7 @@ class MooncakeKVSender:
                     if elapsed >= self.kv_mgr.bootstrap_time_out:
                         logger.warning_once(
                             "Some requests timed out when bootstrapping, "
-                            "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
+                            "which means prefill instances fail to receive the cache manifest from the decode instance of this request. "
                             "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
                         self.kv_mgr.record_failure(
@@ -181,20 +141,20 @@ class MooncakeKVSender:
             return self.conclude_state
 
     def clear(self) -> None:
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = TransferPoll.Failed
 
-        self.clear()
-
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
+            failure_reason = self.kv_mgr.failure_records.get(
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
             )
+        self.clear()
         raise KVTransferError(
             self.bootstrap_room, failure_reason, self.bootstrap_server_url
         )

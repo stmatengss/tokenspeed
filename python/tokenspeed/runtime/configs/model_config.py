@@ -24,7 +24,7 @@ import copy
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, auto
 
@@ -32,7 +32,13 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.model_profile import ModelProfile
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DEEPSEEK_V4_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.plugins import ensure_loaded
+from tokenspeed.runtime.plugins.registry import resolve_model_profile
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import (
@@ -42,13 +48,27 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     resolve_architecture,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    BLOCK_SPEC_ALGORITHMS,
+    read_checkpoint_block_size,
+    resolve_block_widths,
+    validate_block_widths,
+)
 
 logger = get_colorful_logger(__name__)
 
 _DEEPSEEK_V4_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMDSpark",
         "DeepseekV4ForCausalLMNextN",
+    }
+)
+_QWEN4_EXP_ARCHITECTURES = frozenset(
+    {
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMNextN",
     }
 )
 _MLA_ARCHITECTURES = frozenset(
@@ -58,12 +78,28 @@ _MLA_ARCHITECTURES = frozenset(
         "Eagle3DeepseekV2ForCausalLM",
         "LongcatFlashForCausalLM",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3ForConditionalGenerationNextN",
+        # The K3 DSpark draft is MLA-native (DeepSeek-V3 layout, RoPE + YaRN),
+        # so it must resolve to the MLA family rather than defaulting to MHA.
+        "K3DSparkModel",
     }
 )
 _DSA_ARCHITECTURES = frozenset(
     {
         "GlmMoeDsaForCausalLM",
         "GlmMoeDsaForCausalLMNextN",
+        # DeepSeek-V3.2: V3 MLA/MoE backbone + DSA sparse indexer. Same
+        # attention family and indexer geometry as GLM-DSA.
+        "DeepseekV32ForCausalLM",
+        "DeepseekV32ForCausalLMNextN",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
+    }
+)
+_MSA_ARCHITECTURES = frozenset(
+    {
+        "MiniMaxM3SparseForConditionalGeneration",
     }
 )
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
@@ -77,6 +113,7 @@ class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
     DSA = auto()
+    MSA = auto()
 
 
 @dataclass(frozen=True)
@@ -85,8 +122,7 @@ class _AttentionFamilySpec:
     architectures: frozenset[str]
     configure: Callable[[object], None]
     default_backend: str | None = None
-    supports_target_verify_forward_mode: bool = False
-    default_block_size: int | None = None
+    default_prefix_granularity: int | None = None
 
 
 def override_model_config(model_config, ext_yaml):
@@ -103,11 +139,18 @@ def override_model_config(model_config, ext_yaml):
             else:
                 new_v = v
             model_config.__setattr__(k, new_v)
-            logger.info("Override model config: %s=%r", k, new_v)
+            logger.info(f"Override model config: {k!s}={new_v!r}")
 
 
 def is_deepseek_v4(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
+
+
+def is_qwen4_exp(config: PretrainedConfig) -> bool:
+    return (
+        getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
+        or resolve_architecture(config) in _QWEN4_EXP_ARCHITECTURES
+    )
 
 
 def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
@@ -134,7 +177,21 @@ def configure_deepseek_v4_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_glm_attention(model_config) -> None:
+def configure_deepseek_v41_attention(model_config) -> None:
+    """V4.1 latent dimensions; YaRN changes RoPE, not the attention scale."""
+    hf = model_config.hf_text_config
+    model_config.head_dim = hf.head_dim
+    model_config.attention_arch = AttentionArch.MLA
+    model_config.kv_lora_rank = hf.head_dim
+    model_config.qk_rope_head_dim = hf.qk_rope_head_dim
+    model_config.qk_nope_head_dim = hf.head_dim - hf.qk_rope_head_dim
+    model_config.v_head_dim = hf.head_dim
+    model_config.index_head_dim = hf.index_head_dim
+    model_config.scaling = hf.head_dim**-0.5
+
+
+def configure_dsa_attention(model_config) -> None:
+    """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2)."""
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -154,7 +211,7 @@ def configure_glm_attention(model_config) -> None:
     ]
     if missing_fields:
         raise ValueError(
-            "GLM attention config is missing required fields: "
+            "DSA attention config is missing required fields: "
             + ", ".join(missing_fields)
         )
 
@@ -171,6 +228,7 @@ def configure_glm_attention(model_config) -> None:
     model_config.index_topk = mla_config.index_topk
     model_config.index_head_dim = mla_config.index_head_dim
     model_config.index_n_heads = mla_config.index_n_heads
+    model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
 
     model_config.scaling = 1 / math.sqrt(
@@ -208,25 +266,44 @@ def configure_mla_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_minimax_m3_attention(model_config) -> None:
+    model_config.attention_arch = AttentionArch.MSA
+
+
 _ATTENTION_FAMILY_SPECS = (
+    _AttentionFamilySpec(
+        name="DeepSeek V4.1",
+        architectures=frozenset(
+            {"DeepseekV41ForCausalLM", "DeepseekV41ForCausalLMDSpark"}
+        ),
+        configure=configure_deepseek_v41_attention,
+        default_backend="deepseek_v41",
+        default_prefix_granularity=256,
+    ),
     _AttentionFamilySpec(
         name="DeepSeek V4",
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
         configure=configure_deepseek_v4_attention,
-        supports_target_verify_forward_mode=True,
-        default_block_size=256,
+        # V4 kernels need P to be a multiple of their fixed page; default to
+        # exactly one page rather than restating the number.
+        default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
     ),
     _AttentionFamilySpec(
         name="GLM",
         architectures=_DSA_ARCHITECTURES,
-        configure=configure_glm_attention,
+        configure=configure_dsa_attention,
         default_backend="dsa",
-        supports_target_verify_forward_mode=True,
     ),
     _AttentionFamilySpec(
         name="MLA",
         architectures=_MLA_ARCHITECTURES,
         configure=configure_mla_attention,
+    ),
+    _AttentionFamilySpec(
+        name="MiniMax MSA",
+        architectures=_MSA_ARCHITECTURES,
+        configure=configure_minimax_m3_attention,
+        default_prefix_granularity=128,
     ),
 )
 
@@ -253,29 +330,97 @@ def _resolve_attention_family(
     return None
 
 
-def _apply_attention_family_defaults(
+def _is_dflash2_mla(
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> bool:
+    architectures = _model_architectures(hf_config, hf_text_config)
+    dflash_config = getattr(hf_text_config, "dflash_config", None) or getattr(
+        hf_config, "dflash_config", None
+    )
+    return (
+        "DFlash2DraftModel" in architectures
+        and isinstance(dflash_config, dict)
+        and dflash_config.get("attention_mode") == "mla"
+    )
+
+
+def _apply_block_spec_widths(
     server_args: ServerArgs,
-    spec: _AttentionFamilySpec,
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> int | None:
+    """Reconcile the block-drafter launch widths with the draft checkpoint.
+
+    Args:
+        server_args: Server args whose speculative widths are checked, or set
+            when they were left at their defaults.
+        hf_config: The draft checkpoint's config.
+        hf_text_config: Its text config, searched first.
+
+    Returns:
+        The checkpoint's block size, or None when it declares none.
+    """
+    algorithm = getattr(server_args, "speculative_algorithm", None)
+    if algorithm not in BLOCK_SPEC_ALGORITHMS:
+        return None
+    block_size = read_checkpoint_block_size(hf_text_config, hf_config)
+    if block_size is None:
+        return None
+    if getattr(server_args, "_speculative_widths_explicit", True):
+        validate_block_widths(
+            algorithm,
+            block_size,
+            server_args.speculative_num_steps,
+            server_args.speculative_num_draft_tokens,
+        )
+    num_steps, num_draft_tokens = resolve_block_widths(algorithm, block_size)
+    server_args.speculative_num_steps = num_steps
+    server_args.speculative_num_draft_tokens = num_draft_tokens
+    return block_size
+
+
+def _apply_attention_defaults(
+    server_args: ServerArgs,
+    *,
+    name: str,
+    default_backend: str | None,
+    default_prefix_granularity: int | None,
+    is_draft_worker: bool,
 ) -> None:
-    if spec.default_block_size is not None:
-        block_size_default = ServerArgs.__dataclass_fields__["block_size"].default
-        if server_args.block_size == block_size_default:
+    """Fill launch arguments the user left at their defaults."""
+    if default_prefix_granularity is not None:
+        granularity_default = ServerArgs.__dataclass_fields__[
+            "prefix_granularity"
+        ].default
+        if server_args.prefix_granularity == granularity_default:
             logger.info(
-                "%s default block_size=%d; pass --block-size with a value other "
-                "than %d to keep that value.",
-                spec.name,
-                spec.default_block_size,
-                block_size_default,
+                f"{name!s} default prefix_granularity="
+                f"{default_prefix_granularity:d}; pass --prefix-granularity "
+                f"with a value other than {granularity_default:d} to keep that value.",
             )
-            server_args.block_size = spec.default_block_size
-    if spec.default_backend is not None and server_args.attention_backend is None:
-        server_args.attention_backend = spec.default_backend
+            server_args.prefix_granularity = default_prefix_granularity
+    if default_backend is None:
+        return
+    # A draft model's default belongs to the drafter's backend selection;
+    # writing the target field would either be discarded (already set) or
+    # hijack the target's own default.
+    if is_draft_worker:
+        if server_args.drafter_attention_backend is None:
+            server_args.drafter_attention_backend = default_backend
+    elif server_args.attention_backend is None:
+        server_args.attention_backend = default_backend
 
 
 def _derive_num_attention_layers(
     hf_config: PretrainedConfig,
     num_hidden_layers: int,
+    model_profile: ModelProfile | None = None,
 ) -> int:
+    # A registered model declares its own attention-instance count; the
+    # architecture-name tables below stay as the in-tree seed.
+    if model_profile is not None:
+        return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
     if is_deepseek_v4_nextn(hf_config):
@@ -299,6 +444,17 @@ class ModelConfig:
         is_draft_worker: bool | None = False,
         server_args: ServerArgs = None,
     ) -> None:
+        # Plugins may register the architecture, its config class and its
+        # profile; every resolution below must see them.
+        ensure_loaded()
+        if server_args is not None and server_args.speculative_algorithm is not None:
+            # Post-discovery replacement for the CLI choices= this flag no
+            # longer carries: plugins may have added algorithms.
+            from tokenspeed.runtime.execution.drafter import (
+                validate_drafter_algorithm,
+            )
+
+            validate_drafter_algorithm(server_args.speculative_algorithm)
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
@@ -316,6 +472,11 @@ class ModelConfig:
             revision=revision,
             model_override_args=self.model_override_args,
             is_draft_worker=is_draft_worker,
+            speculative_algorithm=(
+                getattr(server_args, "speculative_algorithm", None)
+                if is_draft_worker
+                else None
+            ),
             **kwargs,
         )
         self.hf_generation_config = get_generation_config(
@@ -326,6 +487,85 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        # A registered model states its own family facts; in-tree models
+        # without a profile still resolve through the architecture tables.
+        self.model_profile: ModelProfile | None = resolve_model_profile(
+            _model_architectures(self.hf_config, self.hf_text_config),
+            self.hf_config,
+        )
+        self.spec_block_size: int | None = None
+        if is_draft_worker:
+            self.spec_block_size = _apply_block_spec_widths(
+                server_args, self.hf_config, self.hf_text_config
+            )
+        self.dspark_prefix_replay_tokens: int | None = None
+        if (
+            is_draft_worker
+            and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
+            and resolve_architecture(self.hf_config)
+            in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
+        ):
+            from tokenspeed.runtime.models.deepseek_v4_dspark import (
+                DEFAULT_DSPARK_WINDOW_SIZE,
+                count_dspark_stages,
+            )
+
+            if self.spec_block_size is None:
+                raise ValueError(
+                    "DSPARK same-checkpoint decoding requires the checkpoint to "
+                    "declare dspark_block_size."
+                )
+            dspark_window_size = int(
+                getattr(
+                    self.hf_text_config,
+                    "dspark_window_size",
+                    DEFAULT_DSPARK_WINDOW_SIZE,
+                )
+            )
+            if dspark_window_size <= 0:
+                raise ValueError(
+                    "DSPARK captured-context window size must be positive; "
+                    f"got {dspark_window_size}."
+                )
+            # V4.1 keeps its windows in the SWA cache group, so a prefix hit
+            # already carries them; V4 rebuilds a drafter-private ring instead.
+            self.dspark_prefix_replay_tokens = (
+                0
+                if resolve_architecture(self.hf_config)
+                == "DeepseekV41ForCausalLMDSpark"
+                else dspark_window_size
+            )
+            dspark_num_stages = count_dspark_stages(
+                model_path,
+                revision=revision,
+            )
+            if dspark_num_stages is None:
+                raise ValueError(
+                    "DSPARK requires a safetensors index with mtp.<stage> weights."
+                )
+            self.hf_text_config.dspark_num_stages = dspark_num_stages
+            if self.hf_config is not self.hf_text_config:
+                self.hf_config.dspark_num_stages = dspark_num_stages
+        if (
+            is_draft_worker
+            and resolve_architecture(self.hf_config)
+            == "InklingForConditionalGenerationNextN"
+        ):
+            # The MTP head's depth blocks have their own local/full attention
+            # pattern (mtp_config.local_layer_ids) and only depths
+            # 0..steps-1 ever run; swap in the depth-specialized (and
+            # steps-pruned) text config so layer construction, attention
+            # metadata, and cache-group layout all derive from it.
+            from tokenspeed.runtime.configs.inkling_config import (
+                inkling_mtp_text_config,
+            )
+
+            self.hf_text_config = inkling_mtp_text_config(
+                self.hf_text_config,
+                num_steps=getattr(server_args, "speculative_num_steps", None),
+            )
+            if hasattr(self.hf_config, "text_config"):
+                self.hf_config.text_config = self.hf_text_config
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
@@ -348,6 +588,12 @@ class ModelConfig:
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
         self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        if (
+            not is_draft_worker
+            and getattr(server_args, "mm_encoder_tp_mode", "weights") == "data"
+        ):
+            if not self.is_multimodal_active:
+                raise ValueError("item-DP requires an active multimodal encoder")
         # Vision-only role (EPD encode): the inverse axis of language_model_only.
         # Build the vision tower (is_multimodal_active stays True) but SKIP LM
         # construction + LM weight load so a full ViT fits at encode TP=1.
@@ -385,9 +631,9 @@ class ModelConfig:
             and server_args.gpu_memory_utilization > 0.9
         ):
             logger.info(
-                "Clamping gpu_memory_utilization %.2f -> 0.9 to leave headroom "
+                "Clamping gpu_memory_utilization "
+                f"{server_args.gpu_memory_utilization:.2f} -> 0.9 to leave headroom "
                 "for the vision encoder.",
-                server_args.gpu_memory_utilization,
             )
             server_args.gpu_memory_utilization = 0.9
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
@@ -399,11 +645,11 @@ class ModelConfig:
             if context_length > derived_context_len:
                 if envs.TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get():
                     logger.warning(
-                        "User-specified context_length (%s) is greater than the derived "
-                        "context_length (%s). This may lead to incorrect model outputs or "
+                        f"User-specified context_length ({context_length!s}) is greater"
+                        " than the derived "
+                        f"context_length ({derived_context_len!s}). This may lead to "
+                        "incorrect model outputs or "
                         "CUDA errors.",
-                        context_length,
-                        derived_context_len,
                     )
                     self.context_len = context_length
                 else:
@@ -430,9 +676,28 @@ class ModelConfig:
             self.hf_config,
             self.hf_text_config,
         )
-        if attention_family is not None:
-            _apply_attention_family_defaults(server_args, attention_family)
+        if self.model_profile is not None:
+            _apply_attention_defaults(
+                server_args,
+                name=resolve_architecture(self.hf_config),
+                default_backend=self.model_profile.default_attention_backend,
+                default_prefix_granularity=(
+                    self.model_profile.default_prefix_granularity
+                ),
+                is_draft_worker=bool(is_draft_worker),
+            )
+            self.model_profile.configure_attention(self)
+        elif attention_family is not None:
+            _apply_attention_defaults(
+                server_args,
+                name=attention_family.name,
+                default_backend=attention_family.default_backend,
+                default_prefix_granularity=attention_family.default_prefix_granularity,
+                is_draft_worker=bool(is_draft_worker),
+            )
             attention_family.configure(self)
+        elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
+            configure_mla_attention(self)
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -440,13 +705,6 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
-
-        self.use_v4_mtp_paged_metadata = (
-            getattr(server_args, "speculative_algorithm", None) is not None
-            and not is_draft_worker
-            and attention_family is not None
-            and attention_family.supports_target_verify_forward_mode
-        )
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
@@ -468,10 +726,14 @@ class ModelConfig:
         self.num_attention_layers = _derive_num_attention_layers(
             self.hf_config,
             self.num_hidden_layers,
+            self.model_profile,
         )
         if is_draft_worker:
+            dspark_layers = getattr(self.hf_text_config, "dspark_num_stages", None)
             mtp_layers = getattr(self.hf_text_config, "mtp_num_hidden_layers", None)
-            if mtp_layers is not None:
+            if dspark_layers is not None:
+                self.num_attention_layers = int(dspark_layers)
+            elif mtp_layers is not None:
                 self.num_attention_layers = mtp_layers
             else:
                 nextn_layers = getattr(
@@ -490,6 +752,20 @@ class ModelConfig:
 
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
+
+    @property
+    def tokenizer_kwargs(self) -> Mapping[str, object]:
+        """Extra tokenizer keyword arguments the model's profile declares."""
+        if self.model_profile is None:
+            return {}
+        return self.model_profile.tokenizer_kwargs
+
+    @property
+    def requires_request_token_history(self) -> bool:
+        """Whether the model reads each request's committed token history."""
+        return (
+            self.model_profile is not None and self.model_profile.request_token_history
+        )
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
@@ -513,9 +789,8 @@ class ModelConfig:
                     )
                 except Exception as exc:
                     logger.debug(
-                        "Unable to resolve local quantization config for %s: %s",
-                        self.model_path,
-                        exc,
+                        "Unable to resolve local quantization config for "
+                        f"{self.model_path!s}: {exc!s}",
                     )
                     model_dir = None
             if model_dir is not None:
@@ -539,6 +814,7 @@ class ModelConfig:
             "fp8",
             "nvfp4",
             "mxfp4",
+            "modelopt_mixed",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",
@@ -589,10 +865,9 @@ class ModelConfig:
 
             if self.quantization not in optimized_quantization_methods:
                 logger.warning(
-                    "%s quantization is not fully "
+                    f"{self.quantization!s} quantization is not fully "
                     "optimized yet. The speed can be slower than "
                     "non-quantized models.",
-                    self.quantization,
                 )
 
     def get_hf_eos_token_id(self) -> set[int] | None:
@@ -690,13 +965,13 @@ def _get_and_verify_dtype(
     if torch_dtype != config_dtype:
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.
-            logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
+            logger.info(f"Upcasting {config_dtype!s} to {torch_dtype!s}.")
         elif config_dtype == torch.float32:
             # Downcasting from float32 to float16 or bfloat16 is allowed.
-            logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
+            logger.info(f"Downcasting {config_dtype!s} to {torch_dtype!s}.")
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
-            logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
+            logger.warning(f"Casting {config_dtype!s} to {torch_dtype!s}.")
 
     return torch_dtype
 
@@ -707,11 +982,17 @@ def is_generation_model(model_architectures: list[str]):
 
 def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
+        "DeepseekV41ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "Glm53FlashForConditionalGeneration",
+        "InklingForConditionalGeneration",
+        "MiniMaxM3SparseForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -726,6 +1007,7 @@ def is_image_gen_model(model_architectures: list[str]):
 
 def is_audio_model(model_architectures: list[str] | None):
     audio_architectures = {
+        "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
     }

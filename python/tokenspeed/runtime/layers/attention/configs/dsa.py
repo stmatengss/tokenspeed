@@ -21,13 +21,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -45,11 +46,25 @@ def dsa_index_k_row_bytes(index_head_dim: int) -> int:
     )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DSAConfig(MLAConfig):
+    is_dsa: ClassVar[bool] = True
     index_topk: int
     index_head_dim: int
     index_n_heads: int
+    index_kpool: int | None = None
+
+    @classmethod
+    def _spec_kwargs(
+        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+    ) -> dict:
+        return dict(
+            **super()._spec_kwargs(server_args, model_config, is_draft),
+            index_topk=model_config.index_topk,
+            index_head_dim=model_config.index_head_dim,
+            index_n_heads=model_config.index_n_heads,
+            index_kpool=getattr(model_config, "index_kpool", None),
+        )
 
     @classmethod
     def generate(
@@ -57,9 +72,9 @@ class DSAConfig(MLAConfig):
         server_args: ServerArgs,
         model_config: ModelConfig,
         is_draft: bool = False,
-    ):
-        base = MLAConfig.generate(server_args, model_config, is_draft)
-        if base.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    ) -> AttnConfig:
+        config = super().generate(server_args, model_config, is_draft)
+        if config.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             platform = current_platform()
             if not (platform.is_blackwell_plus or platform.is_cdna4_plus):
                 raise ValueError(
@@ -68,41 +83,10 @@ class DSAConfig(MLAConfig):
                     "auto or bfloat16 on this platform, got "
                     f"{server_args.kv_cache_dtype}."
                 )
-        return cls(
-            **base.__dict__,
-            index_topk=model_config.index_topk,
-            index_head_dim=model_config.index_head_dim,
-            index_n_heads=model_config.index_n_heads,
-        )
+        return config
 
-    def cache_cell_size(self) -> int:
+    def cache_cell_size(self, config: AttnConfig) -> int:
         index_k_cell_size = dsa_index_k_row_bytes(
             self.index_head_dim,
         )
-        return super().cache_cell_size() + index_k_cell_size
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
-
-        return DSATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            model_dtype=self.dtype,
-            quant_method=self.kv_cache_quant_method,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            index_head_dim=self.index_head_dim,
-        )
+        return super().cache_cell_size(config) + index_k_cell_size

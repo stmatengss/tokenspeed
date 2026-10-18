@@ -65,7 +65,6 @@ from tokenspeed.runtime.sampling.backends.triton import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -209,16 +208,12 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
                 f"vocab_size={vocab}, offending="
                 f"{[t for t in raw_ids if not 0 <= t < vocab]}"
             )
-            token_ids = torch.tensor(
-                raw_ids,
-                device=self._logit_bias.device,
-                dtype=torch.long,
+            token_ids = torch.tensor(raw_ids, dtype=torch.long, pin_memory=True).to(
+                self._logit_bias.device, non_blocking=True
             )
             bias_values = torch.tensor(
-                list(bias_map.values()),
-                device=self._logit_bias.device,
-                dtype=torch.bfloat16,
-            )
+                list(bias_map.values()), dtype=torch.bfloat16, pin_memory=True
+            ).to(self._logit_bias.device, non_blocking=True)
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:
@@ -538,12 +533,11 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             accept_token_num=accept_length,
             candidates=candidates.to(torch.int32),
             target_sampled=target_sampled,
-            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1
 
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        self.broadcast_verify_outputs()
 
         valid = accept_index >= 0
         safe_positions = accept_index.clamp(min=0).long()

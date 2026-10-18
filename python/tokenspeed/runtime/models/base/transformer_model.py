@@ -27,7 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import ForwardContext, TargetCaptureSink
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -71,6 +71,9 @@ class BaseTransformerModel(nn.Module):
         self.layers = self.resolve_layers(config, quant_config, prefix)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: list[int] = []
+        # DFLASH: each capture layer's positional tap index (the draft
+        # concatenates taps in this order); set_dflash_layers_to_capture().
+        self._dflash_capture_idx_map: dict[int, int] = {}
 
         self._compile_decoder_stack()
 
@@ -142,28 +145,39 @@ class BaseTransformerModel(nn.Module):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.ModuleList:
-
-        layer_cls = self.layer_cls
-        mapping = self.mapping
-
         return make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: layer_cls(
+            lambda idx, prefix: self.layer_cls(
                 config=config,
                 layer_id=idx,
-                mapping=mapping,
+                mapping=self.mapping,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
         )
 
+    def _notify_dflash_capture(
+        self,
+        sink: TargetCaptureSink,
+        layer_idx: int,
+        aux_hidden_states: list[torch.Tensor],
+    ) -> None:
+        """Hand the tap capture layer ``layer_idx`` just appended to the
+        forward's sink.
+
+        An idle forward skips the attention block, so nothing was appended.
+        """
+        capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+        if capture_idx is None or len(aux_hidden_states) != capture_idx + 1:
+            return
+        sink.on_target_capture(capture_idx, aux_hidden_states[capture_idx])
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
 
@@ -182,7 +196,7 @@ class BaseTransformerModel(nn.Module):
                 )
             elif isinstance(first_layer, BaseDecoderLayer):
                 fuse_embed_reduce = (
-                    self.mapping.attn.tp_size > 1
+                    self.embed_tokens.tp_size > 1
                     and first_layer.comm_manager.should_fuse(input_ids.shape[0])
                 )
             else:
@@ -197,17 +211,21 @@ class BaseTransformerModel(nn.Module):
 
         for i, layer in enumerate(self.layers):
 
+            capture = i in self.layers_to_capture
+
             with get_global_expert_distribution_recorder().with_current_layer(i):
 
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
                     ctx,
-                    out_cache_loc,
                     residual,
-                    aux_hidden_states=(
-                        aux_hidden_states if i in self.layers_to_capture else None
-                    ),
+                    aux_hidden_states=aux_hidden_states if capture else None,
+                )
+
+            if capture and ctx.target_capture_sink is not None:
+                self._notify_dflash_capture(
+                    ctx.target_capture_sink, i, aux_hidden_states
                 )
 
         if not ctx.forward_mode.is_idle():

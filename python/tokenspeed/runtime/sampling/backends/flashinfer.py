@@ -26,9 +26,13 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
+    fused_topk_topp_available as _FUSED_TOPK_TOPP_AVAILABLE,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_prepare,
     fused_topk_topp_renorm,
-    verify_chain_greedy,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
@@ -37,14 +41,7 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.torch_compile import get_compiler_backend
-
-# Resolved once at import: the fused top-k + top-p kernel is NVIDIA-only.
-# On non-NVIDIA platforms (e.g. ROCm) we fall back to the back-to-back
-# flashinfer renorm calls. Defining this at module scope keeps the hot path
-# branch-free in the captured graph.
-_FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
@@ -62,8 +59,8 @@ from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs_torch,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -91,10 +88,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
-        # Pre-create the side stream used by fused_topk_topp_renorm. Must
-        # happen before any CUDA graph capture — cudaStreamCreate is illegal
-        # inside capture, and verify() runs from the captured graph.
-        fused_topk_topp_prepare(config.device)
+        if _FUSED_TOPK_TOPP_AVAILABLE:
+            # Pre-create the fused renorm side stream: cudaStreamCreate is
+            # illegal inside capture, and verify() runs from the captured graph.
+            fused_topk_topp_prepare(config.device)
 
     def _init_dp_sampling(self, config: SamplingBackendConfig) -> None:
         self._dp_tp_group = config.tp_group
@@ -242,29 +239,14 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._ones_buf = torch.ones(
             (max_pad_bs,), dtype=torch.int32, device=config.device
         )
-        # predict + accept_length share one packed backing store.
-        # Layout: [0, max_bs * max_n) is predict, [max_bs * max_n, total)
-        # is accept_length.
-        self._predict_max = max_pad_bs * max_n
-        self._output_pack_buf = torch.zeros(
-            (self._predict_max + max_pad_bs,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._predict_buf = self._output_pack_buf[: self._predict_max]
-        self._accept_length_buf = self._output_pack_buf[self._predict_max :]
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n.
-        self._accept_index_buf = torch.zeros(
-            (max_pad_bs * max_n,),
-            dtype=torch.int32,
-            device=config.device,
-        )
+        # DP padding may need more verify rows than max_bs.
+        if max_pad_bs != config.max_bs:
+            self._allocate_verify_outputs(max_pad_bs, max_n)
 
         self._predict_local_buf: torch.Tensor | None = None
         self._accept_index_local_buf: torch.Tensor | None = None
         self._accept_length_local_buf: torch.Tensor | None = None
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _prepare_step_hook(
         self,
         num_tokens_per_req: int,
@@ -317,38 +299,53 @@ class FlashInferSamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
 
-        if sampling_info.is_all_greedy:
+        # Greedy requests normalize to top_k=1 (SamplingParams.__post_init__),
+        # so the pool route serves them too — same path the CUDA graph
+        # captures. Equivalence to argmax is pinned by
+        # test_greedy_route_equivalence.py.
+        temperatures, top_ks, top_ps, _, seeds, offsets = gather_and_expand_scalars(
+            sampling_info.req_pool_indices,
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
+            seed=self._seed_pool,
+            offsets=sampling_info.valid_cache_lengths,
+        )
 
-            batch_next_token_ids = sampling_argmax(logits)
-
-        else:
-
-            temperatures, top_ks, top_ps, _, seeds, offsets = gather_and_expand_scalars(
-                sampling_info.req_pool_indices,
-                temperature=self._temperature_pool,
-                top_k=self._top_k_pool,
-                top_p=self._top_p_pool,
-                seed=self._seed_pool,
-                offsets=sampling_info.valid_cache_lengths,
-                enable_pdl=pdl_enabled(),
+        probs = softmax(
+            logits,
+            temperature=temperatures.view(-1, 1),
+        )
+        batch_next_token_ids = top_k_top_p_sampling_from_probs(
+            probs,
+            top_ks,
+            top_ps,
+            filter_apply_order="joint",
+            seed=seeds,
+            offset=offsets,
+            deterministic=True,
+        )
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # The pool route serves greedy rows through the stochastic
+            # kernel, whose top-1 filter resolves EXACT logit ties in
+            # reduction order — run-stable but not batch-invariant. Overlay
+            # the canonical lowest-index argmax on greedy rows; elementwise,
+            # so the graph-captured path stays one path.
+            canonical = sampling_argmax(logits)
+            batch_next_token_ids = torch.where(
+                top_ks == 1,
+                canonical.to(batch_next_token_ids.dtype),
+                batch_next_token_ids,
             )
 
-            probs = softmax(
-                logits,
-                temperature=temperatures.view(-1, 1),
-                enable_pdl=pdl_enabled(),
-            )
-            batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                probs,
-                top_ks,
-                top_ps,
-                filter_apply_order="joint",
-                seed=seeds,
-                offset=offsets,
-                deterministic=True,
-            )
-
-        sampled = batch_next_token_ids.to(torch.int32)
+        bs = logits.shape[0]
+        # Land the tokens in the packed output region so both outputs alias
+        # _output_pack_buf and get_packed_output_d2h's single-D2H fast path
+        # fires on the eager path exactly as it does after a verify().
+        sampled = self._predict_buf[:bs]
+        sampled.copy_(batch_next_token_ids)
+        lengths = self._accept_length_buf[:bs]
+        lengths.fill_(1)
 
         # TP-rank sync: rank 0 wins.
         self.maybe_broadcast(sampled)
@@ -358,9 +355,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 logits, sampled
             )
 
-        bs = logits.shape[0]
-
-        return sampled, self._ones_buf[:bs]
+        return sampled, lengths
 
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
@@ -439,8 +434,12 @@ class FlashInferSamplingBackend(SamplingBackend):
             accept_length = self._accept_length_local_buf[:bs]
         else:
             pool_indices = sampling_info.req_pool_indices
-            coins = self._coins_buf
-            final_coins = self._final_coins_buf
+            # prepare_step filled the coin buffers in the step's full batch
+            # order; a MIXED round's verify sees only the decode suffix, so
+            # read each row's own coins at its batch offset.
+            row0 = sampling_info.batch_row_offset
+            coins = self._coins_buf[row0 : row0 + bs]
+            final_coins = self._final_coins_buf[row0 : row0 + bs]
             predict = self._predict_buf[: bs * num_tokens_per_req]
             accept_index = (
                 self._accept_index_buf[: bs * num_tokens_per_req]
@@ -466,72 +465,53 @@ class FlashInferSamplingBackend(SamplingBackend):
                 vocab_mask=vocab_mask,
             )
 
-        if sampling_info.is_all_greedy:
+        # Greedy verifies through the same pool route (top_k=1); see sample().
+        # Each request's N verified positions share one (temp, top_k, top_p)
+        # tuple; flat [bs*N] per-row knobs match the flat [bs*N, vocab] logits.
+        n = num_tokens_per_req
+        temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
+            pool_indices,
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
+            n=n,
+        )
 
-            target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
-
-            verify_chain_greedy(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                target_predict=target_predict,
-                batch_size=bs,
-                num_draft_tokens=num_tokens_per_req,
-                enable_pdl=pdl_enabled(),
+        target_probs = softmax(
+            logits,
+            temperature=temperatures,
+        )
+        if _FUSED_TOPK_TOPP_AVAILABLE:
+            # Fused replacement for the back-to-back top_k_renorm_prob +
+            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+            # K = 1<<30 in top_ks routes per-row through the radix top-p
+            # only path. Availability decided once in
+            # tokenspeed_kernel.ops.sampling.cuda.
+            target_probs = fused_topk_topp_renorm(
+                target_probs,
+                top_ks,
+                top_ps,
             )
-
         else:
-
-            # Each request's N verified positions share one (temp, top_k, top_p)
-            # tuple; flat [bs*N] per-row knobs match the flat [bs*N, vocab] logits.
-            n = num_tokens_per_req
-            temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
-                pool_indices,
-                temperature=self._temperature_pool,
-                top_k=self._top_k_pool,
-                top_p=self._top_p_pool,
-                n=n,
-                enable_pdl=pdl_enabled(),
+            target_probs = top_k_renorm_prob(target_probs, top_ks)
+            target_probs = top_p_renorm_prob(
+                target_probs, top_ps, is_deterministic=True
             )
+        target_probs = target_probs.reshape(bs, n, -1)
 
-            target_probs = softmax(
-                logits,
-                temperature=temperatures,
-                enable_pdl=pdl_enabled(),
-            )
-            if _FUSED_TOPK_TOPP_AVAILABLE:
-                # Fused replacement for the back-to-back top_k_renorm_prob +
-                # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
-                # K = 1<<30 in top_ks routes per-row through the radix top-p
-                # only path.
-                target_probs = fused_topk_topp_renorm(
-                    target_probs,
-                    top_ks,
-                    top_ps,
-                    enable_pdl=pdl_enabled(),
-                )
-            else:
-                target_probs = top_k_renorm_prob(target_probs, top_ks)
-                target_probs = top_p_renorm_prob(
-                    target_probs, top_ps, is_deterministic=True
-                )
-            target_probs = target_probs.reshape(bs, n, -1)
-
-            chain_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                uniform_samples=coins[:bs, :n],
-                uniform_samples_for_final_sampling=final_coins[:bs],
-                target_probs=target_probs,
-                draft_probs=None,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=not dp_sampling,
-                enable_pdl=pdl_enabled(),
-            )
+        chain_speculative_sampling_target_only(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates,
+            uniform_samples=coins[:bs, :n],
+            uniform_samples_for_final_sampling=final_coins[:bs],
+            target_probs=target_probs,
+            draft_probs=None,
+            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+            deterministic=not dp_sampling,
+        )
 
         accept_length += 1
         logprobs_local = None
@@ -575,10 +555,8 @@ class FlashInferSamplingBackend(SamplingBackend):
         # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL,
         # fused top-k + top-p is bit-identical across ranks and does not need
         # a broadcast.
-        elif pdl_enabled():
-            self.maybe_broadcast(predict, accept_index, accept_length)
-        elif not _FUSED_TOPK_TOPP_AVAILABLE:
-            self.maybe_broadcast(predict, accept_index, accept_length)
+        elif pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE:
+            self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs and not dp_sampling:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
@@ -594,10 +572,9 @@ class FlashInferSamplingBackend(SamplingBackend):
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """One D2H of the packed predict+accept_length region.
 
-        Only applies when both outputs alias into ``_output_pack_buf`` (the
-        verify() path). For ``sample()``, ``output_tokens`` is a fresh
-        argmax/top_k_top_p result and ``output_lengths`` is ``_ones_buf``,
-        neither of which lives in the pack. We fall back to two D2Hs.
+        Applies when both outputs alias into ``_output_pack_buf`` — both
+        ``verify()`` and ``sample()`` land their outputs there. Callers
+        holding outputs from another source fall back to two D2Hs.
         """
         if (
             output_tokens.data_ptr() != self._output_pack_buf.data_ptr()

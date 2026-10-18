@@ -20,93 +20,31 @@
 
 #pragma once
 
-#include <optional>
-#include <unordered_map>
-#include <variant>
 #include <cstdint>
-#include <numeric>
-#include <string>
 #include <vector>
-#include <memory>
 
-#include "fsm/forward_events.h"
-#include "resource/allocator/paged_cache_group.h"
-#include "resource/types.h"
-#include "scheduler/operations/inc.h"
+#include "cache/core/cache_config.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
-class TreeNode;
-
-enum class DisaggregationMode {
-    kNone,
-    kPrefill,
-    kDecode,
-};
-// `PagedCacheGroupFamily` is defined in
-// resource/allocator/paged_cache_group.h (transitively included above).
-
-template <ResourceType>
-class NodeRef;
-using HostNodeRef = NodeRef<ResourceType::Host>;
-using DeviceNodeRef = NodeRef<ResourceType::Device>;
-
-struct SchedulerStats {
-    std::int64_t total_batches = 0;
-    std::int64_t mixed_batches = 0;
-    std::int64_t retract_count = 0;
-    std::int64_t abort_count = 0;
-    std::int64_t schedule_latency_count = 0;
-    std::int64_t schedule_latency_sum_us = 0;
-    std::int64_t schedule_latency_max_us = 0;
-    std::int64_t prefix_cache_hit_tokens = 0;
-    std::int64_t prefix_cache_req_tokens = 0;
-
-    std::int64_t pending_queue_size = 0;
-    std::int64_t plan_queue_size = 0;
-    std::int64_t event_queue_size = 0;
-    std::int64_t active_requests = 0;
-};
-
-// Opt-in spec for the paged-cache prefix-cache adjunct. Unset means paged-cache
-// groups are transport-only (no snapshot chain, no prefix-cache reuse).
-struct PrefixCacheAdjunctSpec {
-    std::vector<std::string> required_groups{};
-};
-
 struct SchedulerConfig {
-    std::int32_t block_size{};
-    struct {
-        // Flat builds: page 0 is the null placeholder (device convention), so usable = total - 1.
+    std::int32_t prefix_granularity{};
+    struct AllocatorConfig {
+        // Page 0 is the null placeholder, so usable = total - 1.
         std::int32_t total_pages{};
-    } host_allocator;
+        std::int32_t NumUsableBlocks() const { return total_pages - 1; }
+    };
+    AllocatorConfig host_allocator;
+    AllocatorConfig device_allocator;
 
-    struct {
-        std::int32_t total_pages{};
-    } device_allocator;
+    std::vector<CacheGroupConfig> cache_groups{};
 
-    std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+    bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
 
-    // GCD of every group's effective block_size (per-group override, else the global
-    // block_size): the base page granularity all group block sizes are multiples of.
-    std::int32_t BaseBlockSize() const {
-        std::int32_t base = 0;
-        for (const auto& g : paged_cache_groups) {
-            std::int32_t bs = g.block_size > 0 ? g.block_size : block_size;
-            base = base == 0 ? bs : std::gcd(base, bs);
-        }
-        return base == 0 ? block_size : base;
-    }
-
-    // Streaming-sink (flat L2) enablement: an L2 host tier exists (> 1: page 0 is the null
-    // placeholder) and this role writes to it. Orthogonal to disable_prefix_cache by design:
-    // that flag gates MATCHING only, the sink gates STORING.
-    bool FlatStreamingSinkEnabled() const {
-        return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kFused;
-    }
-
-    // Unset means paged-cache groups are transport-only.
-    std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
+    // Decode uses Host cache only for best-effort Retraction and recovery. It
+    // does not continuously stream ordinary Device cache entries to Host.
+    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
@@ -117,19 +55,32 @@ struct SchedulerConfig {
     std::int32_t overlap_schedule_depth{0};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
-    std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 
-    std::int32_t num_pages_reserved_for_retracted_or_running{};
+    // The P and D roles ARE the cache-transfer PD protocol: there is no
+    // disaggregated deployment without it, so everything PD-specific
+    // (transfer pins, destination layouts, transfer_policy validation) keys
+    // on the role directly.
     Role role{Role::kFused};
 
     bool disable_prefix_cache{false};
-    bool enable_mamba{false};
-    std::int32_t mamba_cache_chunk_size{64};
-    std::int32_t mamba_pool_total_chunks{0};
-    bool enable_mamba_l2{false};
-    std::int32_t mamba_l2_host_slots{0};
+    // Minimum prompt tail that must be recomputed after a prefix-cache hit.
+    // Zero preserves the default logits contract, which already recomputes at
+    // least the final prompt token. The effective hit is page-aligned down.
+    std::int32_t prefix_replay_tokens{0};
+
+    // The single validation entry point for a scheduler configuration: every
+    // scheduler scalar, every group's own invariants, and the cross-checks
+    // between them. Throws std::invalid_argument on the first violation.
+    //
+    // The Scheduler runs this before constructing any member, because the pools
+    // and the cache coordinator assert on the same fields and their assertions
+    // would otherwise preempt these diagnostics.
+    void Validate() const;
+    // The subset of Validate() the CapacityModel needs: every field it reads
+    // to size a pool, none of the page counts that describe a sized one.
+    void ValidateCapacityInputs() const;
 };
 
 }  // namespace tokenspeed

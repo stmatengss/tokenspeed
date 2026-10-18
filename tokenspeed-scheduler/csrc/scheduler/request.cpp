@@ -22,46 +22,77 @@
 
 #include <stdexcept>
 
-#include "fsm/cache_states.h"
-#include "fsm/pd_states.h"
+#include "fsm/forward_events.h"
 
 namespace tokenspeed {
 
-Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
+Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
       token_container_{spec.tokens},
-      page_size_{page_size},
-      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}},
-      storage_info_{spec.rolling_hashes, spec.storage_hit_pages} {}
+      submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
+      max_new_tokens_{spec.max_new_tokens},
+      prefix_granularity_{prefix_granularity},
+      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
 
-PrefillInfo Request::GetPrefillInfo() const {
-    return std::visit(Overloaded{
-        []<typename T>(const T& s) -> PrefillInfo
-            requires(std::same_as<T, fsm::Prefilling> || std::same_as<T, fsm::PrefillDone>)
-        { return s.GetPrefillInfo(); },
-        [this](const auto&) -> PrefillInfo {
-            throw std::logic_error("Request::GetPrefillInfo: expected state=Prefilling or PrefillDone; got state=" +
-                                   StateName());
-        },
+PrefillInfo Request::CurrentPrefillInfo() const {
+    return std::visit(
+        Overloaded{
+            [](const fsm::Prefilling& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::RemotePrefilling& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillDone& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillAwaitingResult& state) { return state.CurrentPrefillInfo(); },
+            [this](const auto&) -> PrefillInfo {
+                throw std::logic_error(
+                    "Request::CurrentPrefillInfo: expected Prefilling, RemotePrefilling or PrefillDone; got " +
+                    StateName());
+            },
         },
         state_);
 }
 
-TreeNode* Request::GetHostLockNode() const {
-    auto* s = std::get_if<fsm::Prefetching>(&state_);
-    if (s == nullptr) {
-        throw std::logic_error("Request::GetHostLockNode: expected state=Prefetching; got state=" + StateName());
-    }
-    return s->GetHostLockNode();
+std::int32_t Request::NumComputedTokens() const {
+    return std::visit(
+        Overloaded{
+            [](const fsm::Prefilling& state) { return state.window.begin + state.window.size; },
+            [](const fsm::PrefillDone& state) { return state.window.begin + state.window.size; },
+            [this](const fsm::Decoding&) { return TokenSize() - 1; },
+            [this](const auto&) -> std::int32_t {
+                throw std::logic_error(
+                    "Request::NumComputedTokens: expected Prefilling, PrefillDone or Decoding; got " + StateName());
+            },
+        },
+        state_);
 }
 
-std::vector<std::int32_t> Request::GetHostPageIds() const {
-    auto* s = std::get_if<fsm::Prefetching>(&state_);
-    if (s == nullptr) {
-        throw std::logic_error("Request::GetHostPageIds: expected state=Prefetching; got state=" + StateName());
+fsm::ForwardResources& Request::forwardResources(const char* operation) {
+    fsm::ForwardResources* result = std::visit(
+        []<typename State>(State& state) -> fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
+            }
+            return nullptr;
+        },
+        state_);
+    if (result == nullptr) {
+        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " + StateName());
     }
-    return s->GetHostPageIds();
+    return *result;
+}
+
+const fsm::ForwardResources& Request::forwardResources(const char* operation) const {
+    const fsm::ForwardResources* result = std::visit(
+        []<typename State>(const State& state) -> const fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
+            }
+            return nullptr;
+        },
+        state_);
+    if (result == nullptr) {
+        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " + StateName());
+    }
+    return *result;
 }
 
 }  // namespace tokenspeed

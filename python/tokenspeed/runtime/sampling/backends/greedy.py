@@ -36,7 +36,6 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
 
@@ -91,7 +90,6 @@ def _verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
-    enable_pdl: bool = False,
 ) -> None:
 
     # Prefer the CUDA kernel when available AND the tensors are on CUDA.
@@ -105,7 +103,6 @@ def _verify_chain_greedy(
             target_predict=target_predict,
             batch_size=batch_size,
             num_draft_tokens=num_draft_tokens,
-            enable_pdl=enable_pdl,
         )
         return
 
@@ -143,21 +140,6 @@ class GreedySamplingBackend(SamplingBackend):
         # ``.to(torch.int32)`` cast and its elementwise launch in the
         # CUDA-graph-captured hot path.
         self._sample_token_buf = torch.empty(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
-        self._predict_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
-        # (required by maybe_broadcast / NCCL).
-        self._accept_index_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._accept_length_buf = torch.zeros(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
@@ -230,7 +212,6 @@ class GreedySamplingBackend(SamplingBackend):
             target_predict=target_predict,
             batch_size=bs,
             num_draft_tokens=num_tokens_per_req,
-            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1
@@ -238,9 +219,8 @@ class GreedySamplingBackend(SamplingBackend):
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length
         # divergence (logits not bit-identical across ranks) desyncs batch
-        # composition and deadlocks the model all-reduce. Buffers are laid out
-        # flat so these views are NCCL-contiguous.
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        # composition and deadlocks the model all-reduce.
+        self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(

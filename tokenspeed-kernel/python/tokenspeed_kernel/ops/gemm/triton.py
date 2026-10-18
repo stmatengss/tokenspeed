@@ -21,25 +21,38 @@
 from __future__ import annotations
 
 import functools
-import json
-import logging
 import math
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import List, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
-logger = logging.getLogger(__name__)
-
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 _MXFP8_BLOCK_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
     block_shape=(128, 128),
+)
+_MXFP8_UE8M0_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(1, 32),
+)
+_MXFP8_FLOAT_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(1, 32),
 )
 _FP8_TENSOR_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
@@ -49,8 +62,17 @@ _FP8_CHANNEL_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="channel",
 )
-_MXFP8_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE
+_MXFP8_FORMAT_SIGNATURES = (
+    format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE)
+    | format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_UE8M0_SCALE)
+    | frozenset(
+        {
+            format_signature(
+                a=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_FLOAT_1X32_SCALE),
+                b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_SCALE),
+            )
+        }
+    )
 )
 _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
@@ -72,7 +94,8 @@ def prepare_block_fp8_matmul_inputs(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
-) -> Tuple[int, int, int]:
+    out: torch.Tensor | None = None,
+) -> tuple[int, int, int, torch.Tensor]:
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
@@ -86,6 +109,8 @@ def prepare_block_fp8_matmul_inputs(
         assert (
             triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
         ), f"{A.shape=} {As.shape=} {block_size=}"
+    elif As.dtype == torch.uint8:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     else:
         raise NotImplementedError
 
@@ -104,58 +129,101 @@ def prepare_block_fp8_matmul_inputs(
         assert (
             triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
         ), f"{B.shape=} {Bs.shape=} {block_size=}"
+    elif Bs.dtype == torch.uint8:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
     else:
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    C = out if out is not None else A.new_empty(C_shape, dtype=output_dtype)
 
     return M, N, K, C
 
 
-@functools.lru_cache
-def get_w8a8_block_fp8_configs(
-    N: int, K: int, block_n: int, block_k: int
-) -> Optional[Dict[int, Any]]:
+_GFX950_W8A8_BLOCK_FP8_SHAPES = frozenset(
+    {
+        (1024, 4096),
+        (2048, 4096),
+        (4096, 512),
+        (4096, 1536),
+        (4096, 3072),
+        (4096, 4096),
+        (6144, 4096),
+    }
+)
+
+
+@functools.lru_cache(maxsize=256)
+def _get_gfx950_w8a8_block_fp8_config(
+    M: int, N: int, K: int, block_n: int, block_k: int
+) -> Mapping[str, int] | None:
+    if (N, K) not in _GFX950_W8A8_BLOCK_FP8_SHAPES or (block_n, block_k) != (128, 128):
+        return None
+
+    if M <= 64:
+        # The narrow output benefits from less M grouping through the
+        # measured M=16 bucket; nearest-bucket dispatch crossed over at M=25.
+        if (N, K) == (1024, 4096) and M <= 24:
+            group_size_m = 1
+        elif (N, K) == (4096, 512):
+            group_size_m = 4
+        else:
+            group_size_m = 8
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": group_size_m,
+            "num_warps": 2,
+            "num_stages": 1,
+        }
+    elif M <= 128:
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    else:
+        config = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    return MappingProxyType(config)
+
+
+def get_w8a8_block_fp8_config(
+    M: int, N: int, K: int, block_n: int, block_k: int
+) -> Mapping[str, int] | None:
+    """Select the measured block-FP8 GEMM launch configuration.
+
+    The gfx950 policy is the compact form of a shape sweep over GLM-5.3's
+    dense FP8 projections. Explicit ranges preserve the legacy launch choices
+    without relying on nearest-neighbor lookup through per-shape JSON files.
+    Uncovered architectures, matrix shapes, and scale layouts return ``None``
+    so the portable launch heuristic remains the fallback.
+
+    Args:
+        M: Number of activation rows.
+        N: Output width.
+        K: Reduction width.
+        block_n: Weight-scale block size along N.
+        block_k: Activation and weight-scale block size along K.
+
+    Returns:
+        An immutable mapping of Triton launch parameters when the shape is
+        covered by the gfx950 sweep, otherwise ``None``.
     """
-    Return optimized configurations for the w8a8 block fp8 kernel.
-
-    The return value will be a dictionary that maps an irregular grid of
-    batch sizes to configurations of the w8a8 block fp8 kernel. To evaluate the
-    kernel on a given batch size bs, the closest batch size in the grid should
-    be picked and the associated configuration chosen to invoke the kernel.
-    """
-
-    # First look up if an optimized configuration is available in the configs
-    # directory
-    device_name = (
-        torch.cuda.get_device_name().replace(" ", "_")
-        if torch.cuda.is_available()
-        else "unknown"
-    )
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
-
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            logger.info(
-                f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
-            )
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
-
-    # If no optimized configuration is available, we will use the default
-    # configuration
-    logger.warning(
-        (
-            "Using default W8A8 Block FP8 kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s"
-        ),
-        config_file_path,
-    )
-    return None
+    if not Platform.get().is_cdna4:
+        return None
+    return _get_gfx950_w8a8_block_fp8_config(M, N, K, block_n, block_k)
 
 
 @triton.jit
@@ -224,6 +292,10 @@ def _w8a8_block_fp8_matmul(
         offs_ks = k_start // group_k
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        if As.dtype.element_ty == tl.uint8:
+            a_s = tl.exp2(a_s.to(tl.float32) - 127.0)
+        if Bs.dtype.element_ty == tl.uint8:
+            b_s = tl.exp2(b_s.to(tl.float32) - 127.0)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -415,6 +487,7 @@ def w8a8_block_fp8_matmul_triton(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise quantization.
 
@@ -432,21 +505,19 @@ def w8a8_block_fp8_matmul_triton(
     Returns:
         torch.Tensor: The result of matmul.
     """
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(
+        A, B, As, Bs, block_size, output_dtype, out=out
+    )
 
     block_n, block_k = block_size
 
-    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-    if configs:
-        # If an optimal configuration map has been found, look up the
-        # optimal config
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-    else:
+    config = get_w8a8_block_fp8_config(M, N, K, block_n, block_k)
+    if config is None:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+        # Each K tile consumes one scale, so its width must equal the scale group.
         if Platform.get().is_amd:
             config = {
-                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_M": 16 if M <= 128 else 32,
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": block_size[1],
                 "GROUP_SIZE_M": 8,
@@ -456,12 +527,19 @@ def w8a8_block_fp8_matmul_triton(
         else:
             config = {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_N": max(64, block_size[0]),
                 "BLOCK_SIZE_K": block_size[1],
                 "GROUP_SIZE_M": 32,
                 "num_warps": 4,
                 "num_stages": 3,
             }
+
+    if config["BLOCK_SIZE_K"] != block_k:
+        raise ValueError(
+            "block-scaled FP8 GEMM requires BLOCK_SIZE_K to match the scale "
+            f"group exactly, got BLOCK_SIZE_K={config['BLOCK_SIZE_K']} and "
+            f"group_k={block_k}"
+        )
 
     kernel = _w8a8_block_fp8_matmul
     if Platform.get().is_amd and config["BLOCK_SIZE_N"] == block_size[0]:
@@ -648,6 +726,7 @@ def triton_scaled_mm(
     block_size_n: int = 32,
     block_size_k: int = 32,
     use_heuristic=True,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
@@ -671,7 +750,15 @@ def triton_scaled_mm(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+    result = (
+        out
+        if out is not None
+        else torch.empty((M, N), dtype=out_dtype, device=input.device)
+    )
+    if result.dtype != out_dtype:
+        raise ValueError(
+            f"triton_scaled_mm out expects dtype {out_dtype}, got {result.dtype}"
+        )
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
@@ -720,7 +807,7 @@ def triton_scaled_mm(
         BLOCK_SIZE_SCALE_B=block_size_sb,
     )
 
-    return result.to(out_dtype)
+    return result
 
 
 # ---- Triton block-scaled FP8 ----------------------------------------------
@@ -737,7 +824,6 @@ def triton_scaled_mm(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
 )
 def triton_mm_fp8_blockscale(
     A: torch.Tensor,
@@ -748,11 +834,14 @@ def triton_mm_fp8_blockscale(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert block_size is not None, "block_size is required for triton_mm_fp8_blockscale"
     assert (
         A_scales is not None
     ), "A_scales is required; online quantization should be done by the caller"
+    if B_scales is None:
+        raise ValueError("B_scales is required for triton MXFP8 GEMM")
     return w8a8_block_fp8_matmul_triton(
         A,
         B,
@@ -760,7 +849,289 @@ def triton_mm_fp8_blockscale(
         B_scales,
         block_size=block_size,
         output_dtype=out_dtype,
+        out=out,
     )
+
+
+@triton.jit
+def _w8a8_block_fp8_bmm(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    M,
+    N,
+    K,
+    group_n,
+    group_k,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bn,
+    stride_bk,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    stride_asb,
+    stride_asm,
+    stride_ask,
+    stride_bsb,
+    stride_bsn,
+    stride_bsk,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_offsets = k_start * BLOCK_SIZE_K + offs_k
+        a = tl.load(
+            A
+            + batch * stride_ab
+            + offs_m[:, None] * stride_am
+            + k_offsets[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k_offsets[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            B
+            + batch * stride_bb
+            + offs_n[None, :] * stride_bn
+            + k_offsets[:, None] * stride_bk,
+            mask=(offs_n[None, :] < N) & (k_offsets[:, None] < K),
+            other=0.0,
+        )
+        scale_k = (k_start * BLOCK_SIZE_K) // group_k
+        a_scale = tl.load(
+            As + batch * stride_asb + offs_m * stride_asm + scale_k * stride_ask,
+            mask=offs_m < M,
+            other=0.0,
+        )
+        b_scale = tl.load(
+            Bs
+            + batch * stride_bsb
+            + (offs_n // group_n) * stride_bsn
+            + scale_k * stride_bsk,
+            mask=offs_n < N,
+            other=0.0,
+        )
+        if As.dtype.element_ty == tl.uint8:
+            a_scale = tl.exp2(a_scale.to(tl.float32) - 127.0)
+        if Bs.dtype.element_ty == tl.uint8:
+            b_scale = tl.exp2(b_scale.to(tl.float32) - 127.0)
+        acc += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+
+    tl.store(
+        C
+        + batch * stride_cb
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+@register_kernel(
+    "gemm",
+    "bmm",
+    name="triton_bmm_fp8_blockscale",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=_MXFP8_FORMAT_SIGNATURES,
+    traits={
+        "a_inner_stride_one": frozenset({True}),
+        "out_inner_stride_one": frozenset({True}),
+    },
+    priority=Priority.PERFORMANT + 3,
+)
+def triton_bmm_fp8_blockscale(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if alpha is not None:
+        raise ValueError("triton block-scaled FP8 BMM does not support alpha")
+    if block_size is None:
+        raise ValueError("block_size is required for triton block-scaled FP8 BMM")
+    if A_scales is None or B_scales is None:
+        raise ValueError("A_scales and B_scales are required for FP8 BMM")
+
+    batch, m, k = A.shape
+    b_batch, n, b_k = B.shape
+    block_n, block_k = block_size
+    if b_batch != batch or b_k != k:
+        raise ValueError(f"FP8 BMM shape mismatch: A={A.shape}, B={B.shape}")
+    if A_scales.shape != (batch, m, triton.cdiv(k, block_k)):
+        raise ValueError(
+            f"FP8 BMM A scale shape mismatch: A={A.shape}, scales={A_scales.shape}"
+        )
+    expected_b_scales = (batch, triton.cdiv(n, block_n), triton.cdiv(k, block_k))
+    if B_scales.shape != expected_b_scales:
+        raise ValueError(
+            "FP8 BMM B scale shape mismatch: "
+            f"expected {expected_b_scales}, got {tuple(B_scales.shape)}"
+        )
+
+    C = (
+        out
+        if out is not None
+        else torch.empty((batch, m, n), device=A.device, dtype=out_dtype)
+    )
+    config = {
+        "BLOCK_SIZE_M": 16 if Platform.get().is_amd and m <= 128 else 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": block_k,
+        "num_warps": 4,
+        "num_stages": 1 if Platform.get().is_amd else 3,
+    }
+    _w8a8_block_fp8_bmm[
+        (batch, triton.cdiv(m, config["BLOCK_SIZE_M"]), triton.cdiv(n, 64))
+    ](
+        A,
+        B,
+        C,
+        A_scales,
+        B_scales,
+        m,
+        n,
+        k,
+        block_n,
+        block_k,
+        A.stride(0),
+        A.stride(1),
+        A.stride(2),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        C.stride(0),
+        C.stride(1),
+        C.stride(2),
+        A_scales.stride(0),
+        A_scales.stride(1),
+        A_scales.stride(2),
+        B_scales.stride(0),
+        B_scales.stride(1),
+        B_scales.stride(2),
+        **config,
+    )
+    return C
+
+
+def _triton_dsv4_grouped_output_projection_weights(
+    *,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    output_dim: int,
+    input_dim: int,
+    block_size: tuple[int, int],
+    recipe: tuple[int, int, int],
+) -> torch.Tensor:
+    del weight, recipe
+    block_n, block_k = block_size
+    expected_shape = (
+        num_groups * (output_dim // block_n),
+        input_dim // block_k,
+    )
+    if tuple(weight_scale.shape) != expected_shape:
+        raise ValueError(
+            "grouped output projection scale shape mismatch: "
+            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
+        )
+    return weight_scale
+
+
+@register_kernel(
+    "gemm",
+    "dsv4_grouped_output_projection",
+    name="triton_dsv4_grouped_output_projection",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=frozenset(
+        format_signature(
+            attention=dense_tensor_format(input_dtype),
+            weight=dense_tensor_format(_fp8_dtype),
+        )
+        for input_dtype in (torch.float16, torch.bfloat16)
+    ),
+    traits={},
+    priority=Priority.PERFORMANT + 3,
+    weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
+)
+def triton_dsv4_grouped_output_projection(
+    *,
+    attention: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    heads_per_group: int,
+    output_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+    block_size: tuple[int, int],
+    tma_aligned_scales: bool,
+    recipe: tuple[int, int, int],
+) -> torch.Tensor:
+    """Run V4's grouped output projection with canonical scales and Triton BMM."""
+    del recipe
+    if tma_aligned_scales:
+        raise ValueError("the portable projection requires canonical scales")
+    from tokenspeed_kernel.ops.attention.dsv4.triton import (
+        dsv4_fused_inv_rope_fp8_quant,
+    )
+
+    values, scales = dsv4_fused_inv_rope_fp8_quant(
+        attention,
+        positions,
+        cos_sin_cache,
+        n_groups=num_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        quant_group_size=block_size[1],
+        tma_aligned_scales=False,
+    )
+    input_dim = heads_per_group * attention.shape[-1]
+    grouped_weight = weight.view(num_groups, output_dim, input_dim)
+    block_n, block_k = block_size
+    grouped_scales = weight_scale.view(
+        num_groups,
+        output_dim // block_n,
+        input_dim // block_k,
+    )
+    output = torch.empty(
+        (attention.shape[0], num_groups, output_dim),
+        dtype=torch.bfloat16,
+        device=attention.device,
+    )
+    triton_bmm_fp8_blockscale(
+        values.transpose(0, 1),
+        grouped_weight,
+        scales.transpose(0, 1),
+        grouped_scales,
+        output.dtype,
+        block_size=list(block_size),
+        out=output.transpose(0, 1),
+    )
+    return output
 
 
 @triton.jit
@@ -843,7 +1214,7 @@ def _mxfp4_mm_kernel(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=_MXFP4_FORMAT_SIGNATURES,
-    traits={"quant": frozenset({"mxfp4"})},
+    traits={},
     priority=Priority.PORTABLE,
 )
 def triton_mm_mxfp4(
@@ -855,6 +1226,7 @@ def triton_mm_mxfp4(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del alpha, block_size
     if A.dtype != torch.uint8 or B.dtype != torch.uint8:
@@ -868,7 +1240,7 @@ def triton_mm_mxfp4(
     N = B.shape[0]
     if K % 32 != 0:
         raise ValueError("MXFP4 GEMM requires K divisible by 32")
-    C = torch.empty(M, N, device=A.device, dtype=out_dtype)
+    C = out if out is not None else torch.empty(M, N, device=A.device, dtype=out_dtype)
     grid = (triton.cdiv(M, 16), triton.cdiv(N, 32))
     _mxfp4_mm_kernel[grid](
         A,
@@ -914,7 +1286,6 @@ def triton_mm_mxfp4(
         "b_layout": frozenset({"KN"}),
     },
     priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
 )
 def triton_mm_fp8_scaled(
     A: torch.Tensor,
@@ -926,6 +1297,7 @@ def triton_mm_fp8_scaled(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return triton_scaled_mm(
         A,
@@ -934,4 +1306,5 @@ def triton_mm_fp8_scaled(
         B_scales,
         out_dtype=out_dtype,
         bias=bias,
+        out=out,
     )

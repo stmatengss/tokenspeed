@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,10 @@ from tokenspeed_kernel.profiling import (
 )
 from viztracer import VizTracer
 
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -48,8 +53,6 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
-    GetLoadReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
@@ -71,9 +74,9 @@ from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
-from tokenspeed.runtime.multimodal.shm_transport import sync_shm_features
+from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
-from tokenspeed.runtime.utils import broadcast_pyobj
+from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
@@ -109,11 +112,14 @@ class RequestHandler:
         vocab_size: int,
         recv_func,
         send_func,
-        get_load_fn=None,
+        can_clear_cache_fn,
+        clear_cache_fn=None,
         architectures: list[str] | None = None,
+        *,
+        tokenizer_kwargs: Mapping[str, object],
         pause_controller=None,
         memory_controller=None,
-        model_runner=None,
+        device=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -123,23 +129,97 @@ class RequestHandler:
         # Owns release/resume_memory_occupation (data plane). See
         # memory_occupation.py. Shares the pause controller's drain machinery.
         self.memory_controller = memory_controller
-        # ModelRunner for in-place RL weight sync (NCCL group init + receive).
-        # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
-        self.model_runner = model_runner
+        # In-place RL weight sync (NCCL group init + receive) goes over the
+        # data plane so it is ordered against forwards. The scheduler worker
+        # passes the handle in; None elsewhere (e.g. unit tests).
+        self._device = device
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
         self.attn_tp_rank = mapping.attn.tp_rank
-        self.attn_tp_cpu_group = pg_manager.get_process_group(
+        self.attn_global_rank = mapping.attn.rank
+        if mapping.has_pp:
+            # Chunk-pipeline: every stage's scheduler runs the same
+            # deterministic plan, so every rank in the WORLD must see the
+            # same request stream. Only global rank 0 owns the ZMQ input;
+            # the broadcast fans out across stages, not just one TP group.
+            self.attn_tp_size = mapping.world_size
+            self.attn_tp_rank = mapping.rank
+            self.attn_tp_cpu_group = pg_manager.get_process_group(
+                "gloo", mapping.world_group
+            )
+            self.attn_tp_src_rank = mapping.world_group[0]
+        elif mapping.has_attn_cp:
+            # ENABLE_CP folds requested TP into CP and leaves every worker
+            # at attn_tp_rank 0, so the TP broadcaster never runs and each
+            # CP rank would otherwise PULL a different ZMQ message. Fan
+            # recv_reqs across CP the same way PP fans them across WORLD
+            # so L3 exists MIN (and later CP collectives) see one stream.
+            self.attn_tp_size = mapping.attn.cp_size
+            self.attn_tp_rank = mapping.attn.cp_rank
+            self.attn_tp_cpu_group = pg_manager.get_process_group(
+                "gloo", mapping.attn.cp_group
+            )
+            self.attn_tp_src_rank = mapping.attn.cp_group[0]
+        else:
+            self.attn_tp_cpu_group = pg_manager.get_process_group(
+                "gloo", mapping.attn.tp_group
+            )
+            self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        # Cache-owning ranks in this DP replica (attention TP × CP × PP).
+        # Distinct from attn_tp_* above: with PP those become WORLD so the
+        # request stream is identical across stages, which would also pull
+        # DP ranks into the TP MIN. Exists uses these replica groups;
+        # flush appends attention DP as its own group afterwards.
+        self._replica_tp_size = mapping.attn.tp_size
+        self._replica_tp_cpu_group = pg_manager.get_process_group(
             "gloo", mapping.attn.tp_group
         )
-        self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        self.attn_cp_size = mapping.attn.cp_size
+        self.attn_cp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
+            if mapping.has_attn_cp
+            else None
+        )
+        self.pp_size = mapping.pp_size
+        self.pp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.pp_group)
+            if mapping.has_pp
+            else None
+        )
+        # Flush MIN includes attention DP after TP/CP/PP: object keys omit
+        # DP rank, so DP replicas share the Mooncake namespace. Exists,
+        # prefetch, and WriteBackDone stay TP/CP/PP only (EventLoop /
+        # L2CacheHooks); those ranks hold different sequences.
+        self.attn_dp_size = mapping.attn.dp_size
+        self.attn_dp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.dp_group)
+            if mapping.has_attn_dp
+            else None
+        )
+        self.req_broadcaster = (
+            PipelinedPyobjBroadcaster(
+                self.attn_global_rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_src_rank,
+            )
+            if self.attn_tp_size != 1
+            else None
+        )
         self.profile_rank_tag = _profile_rank_tag(mapping.attn)
+        # Rendezvous buffer for _profile_sync. Preallocated because the stage
+        # transitions run on the control-plane thread, where allocating is what
+        # Principle 1 forbids -- see _profile_sync.
+        self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        # Same constraint as _profile_sync: gloo barrier would CUDA-allocate.
+        self._replica_decision_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        self._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
-        self.get_load_fn = get_load_fn
+        self.clear_cache_fn = clear_cache_fn
+        self.can_clear_cache_fn = can_clear_cache_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -147,6 +227,7 @@ class RequestHandler:
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             architectures=architectures,
+            **tokenizer_kwargs,
         )
 
         self.recv_func = recv_func
@@ -162,8 +243,7 @@ class RequestHandler:
 
         self.init_profiler()
 
-    def recv_reqs(self) -> list:
-        """Receive results at attn_tp_rank = 0 and broadcast it to all other TP ranks."""
+    def _drain_reqs(self) -> list | None:
         if self.attn_tp_rank == 0:
             recv_reqs = []
 
@@ -176,22 +256,29 @@ class RequestHandler:
         else:
             recv_reqs = None
 
-        if self.attn_tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.attn_tp_rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_src_rank,
-            )
+        return recv_reqs
+
+    def recv_reqs(self) -> list:
+        if self.attn_tp_size == 1:
+            recv_reqs = self._drain_reqs()
+        else:
+            if not self.req_broadcaster.in_flight:
+                self.req_broadcaster.start(self._drain_reqs())
+            recv_reqs = self.req_broadcaster.finish()
 
         if recv_reqs:
-            sync_shm_features(recv_reqs, self.attn_tp_cpu_group, self.attn_tp_size)
+            prepare_shm_features(recv_reqs, self.attn_tp_cpu_group)
+
+        if self.attn_tp_size != 1:
+            self.req_broadcaster.start(self._drain_reqs())
 
         return recv_reqs
 
     def process_requests(self, recv_reqs: list):
         """Dispatch control requests and return new generate request specs and states."""
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
+        pending_flush_outputs = 0
+        pending_weight_updates = []
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
@@ -206,12 +293,10 @@ class RequestHandler:
                 if output is not None:
                     self.send_func.send_pyobj(output)
             elif isinstance(recv_req, AbortReq):
-                logger.debug("AbortReq for rid=%s", recv_req.rid)
+                logger.debug(f"AbortReq for rid={recv_req.rid!s}")
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                # Prefix cache is owned by the scheduler path; acknowledge the
-                # control request here so API callers still get a typed reply.
-                self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
+                pending_flush_outputs += 1
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
                 # controller until the event loop observes a drained scheduler).
@@ -233,32 +318,221 @@ class RequestHandler:
                 self.send_func.send_pyobj(
                     SetInternalStateReqOutput(updated=False, server_args={})
                 )
-            elif isinstance(recv_req, GetLoadReqInput):
-                if self.get_load_fn is not None:
-                    self.send_func.send_pyobj(self.get_load_fn())
-                else:
-                    self.send_func.send_pyobj(GetLoadReqOutput())
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 # RL weight sync: join the trainer's NCCL group on this worker.
-                ok, msg = self.model_runner.init_weights_update_group(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
-                # RL weight sync: receive broadcast weights + load into the model.
-                ok, msg = self.model_runner.update_weights_from_distributed(recv_req)
-                self.send_func.send_pyobj(
-                    UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
-                )
+                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                if ok:
+                    ok, msg = self._require_flush_for_l3_version_switch(recv_req)
+                if not ok:
+                    self.send_func.send_pyobj(
+                        UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+                    )
+                else:
+                    pending_weight_updates.append(recv_req)
             elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
                 # RL weight sync: tear down the trainer's NCCL group on this worker.
-                ok, msg = self.model_runner.destroy_weights_update_group(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
+        flush_success = self._rendezvous_replica_flush(
+            pending_flush_outputs=pending_flush_outputs,
+            weight_updates=pending_weight_updates,
+        )
+        for recv_req in pending_weight_updates:
+            self._complete_weight_update(recv_req, flush_success=flush_success)
         return new_req_specs, req_states, bootstrap_infos, abort_rids
+
+    def _require_weight_version_for_l3_flush(self, recv_req) -> tuple[bool, str]:
+        """Reject a flushed L3 update that has no checkpoint identity.
+
+        Minting ``{current}-uN`` from the old label is not checkpoint
+        specific: two servers that start at ``default`` and load different
+        weights would both publish under ``default-u1``. The second flush
+        only deletes the old ``default`` prefix, so the first server's
+        objects remain and can be restored for incompatible weights.
+        """
+
+        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        if (
+            storage_backend is None
+            or not recv_req.flush_cache
+            or recv_req.weight_version is not None
+        ):
+            return True, ""
+        return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
+
+    def _require_flush_for_l3_version_switch(self, recv_req) -> tuple[bool, str]:
+        """Reject an L3 namespace change that would skip cache invalidation.
+
+        Device/Host still hold KV from the previous checkpoint until a
+        successful ``flush_cache``. Switching the Mooncake prefix first
+        lets later D2H copies (not yet in ``_backup_futures``) land under
+        the new namespace, and lets Admit reuse the stale local indexes
+        as if they belonged to the new weights.
+        """
+
+        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        if storage_backend is None or recv_req.flush_cache:
+            return True, ""
+        version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            recv_req.weight_version,
+            flush_cache=False,
+            storage_backend=storage_backend,
+        )
+        if version is None or str(version) == str(self.server_args.weight_version):
+            return True, ""
+        return (
+            False,
+            "L3 weight_version cannot change without flush_cache; "
+            "retry the update with flush_cache=True so Device/Host KV "
+            "and in-flight writebacks cannot land in the new namespace",
+        )
+
+    def _rendezvous_replica_flush(
+        self, *, pending_flush_outputs: int, weight_updates: list
+    ) -> bool:
+        """Enter flush collectives from every rank on every round.
+
+        ``FlushCacheReqInput`` is sent separately to each attention-DP
+        worker. If only the worker that dequeued it entered
+        ``_try_clear_replica_cache``, that rank would DP all-reduce while a
+        lagging peer continued to ``EventLoop._dp_sync_and_check`` and
+        world-gathered. MAX-reduce flush intent on the DP group first so
+        every DP rank takes the same MIN-reduce path, then reply.
+        """
+
+        want_flush = pending_flush_outputs > 0 or any(
+            bool(recv_req.flush_cache) for recv_req in weight_updates
+        )
+        if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
+            buf = self._replica_flush_want_buf
+            buf[0] = 1 if want_flush else 0
+            torch.distributed.all_reduce(
+                buf, op=torch.distributed.ReduceOp.MAX, group=self.attn_dp_cpu_group
+            )
+            want_flush = bool(buf.item())
+        flush_success = True
+        if want_flush:
+            flush_success = self._try_clear_replica_cache()
+        for _ in range(pending_flush_outputs):
+            self.send_func.send_pyobj(FlushCacheReqOutput(success=flush_success))
+        return flush_success
+
+    def _complete_weight_update(self, recv_req, *, flush_success: bool) -> None:
+        """Finish a validated weight update after the rank-identical flush."""
+
+        if recv_req.flush_cache and not flush_success:
+            ok = False
+            msg = (
+                "cache flush failed; retry the update after in-flight "
+                "Host writebacks drain"
+            )
+        else:
+            ok, msg = self._device.update_weights(recv_req)
+            if ok:
+                ok, msg = self._commit_l3_weight_version(recv_req, msg)
+        self.send_func.send_pyobj(
+            UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+        )
+
+    def _try_clear_replica_cache(self) -> bool:
+        """MIN-reduce clearability, delete L3, then mutate Device/Host.
+
+        Mirrored schedulers must keep the same prefix indexes. A rank whose
+        Host writebacks have drained must not ``ClearCache`` while a TP, CP,
+        PP, or DP peer still rejects. Remote L3 deletion is its own
+        error-returning phase: it runs after the probe agrees and before
+        the irreversible local clear, then MIN-reduces so a Mooncake
+        failure cannot leave one rank cleared and another in NCCL.
+        Exists uses attention TP, then CP, then PP. Flush appends DP
+        because DP replicas share Mooncake objects.
+        """
+
+        if not self._converge_replica_decision(self.can_clear_cache_fn()):
+            return False
+        if not self._converge_replica_decision(self._delete_l3_namespace()):
+            return False
+        return self.clear_cache_fn is not None and self.clear_cache_fn()
+
+    def _delete_l3_namespace(self) -> bool:
+        device = self._device
+        if device is None:
+            return True
+        return bool(device.delete_l3_namespace())
+
+    def _converge_replica_decision(self, local_ok: bool) -> bool:
+        """MIN-reduce a yes/no across every rank that shares this flush.
+
+        Attention TP, then CP, then PP (same order as
+        ``EventLoop._converge_l3_exists``), then attention DP. Exists and
+        WriteBackDone omit DP because those ranks hold different sequences.
+        Flush includes DP: ``storage_object_key`` has no DP rank, so a
+        replica that is clearable must not ``remove_by_prefix`` while
+        another DP replica still has in-flight Host-to-store backups.
+        CPU-tensor gloo all_reduce, not a barrier: see ``_profile_sync``.
+        """
+
+        groups = []
+        if self._replica_tp_size > 1 and self._replica_tp_cpu_group is not None:
+            groups.append(self._replica_tp_cpu_group)
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            groups.append(self.attn_cp_cpu_group)
+        if self.pp_size > 1 and self.pp_cpu_group is not None:
+            groups.append(self.pp_cpu_group)
+        if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
+            groups.append(self.attn_dp_cpu_group)
+        if not groups:
+            return local_ok
+        buf = self._replica_decision_buf
+        buf[0] = 1 if local_ok else 0
+        for group in groups:
+            torch.distributed.all_reduce(
+                buf, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+        return bool(buf.item())
+
+    def converge_replica_decision(self, local_ok: bool) -> bool:
+        """Public replica MIN-reduce for control-plane yes/no decisions."""
+
+        return self._converge_replica_decision(local_ok)
+
+    def _commit_l3_weight_version(self, recv_req, msg: str) -> tuple[bool, str]:
+        """Publish under the new checkpoint after a successful GPU load.
+
+        Device/Host have already been flushed when ``flush_cache`` was
+        requested. The prefix is rebuilt here so newly computed KV cannot
+        land in a peer still serving the previous ``weight_version``.
+        Flushed L3 updates require an explicit ``weight_version``. An
+        explicit new version with ``flush_cache=False`` is rejected
+        before the GPU load.
+        """
+
+        ok, err = self._require_weight_version_for_l3_flush(recv_req)
+        if not ok:
+            return False, err
+        ok, err = self._require_flush_for_l3_version_switch(recv_req)
+        if not ok:
+            return False, err
+        version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            recv_req.weight_version,
+            flush_cache=recv_req.flush_cache,
+            storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
+        )
+        if version is None:
+            return True, msg
+        self.server_args.weight_version = str(version)
+        self._device.set_l3_weight_version(str(version))
+        return True, msg
 
     def handle_generate_request(
         self,
@@ -276,6 +550,23 @@ class RequestHandler:
             tokenizer=self.tokenizer,
             eos_token_ids=self.hf_eos_token_id,
         )
+
+        # A transport that validates requests itself (msgpack ZMQ) marks
+        # rejected ones instead of dropping them; admit pre-finished so the
+        # client gets a terminal abort rather than a hung stream.
+        if getattr(recv_req, "validation_error", None):
+            req_state.finished_reason = FINISH_ABORT(
+                f"Invalid request: {recv_req.validation_error}"
+            )
+            return (
+                req_spec,
+                req_state,
+                BootstrapInfo(
+                    recv_req.bootstrap_host,
+                    recv_req.bootstrap_port,
+                    recv_req.bootstrap_room,
+                ),
+            )
 
         if (
             recv_req.session_params is not None
@@ -302,6 +593,7 @@ class RequestHandler:
             ),
             self.max_req_len - len(req_state.prompt_input_ids) - 1,
         )
+        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
         return (
             req_spec,
             req_state,
@@ -374,6 +666,12 @@ class RequestHandler:
                     success=False,
                     message="Proton is not available: the installed "
                     "tokenspeed-triton does not provide a profiler.",
+                )
+            if torch.version.hip and "HIP_VISIBLE_DEVICES" in os.environ:
+                return ProfileReqOutput(
+                    success=False,
+                    message="Proton on AMD requires ROCR_VISIBLE_DEVICES; "
+                    "unset HIP_VISIBLE_DEVICES before calling /start_profile.",
                 )
             if ProfilingState.get().active:
                 return ProfileReqOutput(
@@ -450,7 +748,19 @@ class RequestHandler:
                 self.profiler_output_dir,
                 f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.proton",
             )
-            start_profiling(profile_config_from_env(output=proton_output))
+            try:
+                start_profiling(profile_config_from_env(output=proton_output))
+            except Exception as exc:
+                logger.exception("Failed to start Proton profiling")
+                if self.torch_profiler is not None:
+                    self.torch_profiler.stop()
+                    self.torch_profiler = None
+                if "MEM" in activities:
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"Failed to start Proton profiling: {exc}",
+                )
 
         if "VIZTRACER" in activities:
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
@@ -469,14 +779,36 @@ class RequestHandler:
         if activities:
             if activities != ["CUDA_PROFILER"]:
                 logger.info(
-                    "Profiling starts%s. Traces will be saved to: %s (with profile id: %s)",
-                    stage_str,
-                    self.profiler_output_dir,
-                    self.profile_id,
+                    f"Profiling starts{stage_str!s}. Traces will be saved to: "
+                    f"{self.profiler_output_dir!s} (with profile id: "
+                    f"{self.profile_id!s})",
                 )
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
+
+    def _profile_sync(self) -> None:
+        """Rendezvous the attention TP peers without touching the device.
+
+        ``torch.distributed.barrier`` cannot be used here. It prefers
+        ``group.bound_device_id`` over its CPU branch, and
+        ``DistributedInitializer`` binds ``cuda:N`` to every group -- including
+        the gloo ones -- to force eager NCCL init. A gloo barrier therefore
+        allocates ``aten.empty`` on CUDA, and these calls run on the
+        control-plane thread (stage transitions arrive through
+        ``_profile_batch_predicate``), where ``_NoDeviceWork`` rejects exactly
+        that. The result was every rank dying mid-profile with "control-plane
+        thread ran CUDA factory".
+
+        An all-reduce over a preallocated CPU tensor rendezvouses identically
+        and allocates nothing, matching how the loop's other in-round
+        collectives are written.
+        """
+        if self.attn_tp_size == 1:
+            return
+        torch.distributed.all_reduce(
+            self._profile_sync_buf, group=self.attn_tp_cpu_group
+        )
 
     def stop_profile(self, stage: ForwardMode | None = None) -> ProfileReqOutput | None:
         if not self.profile_in_progress:
@@ -488,7 +820,7 @@ class RequestHandler:
         Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.name}" if stage else ""
-        logger.info("Stop profiling%s...", stage_suffix)
+        logger.info(f"Stop profiling{stage_suffix!s}...")
 
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
@@ -498,7 +830,7 @@ class RequestHandler:
                     f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
                 )
             )
-            torch.distributed.barrier(self.attn_tp_cpu_group)
+            self._profile_sync()
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
@@ -511,10 +843,18 @@ class RequestHandler:
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
 
+        proton_error: Exception | None = None
         if "PROTON" in self.profiler_activities:
             # Finalizes the session and writes the profile now, while this
             # process is still alive (shutdown is SIGKILL; no atexit).
-            stop_profiling()
+            try:
+                stop_profiling()
+            except Exception as exc:
+                logger.exception("Failed to finalize Proton profiling")
+                proton_error = exc
+            finally:
+                # Do not reply until every TP peer has finished writing.
+                self._profile_sync()
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()
@@ -523,13 +863,18 @@ class RequestHandler:
 
         if self.profiler_activities and self.profiler_activities != ["CUDA_PROFILER"]:
             logger.info(
-                "Profiling done. Traces are saved to: %s", self.profiler_output_dir
+                f"Profiling done. Traces are saved to: {self.profiler_output_dir!s}",
             )
 
         self.torch_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        if proton_error is not None:
+            return ProfileReqOutput(
+                success=False,
+                message=f"Failed to finalize Proton profiling: {proton_error}",
+            )
         return ProfileReqOutput(success=True, message="Succeeded.")
 
     def _profile_batch_predicate(self, forward_mode=None):

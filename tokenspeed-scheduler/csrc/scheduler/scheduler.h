@@ -27,35 +27,24 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#include "resource/types.h"
-#include "scheduler/types.h"
-#include "scheduler/request.h"
-#include "scheduler/execution_plan.h"
-#include "scheduler/execution_event.h"
-#include "scheduler/kv_cache_events.h"
-
-#include "resource/allocator/page_allocator.h"
-#include "resource/allocator/paged_cache_group.h"
-#include "resource/kv_prefix_cache/kv_prefix_cache.h"
-#include "resource/allocator/req_pool_allocator.h"
-#include "resource/allocator/mamba_chunk_allocator.h"
-#include "resource/allocator/mamba_host_allocator.h"
-#include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
-
+#include "cache/coordinator/cache_coordinator.h"
+#include "cache/core/block_pool.h"
+#include "cache/tier/transfer_manager.h"
 #include "fsm/forward_events.h"
-#include "fsm/cache_events.h"
 #include "fsm/pd_events.h"
+#include "resource/allocator/req_pool_allocator.h"
+#include "scheduler/execution_event.h"
+#include "scheduler/execution_plan.h"
+#include "scheduler/kv_cache_events.h"
+#include "scheduler/operations/cache.h"
+#include "scheduler/request.h"
+#include "scheduler/types.h"
 
-#if TOKENSPEED_FLAT_KVCACHE
-#include <unordered_set>
-
-#include "cache/block_pool.h"
-#include "cache/kv_cache_coordinator.h"
-#include "cache/forward_cache_ops.h"
-#endif
 namespace tokenspeed {
 
 class Scheduler {
@@ -63,91 +52,145 @@ public:
     explicit Scheduler(SchedulerConfig config);
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
-    std::vector<std::string> CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match = false);
 
     ExecutionPlan NextExecutionPlan();
-
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
+    // Testing/control-plane operation. A successful return means the complete
+    // Device L1 prefix cache was removed; Host L2 is never touched.
+    bool ClearL1Cache();
+    // Public flush operation. A successful return means both Device L1 and
+    // Host L2 prefix indexes were removed.
+    bool ClearCache();
+    // Same in-flight and pin checks as ClearCache, with no mutation. Weight
+    // updates MIN-reduce this across the replica before any rank clears.
+    bool CanClearCache() const;
 
+    // Lifecycle counters read the current FSM state; they do not schedule work.
+    std::size_t BootstrappingSize() const;
+    // Submitted plus Retracted requests waiting for admission/readmission.
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
-    std::size_t RetractedSize() const;
-    std::size_t AvailableKvPages() const;
-    std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
-    std::int32_t GetRequestTokenSize(const std::string& id) const;
-    std::vector<std::string> PagedCacheGroupIds() const;
-    std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
-    std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
-    std::int64_t PagedCacheGroupFailedAllocCount(const std::string& group_id) const;
-    std::vector<std::int32_t> GetRequestPagedCachePageIds(const std::string& request_id,
-                                                          const std::string& group_id) const;
-    // Compact-view base logical-page offset; 0 for full-history / unseen.
-    std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
-#if TOKENSPEED_FLAT_KVCACHE
-    // Free pages in the flat shared BlockPool; int32 twin of AvailableKvPages() for C++ tests.
-    std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
-    std::int32_t FlatHostPoolCachedBlocks() const { return flat_host_pool_.NumCachedBlocks(); }
-    std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumFreeBlocks(); }
-    std::int32_t FlatHostPoolPinnedBlocks() const { return flat_host_pool_.NumPinnedCachedBlocks(); }
-#endif
+    // Device pool parents that are empty or hold only unpinned cache entries.
+    // Scans the pool and every prefix index: a leak check for tests and
+    // diagnostics, not a per-step gauge.
+    std::int32_t AvailableLcmBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    // Per-step gauges: empty parents are O(1), active parents walk the live
+    // requests' block tables. Parents resident only as cache are
+    // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
+    std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
+    std::int32_t ActiveLcmBlocks() const;
+    // RemotePrefilling only: a subset of PrefillSize(), never an extra total.
+    std::size_t RemotePrefillSize() const;
+    // Requests whose pages PD still pins. This resource count overlaps FSM states.
+    std::size_t PdTransferSize() const;
+    std::int32_t RequestTokenSize(const std::string& id) const;
+    // Maximum logical request extent that one request can reserve in an
+    // otherwise reclaimable device pool. The runtime must enforce this limit
+    // before submitting requests.
+    std::int32_t MaxSingleRequestTokens() const { return max_single_request_tokens_; }
+
+    std::int32_t CacheGroupTotalPages(const std::string& group_id) const;
+    std::int32_t CacheGroupAvailablePages(const std::string& group_id) const;
+
+    // Test/diagnostic view of pdTransferInFlight by request id.
+    bool PdTransferPinned(const std::string& request_id) const;
+    std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
+    std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
+    std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+
+    // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
+    // backend for existing objects, then registers the matching CacheKeys so
+    // ProbePrefix can treat them as Host hits that require prefetch.
+    std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
+    // Prefix hashes of Submitted/Retracted requests the scheduler can admit
+    // this round. The event loop revalidates these against L3 immediately
+    // before NextExecutionPlan so a queued hit cannot survive deletion.
+    // Requests that cannot take a batch slot (full decode batch, HOL
+    // incomplete prefill) or cannot obtain Device pages (pool exhausted)
+    // are skipped so a long waiter is not rehashed and remotely probed on
+    // every decode step.
+    std::vector<std::string> WaitingPrefixHashes() const;
+    std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
+        return coordinator_.ExpandPrefixKeys(content_hashes);
+    }
+    void RegisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.RegisterStorageKeys(keys); }
+    void UnregisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.UnregisterStorageKeys(keys); }
 
 private:
-    // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
-    std::tuple<std::vector<ForwardOperation>,
-               std::variant<std::vector<LoadBackOperation>, std::vector<WriteBackOperation>>>
-    newForwardOperation(std::vector<Request*> candidates);
-    std::vector<WriteBackOperation> newWriteBackOperation(
-        std::unordered_map<std::string, std::unique_ptr<Request>>& requests);
-    std::optional<WriteBackOperation> newRetractOperation(Request* retract_request);
-
-    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
-                                             std::vector<LoadBackOperation>& loadback_ops);
-    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event);
-    DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event);
-    DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event);
-    std::optional<WriteBackOperation> applyEventAndGenerateOp(Request* request, fsm::ScheduleRetractEvent event);
-    PrefetchOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefetchEvent event);
-
-    std::optional<fsm::SchedulePrefetchEvent> schedulePrefetch(Request* request, const MatchResult& match);
-
-    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
-        Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
-        std::map<std::string, std::int32_t>& simulated_free);
-    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(Request* request, std::int32_t remaining,
-                                                             std::int32_t reserve_num_tokens_in_next_schedule_event,
-                                                             std::map<std::string, std::int32_t>& simulated_free);
-    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request,
-                                                           std::map<std::string, std::int32_t>& simulated_free);
-    std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
-        Request* request, std::map<std::string, std::int32_t>& simulated_free);
-    std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
-
-#if TOKENSPEED_FLAT_KVCACHE
-    // One hash pass at admission: the device match, the read-only host-tier match above its
-    // boundary, and the extension's hash slice (registration form).
-    struct FlatAdmissionMatch {
-        CoordinatorMatch device;
-        CoordinatorMatch host;
-        std::vector<std::string> ext_hashes;
+    bool clearCache(bool include_host);
+    bool cacheIsClearable(bool include_host) const;
+    struct AdmissionMatch {
+        CacheCoordinator::PrefixProbe probe;
+        std::vector<std::string> candidate_prefix_hashes;
+        std::vector<std::string> extension_hashes;
+        std::vector<std::string> prefix_hashes;
     };
-    FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
-                                                    std::int32_t ext_real_pages, std::int32_t chunk_tokens,
-                                                    std::int32_t decode_reserve_tokens) const;
-    std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
-                                                      std::int32_t decode_reserve_tokens,
-                                                      std::int32_t num_computed_tokens) const;
-    bool flatAdmitDecode(Request* request) const;
-    bool flatPoolWedged(const std::vector<Request*>& candidates) const;
-    void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
-#endif
 
-    void check_device_mem();
+    struct KvEventHashProgress {
+        std::vector<std::uint64_t> block_hashes;
+    };
 
-private:
-    void handleEvent(const cache::PrefetchDone& event);
+    // What the per-request admission layer reports back to the role
+    // grammars. Together with the output ExecutionPlan (where admit()
+    // records fresh pages to zero) this is ALL that layer sees of a
+    // plan-building pass: batch composition lives in PlanBuild, which the
+    // grammars alone hold, so nothing below them can bypass pushOperation.
+    struct AdmissionFeedback {
+        // Set by admit() when the last admission failed for capacity (as
+        // opposed to a chunk that aligned to zero tokens). The phases clear
+        // it before each attempt.
+        bool admission_failed{false};
+        // The first candidate whose admission failed for capacity, in phase
+        // order -- the request a retraction would serve. A readmission is
+        // never recorded here: when it needs a victim, the two simply do not
+        // fit together, and swapping them is pure thrash.
+        Request* capacity_blocker{nullptr};
+    };
+
+    std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
+        ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
+    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(ExecutionPlan& plan,
+                                                                                 AdmissionFeedback& feedback,
+                                                                                 Request* request,
+                                                                                 std::int32_t remaining,
+                                                                                 std::int32_t decode_input_tokens);
+    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                             Request* request, std::int32_t remaining,
+                                                             std::int32_t reserve_num_tokens_in_next_schedule_event);
+    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                           Request* request);
+
+    PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
+                                                 std::vector<LoadBackOperation>& load_back_operations);
+    PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event);
+    DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
+
+    AdmissionMatch matchPrefixAtAdmission(Request* request);
+    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                           CacheCoordinator::PrefixProbe&& prefix,
+                                                           std::span<const GroupDemand> demands,
+                                                           const RequestProgress& progress,
+                                                           std::optional<std::uint64_t> request_access_epoch);
+    bool admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
+                                  const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
+                                  const RequestProgress& progress);
+    void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+                                    std::int32_t first_page);
+    void markKvEventBoundaryForReconcile(const CacheKey& boundary);
+    std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+
+    std::size_t groupIndex(const std::string& group_id) const;
+    Request* findRequest(const std::string& request_id);
+    // A PD transfer is out against this request's pages, so nothing here may
+    // retract, finish or flush them. Derived from the FSM, never recorded: on
+    // the D role it is the peer's prefill writing the destination pages
+    // (RemotePrefilling); on the P role it is the peer's decode reading them,
+    // which begins with the first scheduled chunk and ends only with the PD
+    // ACK -- every page-holding state. A fused engine never transfers.
+    bool pdTransferInFlight(const Request& request) const;
+
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
@@ -156,125 +199,158 @@ private:
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
+    void handleEvent(const forward::Retract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
-private:
-    Request* find_request(std::string rid) {
-        auto it = requests_.find(rid);
-        return it != requests_.end() ? it->second.get() : nullptr;
+    // Mutable state of one plan-building pass: the output plan, the model
+    // batch under construction, the transfer peer's two streams, and the
+    // composition flags the role grammars consult. buildForwardOperations
+    // owns one and hands it to the role's builder. The admission layer never
+    // sees this struct -- it receives build.plan and an AdmissionFeedback --
+    // so batch and budget accounting stay behind pushOperation.
+    struct PlanBuild {
+        explicit PlanBuild(ExecutionPlan& output_plan) : plan{output_plan} {}
+
+        ExecutionPlan& plan;
+        std::vector<ForwardOperation> operations;
+        std::vector<ForwardOperation> remote_decode;
+        std::vector<ForwardOperation> remote_prefill;
+        std::vector<LoadBackOperation> load_backs;
+        // A round schedules each request at most once, whatever states it
+        // moves through while the phases run (a prompt completed by the
+        // prefill phase is PrefillDone by the time the decode phase walks
+        // the same candidates -- its first decode is next round's work).
+        std::unordered_set<const Request*> scheduled;
+        std::int32_t token_budget{0};
+        // Budget the decode batch must leave untouched for a pending local
+        // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
+        // fused mixed mode only).
+        std::int32_t state_prefill_reserve{0};
+        bool pushed_prefill{false};
+        bool pushed_decode{false};
+        bool Full(std::int32_t max_batch_size) const {
+            return token_budget <= 0 || operations.size() == static_cast<std::size_t>(max_batch_size);
+        }
+        bool Scheduled(const Request& request) const { return scheduled.contains(&request); }
+        // No prefill made progress this round: nothing new was admitted and
+        // no resident prefill advanced a chunk. Decode steps do not count --
+        // they release no capacity, so a round of pure decode leaves a
+        // stalled prefill exactly as stuck as an empty one.
+        bool NoPrefillProgress() const { return !pushed_prefill && remote_prefill.empty(); }
+    };
+
+    // Budget/flag accounting for one operation entering the model batch.
+    // Work handed to the transfer peer takes neither budget nor a batch
+    // slot, so it bypasses this (but still marks the request scheduled).
+    template <typename Operation>
+    void pushOperation(PlanBuild& build, const Request& request, Operation operation) {
+        build.scheduled.insert(&request);
+        // The D role budgets prompt tokens only: its prefills are the peer's
+        // work (they ride plan.remote_prefill and never reach here), so its
+        // decode steps run against no chunk budget.
+        if constexpr (std::is_same_v<Operation, PrefillOperation>) {
+            build.token_budget -= operation.input_length;
+            build.pushed_prefill = true;
+        } else if (config_.role != Role::kD) {
+            build.token_budget -= operation.input_length;
+        }
+        if constexpr (std::is_same_v<Operation, DecodeOperation>) {
+            build.pushed_decode = true;
+        }
+        build.operations.push_back(std::move(operation));
     }
 
-    // Group-id list for flat KV-cache ops; empty span on the radix path so call sites stay #if-free.
-    std::span<const std::string> FlatGroupIds() const {
-#if TOKENSPEED_FLAT_KVCACHE
-        return flat_group_ids_;
-#else
-        return {};
-#endif
-    }
+    // Admission for one prefill-work candidate: a resumed chunk for a
+    // Prefilling request, the first chunk otherwise. Returns the built
+    // operation, or nullopt when admission fails (feedback.admission_failed
+    // says whether capacity was the reason).
+    std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                             Request* request, std::int32_t token_budget,
+                                                             std::int32_t decode_reserve,
+                                                             std::vector<LoadBackOperation>& load_backs);
 
-private:
+    // The readmission this round may schedule, or nullptr: among the
+    // retracted requests holding a recoverable snapshot, decode-origin
+    // victims first, then oldest retraction epoch. Derived from the states
+    // themselves, so a request that finishes or aborts while retracted
+    // simply stops qualifying. A snapshot-less retraction is not in this
+    // ordering at all -- it re-prefills through the ordinary admission path
+    // (admitsLikeNewPrompt).
+    static Request* nextReadmission(std::span<Request* const> candidates);
+
+    // The capacity-retraction entry shared by the D and fused grammars:
+    // fires only when no prefill progressed and admission failed. Retracts
+    // victims and RETRIES the blocked admission in the same plan build, so
+    // the freed capacity reaches the request it was freed for -- never a
+    // free page waiting for whoever asks first next round.
+    void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                 std::vector<WriteBackOperation>& write_back_operations);
+    Request* chooseVictim(std::span<Request* const> candidates) const;
+    void retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations);
+
+    // One plan-building grammar per engine role: the roles share the
+    // scheduling mechanism (schedulePrefill / scheduleDecode / admission)
+    // and the two phase helpers below, but compose genuinely different
+    // batches, so each role states its own story instead of one loop full of
+    // role conditionals. Every phase walks the candidates in submission
+    // order (requests_ is the FIFO) -- what used to be a priority ladder is
+    // now the phase sequence itself, and within a phase older requests win.
+    void buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+    void buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                               std::vector<WriteBackOperation>& write_back_operations);
+    void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                        std::vector<WriteBackOperation>& write_back_operations);
+    void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                  Request* readmission, std::int32_t decode_reserve);
+    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+
     SchedulerConfig config_;
-
-private:
-    PageAllocator device_allocator_;
-    PageAllocator host_allocator_;
-    std::optional<MambaChunkAllocator> mamba_allocator_{};
-    std::optional<MambaHostAllocator> mamba_host_allocator_{};
-    KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
-    std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
 
-#if TOKENSPEED_FLAT_KVCACHE
+    // Pools outlive every CacheBlockRef stored below.
     BlockPool block_pool_;
-    // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
-    // placeholder there too); the two differ only in which memory the ids index.
-    BlockPool flat_host_pool_;
-    KvCacheCoordinator coordinator_;
-    std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
-    // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
-    // an in-flight forward can still free pool pages, which flatPoolWedged keys off.
-    std::unordered_map<std::string, std::int32_t> pending_forward_results_;
-    // Reserve ledger: decode pages promised at admission but Acquired only at PrefillDone->Decoding; until
-    // then they sit in the free count, so every flat gate subtracts OTHER requests' entries.
-    std::unordered_map<std::string, std::int32_t> flat_reserved_pages_;
-    // Flat retract requires TWO consecutive starved rounds (an in-flight Finish fakes one)
-    // before releasing a victim; see resolveFlatStarvation.
-    std::int32_t flat_starved_rounds_{0};
-    // Requests terminalized as flat OOM (pool wedged by unretractable mid-prefill holders, no
-    // retract victim); drained into the plan being built for the client layer to fail them.
-    std::vector<std::string> flat_oom_request_ids_;
+    BlockPool host_pool_;
+    CacheCoordinator coordinator_;
+    TierTransferManager tier_transfers_;
+    std::vector<WriteBackOperation> pending_write_back_operations_;
+    std::vector<std::string> cache_group_ids_;
+    std::int32_t max_single_request_tokens_{0};
 
-    struct FlatStoreTicket {
-        std::string key;
-        BlockRef device_block;  // source page, pinned under the D2H copy
-        BlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
+    // Stamped onto each retraction; the readmission order lives on the
+    // Retracted states themselves (nextReadmission).
+    std::int64_t next_retraction_epoch_{1};
+
+    // Submission order -- the FIFO every scheduling phase walks, identical
+    // on every rank because the mirrored schedulers receive identical
+    // batches. The unique_ptr keeps each Request's address stable across
+    // vector reshuffles, so the id index below never dangles.
+    std::vector<std::unique_ptr<Request>> requests_;
+    std::unordered_map<std::string, Request*> requests_by_id_;
+    std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
+    // What the prefix index cannot tell us about a boundary: the token
+    // descriptor the external event carries, and whether that event is
+    // currently out (a BlockStored not yet followed by its BlockRemoved).
+    // Residency itself is the coordinator's answer, never mirrored here.
+    // Cache mutations and registrations only mark a boundary for reconcile;
+    // DrainKvEvents reconciles each marked boundary against its residency, so
+    // the order of evictions and publications inside one admission does not
+    // matter. After a drain, a descriptor exists exactly for the boundaries
+    // with a cached child.
+    struct KvEventBoundary {
+        KvBlockStoredEvent stored;
+        // Position in the prefix chain (page index). Consumers resolve a
+        // Stored event's parent_block_hash on receipt, so DrainKvEvents
+        // orders each batch by depth rather than by mutation order.
+        std::int32_t depth{0};
+        bool published{false};
+        bool needs_reconcile{false};
     };
-    // In-flight D2H stores. The host pool is transaction-blind like the device pool, so the
-    // key-dedupe index lives here, paired with the op ledger: Add/Retire are the only mutation
-    // points, so keys_ always equals the union of in-flight ticket keys.
-    class FlatStoreLedger {
-    public:
-        void Add(cache_op_id id, std::vector<FlatStoreTicket> tickets) {
-            for (const FlatStoreTicket& t : tickets) {
-                keys_.insert(t.key);
-            }
-            const bool inserted = ops_.emplace(id, std::move(tickets)).second;
-            _assert(inserted, "duplicate flat store op id");
-        }
-        // Empty result: unknown op (the radix WriteBackDone path owns it).
-        std::vector<FlatStoreTicket> Retire(cache_op_id id) {
-            auto it = ops_.find(id);
-            if (it == ops_.end()) {
-                return {};
-            }
-            for (const FlatStoreTicket& t : it->second) {
-                keys_.erase(t.key);
-            }
-            std::vector<FlatStoreTicket> tickets = std::move(it->second);
-            ops_.erase(it);
-            return tickets;
-        }
-        bool InFlight(const std::string& key) const { return keys_.contains(key); }
-        bool Empty() const { return ops_.empty(); }
-
-    private:
-        std::unordered_map<cache_op_id, std::vector<FlatStoreTicket>> ops_;
-        std::unordered_set<std::string> keys_;
-    };
-    FlatStoreLedger flat_store_ops_;
-
-    struct FlatLoadTicket {
-        std::vector<BlockRef> host_pins;
-        std::vector<BlockRef> device_blocks;
-    };
-    // In-flight H2D loads: op_id -> the pinned source host pages plus the pinned destination
-    // device pages (a freed destination must not be recycled under the copy); LoadBackDone drops both.
-    std::unordered_map<cache_op_id, FlatLoadTicket> flat_load_ops_;
-
-    // Sum excluding request_id: a request consuming its own reservation must not be gated by it.
-    std::int32_t flatReservedPagesExcept(const std::string& request_id) const {
-        std::int32_t total = 0;
-        for (const auto& [id, pages] : flat_reserved_pages_) {
-            if (id != request_id) {
-                total += pages;
-            }
-        }
-        return total;
-    }
-
-    // Pool budget the flat gates charge against: free blocks minus other requests' decode reservations.
-    std::int32_t flatFreeBudget(const std::string& request_id) const {
-        return block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request_id);
-    }
-#endif
-
-private:
-    std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
-    std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
-    std::vector<KvCacheEvent> kv_events_;
-    SchedulerStats stats_;
+    std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
+    // The boundaries marked for reconcile. Mutations mark them in whatever
+    // order the coordinator touches pages (evictions run suffix-first), so
+    // this order carries no meaning; DrainKvEvents sorts the batch.
+    std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
 };
 
 }  // namespace tokenspeed

@@ -27,6 +27,9 @@ import numpy as np
 import requests
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.cache_protocol import (
+    CacheTransferContract,
+)
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.utils import DisaggregationMode
@@ -43,20 +46,21 @@ logger = get_colorful_logger(__name__)
 class PrefillParallelInfo:
     tp_size: int
     dp_size: int
-    enable_mla_l1_5_cache: bool
-    kv_item_lens: tuple[int, ...] = ()
-    kv_unit_lens: tuple[int, ...] = ()
-    state_item_lens: tuple[int, ...] = ()
-    state_unit_lens: tuple[int, ...] = ()
+    cache_fields_by_stage: tuple[tuple[str, ...], ...]
+    cache_layout: CacheTransferContract | None = None
+    # Prefill chunk-pipeline stage count; each stage sends only its own
+    # layers' KV, so Decode plans per stage and unions the routes.
+    pp_size: int = 1
 
     @property
     def prefill_tp_size_per_dp_rank(self):
-        return self.tp_size // self.dp_size
+        # Intra-stage TP width: the registered world spans pp stages.
+        return self.tp_size // (self.dp_size * self.pp_size)
 
 
 def parse_prefill_status_message(
     parts: list[bytes],
-) -> tuple[int, int, int, int, list[int] | None]:
+) -> tuple[int, int, int, int, list[int] | None, int]:
     bootstrap_room = int(parts[0].decode("ascii"))
     status = int(parts[1].decode("ascii"))
     prefill_rank = int(parts[2].decode("ascii"))
@@ -70,6 +74,7 @@ def parse_prefill_status_message(
         prefill_rank,
         bootstrap_token,
         spec_candidate_ids,
+        int(parts[5].decode("ascii")) if len(parts) > 5 else 0,
     )
 
 
@@ -95,9 +100,8 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.max_failures = max(
             envs.TOKENSPEED_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
         )
-        self.start_decode_thread()
         self.connection_pool: dict[str, dict[str, str | int]] = {}
-        self.required_prefill_response_num_table: dict[int, int] = {}
+        self.expected_prefill_ranks_table: dict[int, frozenset[int]] = {}
         self.prefill_response_tracker: dict[int, set[int]] = defaultdict(set)
 
         self.prefill_parallel_info: dict[str, PrefillParallelInfo] = {}
@@ -106,6 +110,9 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # fail to receive the KV Cache transfer done signal after bootstrapping.
         # These timeout requests should be aborted to release the tree cache.
         self.waiting_timeout = envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
+        # The status and heartbeat threads read every field above, so publish
+        # their sockets only after the manager is fully initialized.
+        self.start_decode_thread()
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
@@ -115,13 +122,18 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
         self.bootstrap_token_table: dict[int, int] = {}
         self.spec_candidate_ids_table: dict[int, list[int]] = {}
+        self.cached_tokens_table: dict[int, int] = {}
         self._pending_bootstrap_token_table: dict[int, int] = {}
         self._pending_spec_candidate_ids_table: dict[int, list[int]] = {}
 
         def decode_thread():
             while True:
                 parts = self.server_socket.recv_multipart()
-                self._handle_prefill_status(*parse_prefill_status_message(parts))
+                try:
+                    parsed = parse_prefill_status_message(parts)
+                    self._handle_prefill_status(*parsed)
+                except Exception:
+                    logger.exception("Rejecting malformed Prefill status message")
 
         def heartbeat_checker():
             while True:
@@ -154,7 +166,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                                     )
                         else:
                             logger.info(
-                                "Attempting to reconnect to %s...", bootstrap_addr
+                                f"Attempting to reconnect to {bootstrap_addr!s}...",
                             )
                             self.heartbeat_failures[bootstrap_addr] = (
                                 self.heartbeat_failures.get(bootstrap_addr, 0) + 1
@@ -163,7 +175,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                                 if bootstrap_addr in self.session_pool:
                                     del self.session_pool[bootstrap_addr]
                     except Exception:
-                        logger.info("Attempting to reconnect to %s...", bootstrap_addr)
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr!s}...")
                         self.heartbeat_failures[bootstrap_addr] = (
                             self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                         )
@@ -187,12 +199,33 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         prefill_rank: int,
         bootstrap_token: int,
         spec_candidate_ids: list[int] | None,
+        cached_tokens: int,
     ) -> None:
+        if bootstrap_room not in self.request_status:
+            return
         if status == TransferPoll.Success:
-            if bootstrap_room not in self.request_status:
+            expected_prefill_ranks = self.expected_prefill_ranks_table.get(
+                bootstrap_room
+            )
+            if expected_prefill_ranks is None:
+                self.record_failure(
+                    bootstrap_room,
+                    "Received KV completion before its transfer route was registered",
+                )
+                self.update_status(bootstrap_room, TransferPoll.Failed)
                 return
-
+            if prefill_rank not in expected_prefill_ranks:
+                self.record_failure(
+                    bootstrap_room,
+                    "Received KV completion from an unexpected Prefill TP rank",
+                )
+                self.update_status(bootstrap_room, TransferPoll.Failed)
+                return
             self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            # TP ranks describe overlapping prefixes, not disjoint ranges.
+            self.cached_tokens_table[bootstrap_room] = max(
+                self.cached_tokens_table.get(bootstrap_room, 0), cached_tokens
+            )
             if bootstrap_token != -1:
                 self._pending_bootstrap_token_table.setdefault(
                     bootstrap_room, bootstrap_token
@@ -202,11 +235,16 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                     bootstrap_room, spec_candidate_ids
                 )
 
-            expected_response_num = self.required_prefill_response_num_table.get(
-                bootstrap_room, 1
-            )
+            expected_response_num = len(expected_prefill_ranks)
             arrived_response_num = len(self.prefill_response_tracker[bootstrap_room])
             if arrived_response_num < expected_response_num:
+                return
+            if self.prefill_response_tracker[bootstrap_room] != expected_prefill_ranks:
+                self.record_failure(
+                    bootstrap_room,
+                    "Prefill TP completion set disagrees with the transfer route",
+                )
+                self.update_status(bootstrap_room, TransferPoll.Failed)
                 return
 
             # Store metadata before marking Success so generate_events() can read
@@ -238,10 +276,13 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         """Pop and return the bootstrap_token for the given room, or -1 if absent."""
         return self.bootstrap_token_table.pop(bootstrap_room, -1)
 
-    def pop_prefill_metadata(self, bootstrap_room: int) -> tuple[int, list[int] | None]:
+    def pop_prefill_metadata(
+        self, bootstrap_room: int
+    ) -> tuple[int, list[int] | None, int]:
         return (
             self.bootstrap_token_table.pop(bootstrap_room, -1),
             self.spec_candidate_ids_table.pop(bootstrap_room, None),
+            self.cached_tokens_table.pop(bootstrap_room, 0),
         )
 
     def get_session_id(self):
@@ -277,7 +318,6 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self.update_status(room, TransferPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
-            "Losing connection with prefill instance (bootstrap_addr: %s), affected %s requests",
-            failed_bootstrap_addr,
-            len(affected_rooms),
+            "Losing connection with prefill instance (bootstrap_addr: "
+            f"{failed_bootstrap_addr!s}), affected {len(affected_rooms)!s} requests",
         )

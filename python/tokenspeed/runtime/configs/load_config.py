@@ -33,6 +33,7 @@ class LoadFormat(str, enum.Enum):
     AUTO = "auto"
     PT = "pt"
     SAFETENSORS = "safetensors"
+    INSTANTTENSOR = "instanttensor"
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
@@ -51,6 +52,10 @@ class LoadConfig:
             not available.
         "pt" will load the weights in the pytorch bin format.
         "safetensors" will load the weights in the safetensors format.
+        "instanttensor" will load the safetensors weights on NVIDIA GPUs
+            using InstantTensor, which accelerates loading via distributed
+            loading, pipelined prefetching, and direct I/O (with optional
+            GPUDirect Storage support).
         "npcache" will load the weights in pytorch format and store
             a numpy cache to speed up the loading.
         "dummy" will initialize the weights with random values, which is
@@ -67,7 +72,7 @@ class LoadConfig:
     model_loader_extra_config: str | dict | None = field(default_factory=dict)
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None
-    weight_loader_prefetch_checkpoints: bool = False
+    weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
 
     ext_yaml: str | None = None
@@ -80,8 +85,8 @@ class LoadConfig:
 
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
             logger.info(
-                "Ignoring the following patterns when downloading weights: %s",
-                self.ignore_patterns,
+                "Ignoring the following patterns when downloading weights: "
+                f"{self.ignore_patterns!s}",
             )
         else:
             self.ignore_patterns = ["original/**/*"]

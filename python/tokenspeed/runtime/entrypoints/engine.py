@@ -36,6 +36,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import signal
+import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
 
@@ -56,6 +57,10 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 import torch
 import uvloop
 
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -84,6 +89,7 @@ from tokenspeed.runtime.utils import (
     set_ulimit,
 )
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.launcher import interface_for_host
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -127,7 +133,7 @@ class Engine(EngineBase):
 
         # Allocate ports for inter-process communications
         self.port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
         # Launch subprocesses
         tokenizer_manager, _, scheduler_info = _launch_subprocesses(
@@ -170,16 +176,6 @@ class Engine(EngineBase):
         ``tokenspeed.runtime.engine.io_struct.GenerateReqInput``.
         Please refer to ``GenerateReqInput`` for the documentation.
         """
-        if self.server_args.mapping.has_attn_dp:
-            if data_parallel_rank is None:
-                logger.debug("data_parallel_rank not provided, using default dispatch")
-            elif data_parallel_rank < 0:
-                raise ValueError("data_parallel_rank must be non-negative")
-            elif data_parallel_rank >= self.server_args.mapping.attn.dp_size:
-                raise ValueError(
-                    f"data_parallel_rank must be less than dp_size: {self.server_args.mapping.attn.dp_size}"
-                )
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -196,6 +192,7 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            data_parallel_rank=data_parallel_rank,
         )
         if stream:
             return self.llm.generate_stream(obj)
@@ -226,6 +223,7 @@ class Engine(EngineBase):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         user_rid: list[str] | str | None = None,
+        data_parallel_rank: list[int] | int | None = None,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function match
@@ -253,6 +251,7 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             user_rid=user_rid,
+            data_parallel_rank=data_parallel_rank,
         )
         generator = self.tokenizer_manager.generate_request(obj)
 
@@ -275,7 +274,19 @@ class Engine(EngineBase):
         # stale-reference error.
         if getattr(self, "llm", None) is not None:
             self.llm.shutdown()
-        kill_process_tree(os.getpid(), include_parent=False)
+        bootstrap_server = getattr(
+            getattr(self, "tokenizer_manager", None),
+            "bootstrap_server",
+            None,
+        )
+        close_bootstrap = getattr(bootstrap_server, "close", None)
+        try:
+            if callable(close_bootstrap):
+                close_bootstrap()
+        except Exception:
+            logger.exception("Failed to close the disaggregation bootstrap server")
+        finally:
+            kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
         return self
@@ -358,16 +369,43 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        *,
+        weight_version: str | None,
     ):
-        """Update weights from distributed source."""
+        """Update weights from distributed source.
+
+        ``weight_version`` is required. Pass ``None`` to keep the current
+        namespace on an intermediate update. Flushed L3 updates must pass
+        a caller-supplied identity so independent checkpoints cannot share
+        a minted successor.
+        """
+        if (
+            flush_cache
+            and weight_version is None
+            and self.server_args.kvstore_storage_backend is not None
+        ):
+            return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            weight_version,
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            weight_version=weight_version,
         )
-        return self.llm.run(self.tokenizer_manager.update_weights_from_distributed(obj))
+        result = self.llm.run(
+            self.tokenizer_manager.update_weights_from_distributed(obj)
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
 
     def update_weights_from_tensor(
         self,
@@ -442,12 +480,37 @@ class Engine(EngineBase):
         self.collective_rpc("save_sharded_model", **kwargs)
 
 
+def _set_socket_interface(server_args: ServerArgs):
+    """Point gloo and NCCL at the interface that reaches the head node.
+
+    Gloo has no peer-address heuristic: left alone it binds whatever the local
+    hostname resolves to, which is a loopback entry on many hosts, and every
+    cross-node gloo collective then fails to connect.
+    """
+    if server_args.mapping.nnodes <= 1 or not server_args.dist_init_addr:
+        return
+
+    head = server_args.dist_init_addr.rsplit(":", 1)[0]
+    interface = interface_for_host(head)
+    if interface is None:
+        logger.warning(
+            f"cannot tell which interface reaches the head node {head}; set "
+            "GLOO_SOCKET_IFNAME and NCCL_SOCKET_IFNAME explicitly if cross-node setup fails"
+        )
+        return
+
+    for name in ("GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME"):
+        os.environ.setdefault(name, interface)
+    logger.info(f"socket interface reaching {head}: {interface}")
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
-    if not server_args.enable_symm_mem:
-        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    if server_args.disable_symm_mem:
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    if server_args.disable_nccl_nvls:
+        os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     if not server_args.disable_tf32:
@@ -455,6 +518,25 @@ def _set_envs_and_config(server_args: ServerArgs):
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    if server_args.numerics == "rl-bitwise":
+        # Bitwise envelope: no TF32 anywhere, and pin NCCL to one
+        # algorithm/protocol so the reduction association order cannot switch
+        # with message size. The envelope's promise beats ambient
+        # environment: a conflicting value is replaced, loudly, instead of
+        # silently voiding the contract.
+        for key, value in (
+            ("NVIDIA_TF32_OVERRIDE", "0"),
+            ("NCCL_ALGO", "Ring"),
+            ("NCCL_PROTO", "Simple"),
+        ):
+            prior = os.environ.get(key)
+            if prior is not None and prior != value:
+                logger.warning(
+                    f"--numerics rl-bitwise replaces {key}={prior} with {value}"
+                )
+            os.environ[key] = value
+
+    _set_socket_interface(server_args)
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -492,7 +574,7 @@ def _launch_subprocesses(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
     # If using model from www.modelscope.cn, first download the model.
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
@@ -562,9 +644,8 @@ def _launch_subprocesses(
         for proc in scheduler_procs:
             proc.join()
             logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
-                proc.pid,
-                proc.exitcode,
+                f"Scheduler or DataParallelController {proc.pid!s} terminated with "
+                f"{proc.exitcode!s}",
             )
         return None, None, None
 
@@ -579,10 +660,11 @@ def _launch_subprocesses(
             data = scheduler_pipe_readers[i].recv()
         except EOFError:
             logger.error(
-                "Rank %s scheduler is dead. Please check if there are relevant logs.", i
+                f"Rank {i!s} scheduler is dead. Please check if there are relevant "
+                "logs.",
             )
             scheduler_procs[i].join()
-            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
             raise
 
         if data["status"] != "ready":
@@ -594,4 +676,162 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.max_single_request_tokens = scheduler_info[
+        "max_single_request_tokens"
+    ]
+    tokenizer_manager.context_len = scheduler_info["max_model_len"]
     return tokenizer_manager, None, scheduler_info
+
+
+def launch_scheduler_headless(server_args: ServerArgs) -> None:
+    """Launch scheduler process(es) driven directly by SMG over msgpack ZMQ.
+
+    Headless: no in-process tokenizer_manager and no AsyncLLM detokenizer (SMG
+    owns both). This process only spawns and
+    supervises the scheduler workers, which connect out to the SMG-bound
+    handshake/input/output sockets (see zmq_msgpack.connect_msgpack_engine_for_loop),
+    then blocks until they exit.
+
+    Forces ``--zmq-msgpack`` + ``--skip-tokenizer-init`` since SMG passes
+    token ids. The workers dial ``tcp://{--data-parallel-address}:
+    {--data-parallel-rpc-port}`` (defaults ``127.0.0.1:30500``; the frontend
+    binds it). Both flags always carry values — non-emptiness and the u16
+    range are enforced at parse time.
+    """
+    server_args.zmq_msgpack = True
+    server_args.skip_tokenizer_init = True
+    # DP > 1: each rank dials the frontend with its own engine identity
+    # (zmq_engine_index + dp_rank) in zmq_msgpack.connect_msgpack_engine_for_loop, the
+    # choke point shared with the non-headless --zmq-msgpack launch path.
+
+    configure_logger(server_args)
+    _set_envs_and_config(server_args)
+
+    # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
+    # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.
+    port_args = PortArgs.init_new(server_args)
+    logger.info(f"headless server_args={server_args!r}")
+
+    server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
+        server_args.model, server_args.tokenizer
+    )
+
+    scheduler_procs: list[mp.Process] = []
+    scheduler_pipe_readers = []
+
+    # SIGUSR1 is what a scheduler sends its parent on an internal exception
+    # (see run_event_loop) — the child itself then exits 0, so record the
+    # failure here or the supervisor would report success.
+    child_failed = threading.Event()
+
+    def _terminate_schedulers(signum=None, _frame=None):
+        """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
+        if signum is not None:
+            logger.info(f"received signal {signum!s}; terminating scheduler(s)")
+        if signum == signal.SIGUSR1:
+            child_failed.set()
+        for proc in scheduler_procs:
+            if proc.is_alive():
+                proc.terminate()
+
+    # Install before spawning so a signal in the launch window is not lost;
+    # an unhandled SIGUSR1 would kill this supervisor without cleanup.
+    signal.signal(signal.SIGTERM, _terminate_schedulers)
+    signal.signal(signal.SIGINT, _terminate_schedulers)
+    signal.signal(signal.SIGUSR1, _terminate_schedulers)
+
+    if not server_args.mapping.attn.has_dp:
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
+        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
+        rank_end = rank_start + server_args.mapping.nprocs_per_node
+        for rank in range(rank_start, rank_end):
+            rank_server_args = copy.copy(server_args)
+            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+            rank_server_args.mapping.rank = rank
+
+            reader, writer = mp.Pipe(duplex=False)
+            proc = mp.Process(
+                target=run_event_loop,
+                args=(rank_server_args, port_args, writer),
+            )
+            with memory_saver_adapter.configure_subprocess():
+                proc.start()
+            scheduler_procs.append(proc)
+            scheduler_pipe_readers.append(reader)
+    else:
+        reader, writer = mp.Pipe(duplex=False)
+        scheduler_pipe_readers.append(reader)
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, writer),
+        )
+        proc.start()
+        scheduler_procs.append(proc)
+
+    try:
+        for i, reader in enumerate(scheduler_pipe_readers):
+            try:
+                data = reader.recv()
+            except EOFError:
+                logger.error(
+                    f"Rank {i!s} scheduler is dead. Please check if there are "
+                    "relevant logs.",
+                )
+                scheduler_procs[i].join()
+                logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
+                raise
+            if data.get("status") != "ready":
+                raise RuntimeError(
+                    "Scheduler initialization failed. See the error messages above."
+                )
+        logger.info(
+            "headless scheduler(s) ready; SMG handshake endpoint="
+            f"{server_args.zmq_handshake_endpoint()!s}",
+        )
+
+        # Supervise until every scheduler exits. If any rank dies (e.g. OOM
+        # SIGKILL) take the survivors down and exit nonzero instead of
+        # reporting success.
+        failed = False
+        alive = list(scheduler_procs)
+        while alive:
+            for proc in list(alive):
+                proc.join(timeout=1)
+                if proc.exitcode is None:
+                    continue
+                alive.remove(proc)
+                if proc.exitcode == 0:
+                    logger.info(
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}",
+                    )
+                else:
+                    logger.error(
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}; "
+                        "terminating the "
+                        "remaining scheduler(s)",
+                    )
+                    failed = True
+                    _terminate_schedulers()
+        if failed or child_failed.is_set():
+            sys.exit(1)
+    finally:
+        # Backstop: never leak GPU-holding scheduler trees, whichever path
+        # (signal, dead rank, readiness failure) unwound this launcher.
+        _terminate_schedulers()
+        for proc in scheduler_procs:
+            proc.join(timeout=5)
+        kill_process_tree(os.getpid(), include_parent=False)
+
+
+def run_scheduler_headless_from_cli(argv: list[str] | None = None) -> None:
+    """CLI shim: ``python -m tokenspeed.runtime.entrypoints.engine <ServerArgs>``."""
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    server_args = prepare_server_args(sys.argv[1:] if argv is None else argv)
+    launch_scheduler_headless(server_args)
+
+
+if __name__ == "__main__":
+    run_scheduler_headless_from_cli()

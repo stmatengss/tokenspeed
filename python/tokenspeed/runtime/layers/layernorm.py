@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
+from tokenspeed_kernel.ops.layernorm import rmsnorm
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -43,31 +44,54 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
-_is_amd = current_platform().is_amd
+_platform = current_platform()
+_is_amd = _platform.is_amd
+
+
+def _torch_allreduce_residual_rmsnorm(
+    *,
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    group,
+    eps: float,
+    **_,
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    torch.distributed.all_reduce(input_tensor, group=group)
+    output, updated_residual = rmsnorm(
+        input_tensor,
+        weight,
+        eps,
+        residual=residual,
+    )
+    return output, updated_residual, None
+
 
 if _is_amd:
-    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
     )
-else:
+
+    _allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
+elif _platform.is_nvidia:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
-        fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         layernorm,
-        rmsnorm,
     )
+
+    _allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
+else:
+    _allreduce_residual_rmsnorm = _torch_allreduce_residual_rmsnorm
 
 
 logger = get_colorful_logger(__name__)
 
 
 def _get_process_group(group: tuple[int, ...]):
-    return pg_manager.get_process_group("nccl", group)
+    return pg_manager.get_device_process_group(group)
 
 
 class LayerNorm(nn.Module):
@@ -81,7 +105,7 @@ class LayerNorm(nn.Module):
         # There might be no tokens here (e.g. idle/padded graph rows).
         if x.shape[0] == 0:
             return x
-        if current_platform().is_nvidia:
+        if _platform.is_nvidia:
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         return nn.functional.layer_norm(
             x.float(),
@@ -106,7 +130,7 @@ class RMSNorm(torch.nn.Module):
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
-        inplace: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # There might be no tokens here
         if x.shape[0] == 0:
@@ -115,46 +139,13 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
-            if residual is not None:
-                if inplace:
-                    raise ValueError(
-                        "fused add rmsnorm does not support inplace operation"
-                    )
-                return triton_rmsnorm(
-                    x,
-                    self.weight.data,
-                    self.variance_epsilon,
-                    residual=residual,
-                )
-            return triton_rmsnorm(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                out=x if inplace else None,
-            )
-        else:
-            if residual is not None:
-                if inplace:
-                    raise ValueError(
-                        "fused_add_rmsnorm does not support inplace operation"
-                    )
-                fused_add_rmsnorm(
-                    x,
-                    residual,
-                    self.weight.data,
-                    self.variance_epsilon,
-                    enable_pdl=pdl_enabled(),
-                )
-                return x, residual
-            out = rmsnorm(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                out=x if inplace else None,
-                enable_pdl=pdl_enabled(),
-            )
-            return out
+        return rmsnorm(
+            x,
+            self.weight.data,
+            self.variance_epsilon,
+            residual=residual,
+            out=out,
+        )
 
     def forward_with_allreduce_fusion(
         self,
@@ -175,13 +166,7 @@ class RMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
+                fused_result = _allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
                     weight=self.weight,
@@ -194,7 +179,6 @@ class RMSNorm(torch.nn.Module):
                     max_sm_to_use=max_sm_to_use,
                     trigger_completion_at_end=trigger_completion_at_end,
                     has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -231,7 +215,6 @@ class RMSNorm(torch.nn.Module):
                     use_oneshot=True,
                     block_quant_fp8=fuse_block_quant_fp8,
                     add_in=add_in,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -298,14 +281,12 @@ class GemmaRMSNorm(torch.nn.Module):
                     residual,
                     self.weight.data,
                     self.variance_epsilon,
-                    enable_pdl=pdl_enabled(),
                 )
                 return x, residual
             out = gemma_rmsnorm(
                 x,
                 self.weight.data,
                 self.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
             return out
 
@@ -330,13 +311,7 @@ class GemmaRMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
+                fused_result = _allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
                     weight=self.gemma_weight,
@@ -349,7 +324,6 @@ class GemmaRMSNorm(torch.nn.Module):
                     max_sm_to_use=max_sm_to_use,
                     trigger_completion_at_end=trigger_completion_at_end,
                     has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -388,7 +362,6 @@ class GemmaRMSNorm(torch.nn.Module):
                     use_oneshot=True,
                     block_quant_fp8=fuse_block_quant_fp8,
                     add_in=add_in,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -426,6 +399,10 @@ class FusedRMSNorm(nn.Module):
         """Expose weight_kv_a from kv_a_norm for backward compatibility."""
         return self.kv_a_norm.weight
 
+    def supports(self, input_q_a: torch.Tensor) -> bool:
+        """Return whether the fused implementation supports this input."""
+        return input_q_a.device.type != "cpu"
+
     def forward(
         self,
         input_q_a: torch.Tensor,
@@ -452,7 +429,6 @@ class FusedRMSNorm(nn.Module):
                 weight2=self.weight_kv_a,
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
         else:
             rmsnorm_fused_parallel(
@@ -463,7 +439,6 @@ class FusedRMSNorm(nn.Module):
                 weight2=self.weight_kv_a,
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
         return input_q_a, input_kv_a
 
@@ -514,7 +489,6 @@ class FusedRMSNorm(nn.Module):
                 block_quant_fp8=fuse_block_quant_fp8,
                 trigger_completion_at_end=trigger_completion_at_end,
                 fp32_acc=False,
-                launch_with_pdl=pdl_enabled(),
             )
             if fused_result[0] is not None:
                 return fused_result

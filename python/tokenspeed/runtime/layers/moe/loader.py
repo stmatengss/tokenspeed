@@ -59,6 +59,17 @@ class MoECheckpointLoadError(RuntimeError):
     pass
 
 
+def _ep_partition(num_experts: int, ep_rank: int, ep_size: int) -> int:
+    if not (
+        num_experts > 0
+        and ep_size > 0
+        and num_experts % ep_size == 0
+        and 0 <= ep_rank < ep_size
+    ):
+        raise ValueError("experts must divide evenly across valid EP ranks")
+    return num_experts // ep_size
+
+
 def _build_default_expert_plan(
     schema: ExpertCheckpointSchema,
     *,
@@ -68,7 +79,7 @@ def _build_default_expert_plan(
 ) -> list[ExpertWeightPlanEntry]:
     # Expert ownership is assumed to be a contiguous per-rank range here.
     # EPLB-aware remapping would need a different planning step.
-    num_local_experts = num_experts // ep_size
+    num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
     start_expert = num_local_experts * ep_rank
     expert_plan: list[ExpertWeightPlanEntry] = []
     for local_expert_id in range(num_local_experts):
@@ -114,25 +125,25 @@ def _build_global_expert_name_plan(
         expert_plan.extend(
             (
                 CheckpointPlanEntry(
-                    param_name="",
+                    param_name="experts.w13_",
                     checkpoint_weight_name=schema.make_expert_weight_name(
                         expert_id, "gate_proj"
                     ),
-                    shard_id="",
+                    shard_id="w1",
                 ),
                 CheckpointPlanEntry(
-                    param_name="",
+                    param_name="experts.w13_",
                     checkpoint_weight_name=schema.make_expert_weight_name(
                         expert_id, "up_proj"
                     ),
-                    shard_id="",
+                    shard_id="w3",
                 ),
                 CheckpointPlanEntry(
-                    param_name="",
+                    param_name="experts.w2_",
                     checkpoint_weight_name=schema.make_expert_weight_name(
                         expert_id, "down_proj"
                     ),
-                    shard_id="",
+                    shard_id="w2",
                 ),
             )
         )
@@ -248,7 +259,7 @@ def _load_fused_expert_tensor(
 ) -> None:
     # Expert ownership is assumed to be a contiguous per-rank range here.
     # EPLB-aware remapping would need a different loading step.
-    num_local_experts = num_experts // ep_size
+    num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
     start_expert = num_local_experts * ep_rank
     end_expert = start_expert + num_local_experts
     weight_loader = param.weight_loader
@@ -296,8 +307,13 @@ class MoECheckpointLoader:
         return any(plan_entry.matches(name) for plan_entry in plan)
 
     def matches(self, name: str) -> bool:
+        plan = (
+            self._global_expert_plan
+            if name.endswith(".input_scale")
+            else self._expert_plan
+        )
         return self._matches_plan(self._fused_plan, name) or self._matches_plan(
-            self._expert_plan, name
+            plan, name
         )
 
     def is_expert_checkpoint_weight(self, name: str) -> bool:
@@ -316,8 +332,10 @@ class MoECheckpointLoader:
         )
 
     def _load_expert(self, name: str, loaded_weight: torch.Tensor) -> str | None:
+        input_scale = name.endswith(".input_scale")
+        plan = self._global_expert_plan if input_scale else self._expert_plan
         mapped_name: str | None = None
-        for plan_entry in self._expert_plan:
+        for plan_entry in plan:
             if not plan_entry.matches(name):
                 continue
 
@@ -330,7 +348,7 @@ class MoECheckpointLoader:
                 param,
                 loaded_weight,
                 shard_id=plan_entry.shard_id,
-                local_expert_id=plan_entry.local_expert_id,
+                local_expert_id=None if input_scale else plan_entry.local_expert_id,
             )
             return mapped_name
 
@@ -379,6 +397,16 @@ class MoECheckpointLoader:
             if param is None:
                 continue
 
+            if mapped_name.endswith("_input_scale"):
+                param.weight_loader(
+                    param,
+                    loaded_weight,
+                    shard_id=plan_entry.shard_id,
+                    local_expert_id=None,
+                )
+                loaded_any = True
+                continue
+
             tensor_to_load = loaded_weight
             if plan_entry.split_dim is not None:
                 tensor_to_load = loaded_weight.chunk(
@@ -405,6 +433,12 @@ class MoECheckpointLoader:
                     * self._ep_rank : local_num_experts
                     * (self._ep_rank + 1)
                 ]
+                if getattr(param, "block_scale_inv", None) is not None:
+                    raise MoECheckpointLoadError(
+                        f"{mapped_name} needs online FP8 block quantization, "
+                        "which the fused local-tensor loader cannot apply; load a "
+                        "pre-quantized checkpoint or drop --quantization fp8."
+                    )
                 if tensor_to_load.dtype == torch.float8_e5m2:
                     default_weight_loader(param, local_experts.to(torch.bfloat16))
                 else:

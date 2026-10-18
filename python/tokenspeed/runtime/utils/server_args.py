@@ -25,11 +25,10 @@ import dataclasses
 import json
 import os
 import random
+import socket
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
+from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
@@ -41,11 +40,30 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
+from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    BLOCK_SPEC_ALGORITHMS,
+    BLOCK_SPEC_RULES,
+)
 
 logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
+
+# Spec-decode overshoot spans the physical KV extent must absorb past the
+# logical context_len. The overlap scheduler steps a finished request at most
+# ONE extra iteration (the depth-1 event loop commits the previous step every
+# round, so the Finish event reaches the C++ scheduler before the next plan),
+# and termination is checked CPU-side against max_new_tokens, so verify can
+# commit past context_len for exactly that window:
+#   1. the finishing step's own accept (up to spec_num_tokens past the limit),
+#   2. the single lingering step's accept,
+#   3. the lingering step laying out its next draft block after that accept.
+# Hence 3 spans. Everything written past context_len belongs to a request
+# whose output is already truncated by max_new_tokens; the garbage KV is
+# evicted with the request one step later.
+_SPEC_OVERSHOOT_SPANS = 3
 
 
 def str_to_bool(value: str | bool) -> bool:
@@ -57,6 +75,21 @@ def str_to_bool(value: str | bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
+
+
+def _uint16(value: str) -> int:
+    """argparse type for values packed as a two-byte identity (``<H``)."""
+    index = int(value)
+    if not 0 <= index <= 0xFFFF:
+        raise argparse.ArgumentTypeError(f"value must be in [0, 65535], got {value}")
+    return index
+
+
+def _nonempty_str(value: str) -> str:
+    """argparse type for string flags that must not be empty."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("value must be a non-empty string")
+    return value
 
 
 @dataclasses.dataclass
@@ -79,7 +112,20 @@ class ServerArgs:
     revision: str | None = None
     language_model_only: bool = False
 
-    # Port for the HTTP server
+    # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
+    # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
+    # output sockets) over the msgpack wire. Default OFF;
+    # SMG tokenizes/detokenizes, so pair with --skip-tokenizer-init.
+    zmq_msgpack: bool = False
+    # The frontend handshake endpoint dialed by each scheduler DP rank.
+    data_parallel_address: str = "127.0.0.1"
+    # Default chosen to avoid the 20000-29999 range used for derived
+    # per-worker handshake ports and common rendezvous defaults of
+    # co-located services.
+    data_parallel_rpc_port: int = 30500
+    zmq_engine_index: int = 0
+
+    # Engine host and base port for derived control-plane endpoints.
     host: str = "127.0.0.1"
     port: int = 8000
 
@@ -90,18 +136,10 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
-    block_size: int = 64
+    # Scheduler cache-reuse identity granularity in tokens.
+    prefix_granularity: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
-    mamba_track_interval: int = 256
-    max_mamba_cache_size: int | None = None
-    mamba_full_memory_ratio: float = 0.9
-    enable_mamba_l2: bool = False
-    mamba_l2_host_slots: int = 0
-    mamba_l2_ratio: float = 2.0
-    mamba_l2_layout: str = "layer_first"
-    mamba_l2_io_backend: str = "kernel"
-    mamba_l2_host_gb: int = 0
 
     # Other runtime options
     stream_interval: int = 1
@@ -119,7 +157,6 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    log_level_http: str | None = None
     enable_log_requests: bool = False
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
@@ -128,24 +165,28 @@ class ServerArgs:
     metrics_reporters: list[str] | None = None
     app_key: str | None = None
 
-    # API related
-    api_key: str | None = None
-    enable_cache_report: bool = False
+    # Cache events
     kv_events_config: str | None = None
 
-    # RL online weight sync (always on / ungated). NOTE: these endpoints can
-    # overwrite model weights, reload checkpoints from disk, and pause/abort
-    # serving, and are exposed on the public control port. See
-    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
-    weight_transfer_config: str | None = None
-    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
-    # + memory occupation, both the native and SGLang-compatible dialects). Set by
-    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
-    # disables the in-engine app.
+    # Port for the in-engine SGLang-compatible RL control app (weight sync,
+    # pause/resume, and memory occupation). Set by the ``ts serve`` orchestrator;
+    # None disables the in-engine app.
     rl_control_port: int | None = None
+    # Version identifier for the model weights. Stamped into every generation
+    # response's meta_info so RL trainers know which policy version produced each
+    # sample. Updated atomically after a successful weight push when the trainer
+    # supplies a new version string.
+    weight_version: str = "default"
 
     # Data parallelism
     data_parallel_size: int | None = None
+    # Pipeline parallelism (prefill-only): number of stages. Only supported on
+    # PD-disaggregated prefill servers; see resolve_disaggregation.
+    pipeline_parallel_size: int = 1
+    # Optional explicit per-stage layer counts, front to back (e.g.
+    # "8,11,11,8"). Default None = even split, remainder to the front. Use to
+    # lighten the embed (first) and lm_head (last) stages.
+    pp_layer_partition: tuple[int, ...] | None = None
     load_balance_method: str = "shortest_queue"
     load_watch_interval: float = 0.02
 
@@ -171,9 +212,15 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
 
+    # Dense GEMM selection is independent of routed-expert kernels.
+    dense_gemm_backend: str = "auto"
+
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
+    # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
+    moe_mxfp4_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -183,15 +230,15 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
-    kvstore_mem_layout: str = "layer_first"
+    # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
-    enable_mla_l1_5_cache: bool = False
 
-    # Multi-node distributed serving
+    # Multi-node distributed serving. ``None`` means "not given by the user",
+    # which is what lets the launcher environment fill them in.
     dist_init_addr: str | None = None
-    nnodes: int = 1
-    node_rank: int = 0
+    nnodes: int | None = None
+    node_rank: int | None = None
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
@@ -199,7 +246,11 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = None
+    kda_backend: str = "auto"
     drafter_attention_backend: str | None = None
+    # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
+    # (default) is exact dense attention; see --skip-softmax-threshold help.
+    skip_softmax_threshold: float = 0.0
     sampling_backend: str | None = None
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -207,9 +258,14 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # DeepSeek V4
+    decode_context_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
+    # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
+    engram_host_table: bool = False
+    engram_host_table_dir: str | None = None
+    engram_host_table_layout: str = "auto"
 
     # Grammar backend
     grammar_backend: str = "none"
@@ -233,6 +289,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    enable_replay_ssm: bool = False
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -245,33 +302,38 @@ class ServerArgs:
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
+    disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
-    enable_nccl_nvls: bool = False
-    enable_symm_mem: bool = False
-    disable_custom_all_reduce: bool = False
+    disable_nccl_nvls: bool = False
+    disable_symm_mem: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
+    batch_invariant_collectives: bool = False
     disable_sampling_tp_sync: bool = False
+    # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
+    # asks for bitwise run-to-run and batch-composition invariance and folds
+    # the determinism switches below (resolve_numerics). Each folded switch
+    # can still be set individually; the umbrella only ever tightens.
+    numerics: str = "auto"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
+    disable_kda_prefill_graph: bool = False
     # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # Request capacities for inline attention; unset keeps the minimum per bucket.
+    prefill_graph_capture_batch_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
-    enable_p2p_check: bool = False
-    triton_attention_reduce_in_fp32: bool = False
-    delete_ckpt_after_loading: bool = False
-    weight_loader_prefetch_checkpoints: bool = False
+    weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
-    enable_custom_logit_processor: bool = False
+    disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
-    warmups: str | None = None
 
     # parallel strategy
     nprocs_per_node: int | None = None
@@ -283,6 +345,7 @@ class ServerArgs:
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
+    mm_encoder_tp_mode: Literal["weights", "data"] = "weights"
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
@@ -292,8 +355,6 @@ class ServerArgs:
     disaggregation_layerwise_interval: int = 1
     pdlb_url: str | None = None
 
-    skip_server_warmup: bool = False
-
     # For communication + norm fusion
     comm_fusion_max_num_tokens: int = 2048
     enable_allreduce_fusion: bool = False
@@ -302,16 +363,31 @@ class ServerArgs:
 
     @property
     def mamba_cache_chunk_size(self) -> int:
-        return max(FLA_CHUNK_SIZE, self.block_size)
+        return max(FLA_CHUNK_SIZE, self.prefix_granularity)
+
+    @property
+    def spec_context_pad(self) -> int:
+        """Tokens the physical KV extent must hold past the logical context_len.
+
+        Zero without speculative decoding; see _SPEC_OVERSHOOT_SPANS for the
+        derivation. Sizing consumers (page tables, graph capture widths) add
+        this pad; user-semantic consumers (input validation, max_new_tokens
+        folding, stop checks) keep the logical context_len.
+        """
+        if self.speculative_algorithm is None:
+            return 0
+        return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
         self.resolve_cache()
         self.resolve_speculative_decoding()
         self.resolve_communication()
+        self.resolve_numerics()
         self.resolve_disaggregation()
         self.validate()
 
@@ -334,8 +410,26 @@ class ServerArgs:
             self.seed = random.randint(0, 1 << 30)
 
     def resolve_config_aliases(self):
+        # Whether the block-drafter widths were given rather than defaulted.
+        self._speculative_widths_explicit = (
+            self.speculative_num_steps != ServerArgs.speculative_num_steps
+            or self.speculative_num_draft_tokens is not None
+        )
+
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
+
+        # Classify explicit DSpark arguments before cache validation, matching
+        # the speculative-config path below. Model aliases that resolve to the
+        # target checkpoint must use the same fail-closed cache contract.
+        if self.speculative_config is None and self.speculative_algorithm == "DSPARK":
+            explicit_draft_model = self.speculative_draft_model_path
+            if (
+                self.draft_model_path_use_base
+                or explicit_draft_model is None
+                or maybe_model_redirect(explicit_draft_model) == self.model
+            ):
+                self.draft_model_path_use_base = True
 
         if self.speculative_config is not None:
             try:
@@ -354,13 +448,30 @@ class ServerArgs:
             if draft_model is not None and self.speculative_draft_model_path is None:
                 self.speculative_draft_model_path = str(draft_model)
 
+            dspark_draft_model = self.speculative_draft_model_path
+            dspark_uses_base_model = self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or dspark_draft_model is None
+                or maybe_model_redirect(dspark_draft_model) == self.model
+            )
+            if dspark_uses_base_model:
+                self.draft_model_path_use_base = True
+
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
-                if self.speculative_algorithm == "DFLASH":
+                self._speculative_widths_explicit = True
+                if self.speculative_algorithm == "DFLASH" or (
+                    self.speculative_algorithm == "DSPARK"
+                    and not dspark_uses_base_model
+                ):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
                     self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                elif self.speculative_algorithm == "DSPARK":
+                    self.speculative_num_steps = num_speculative_tokens
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = num_speculative_tokens + 1
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
@@ -416,10 +527,8 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
-        # Choose kernel backends
-        # attention_backend default is NOT set here — deferred to
-        # AttnInitializer.modify_args where both hardware and model arch are known.
-
+        if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
+            raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -436,10 +545,47 @@ class ServerArgs:
             else:
                 self.sampling_backend = "greedy"
 
+    def resolve_launcher_topology(self):
+        """Fill in unset multi-node arguments from the launcher environment."""
+        topology = detect_topology()
+        if topology is None:
+            self.nnodes = 1 if self.nnodes is None else self.nnodes
+            self.node_rank = 0 if self.node_rank is None else self.node_rank
+            return
+
+        for flag, given, found in (
+            ("--nnodes", self.nnodes, topology.nnodes),
+            ("--node-rank", self.node_rank, topology.node_rank),
+        ):
+            if given is not None and given != found:
+                raise ValueError(
+                    f"{flag}={given} contradicts the {topology.source} environment, "
+                    f"which reports {found}. Drop the flag to use the launcher's "
+                    f"value, or correct the launch."
+                )
+
+        derived = []
+        if self.nnodes is None:
+            self.nnodes = topology.nnodes
+            derived.append(f"--nnodes {self.nnodes}")
+        if self.node_rank is None:
+            self.node_rank = topology.node_rank
+            derived.append(f"--node-rank {self.node_rank}")
+        if self.dist_init_addr is None:
+            check_dist_init_port(topology.dist_init_port)
+            self.dist_init_addr = topology.dist_init_addr
+            derived.append(f"--dist-init-addr {self.dist_init_addr}")
+        if derived:
+            logger.info(
+                f"node {self.node_rank}/{self.nnodes} on {socket.gethostname()}: "
+                f"derived from {topology.source}: {' '.join(derived)}"
+            )
+
     def resolve_parallelism(self):
         world_size = self.world_size
         nprocs_per_node = self.nprocs_per_node
         nnodes = 1 if self.nnodes is None else self.nnodes
+        pp_size = self.pipeline_parallel_size
 
         attn_tp_size = self.attn_tp_size
         attn_dp_size = self.data_parallel_size
@@ -450,7 +596,7 @@ class ServerArgs:
             attn_cp_size, attn_tp_size = attn_tp_size, 1
 
         if world_size is None:
-            world_size = 1
+            world_size = pp_size
             if attn_tp_size is not None:
                 world_size *= attn_tp_size
             if attn_cp_size is not None:
@@ -458,50 +604,86 @@ class ServerArgs:
             if attn_dp_size is not None:
                 world_size *= attn_dp_size
             logger.info(
-                "Inferred world_size (%s) from attn_tp_size (%s) x attn_cp_size (%s) x attn_dp_size (%s)",
-                world_size,
-                attn_tp_size,
-                attn_cp_size,
-                attn_dp_size,
+                f"Inferred world_size ({world_size!s}) from attn_tp_size ("
+                f"{attn_tp_size!s}) x attn_cp_size ({attn_cp_size!s}) x attn_dp_size ("
+                f"{attn_dp_size!s}) x pp_size ({pp_size!s})",
             )
         else:
-            logger.info("Specified world_size (%s)", world_size)
+            logger.info(f"Specified world_size ({world_size!s})")
+
+        # Pipeline stages are the outermost split: every per-layer-type
+        # parallelism resolves inside one stage's world.
+        if world_size % pp_size != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by "
+                f"--pipeline-parallel-size ({pp_size})"
+            )
+        stage_world_size = world_size // pp_size
 
         attn_tp_size, attn_cp_size, attn_dp_size = _resolve_parallelism_sizes(
-            world_size, attn_tp_size, attn_cp_size, attn_dp_size
+            stage_world_size, attn_tp_size, attn_cp_size, attn_dp_size
         )
 
-        # Dense layers still default to full TP participation when no
-        # dedicated dense_tp_size is provided.
+        # Dense layers default to the attention replica's TP width
+        # (attn_tp_size x attn_cp_size == world_size // attn_dp_size). Without
+        # DP attention this is the full world, unchanged from before; with DP
+        # attention it keeps each dense all-reduce inside one replica (matching
+        # attn) instead of spanning the whole world, which would otherwise cross
+        # nodes and force attn_tp != dense_tp. Pass --dense-tp-size to override.
         dense_tp_size = self.dense_tp_size
         if self.dense_tp_size is None:
-            # dense always do tp now.
-            dense_tp_size = world_size
+            dense_tp_size = attn_tp_size * attn_cp_size
         dense_dp_size = None
 
-        # --enable-expert-parallel auto-sets ep_size = world_size
+        # --enable-expert-parallel auto-sets ep_size = the stage world (the
+        # whole world when PP is off).
         if self.enable_expert_parallel and self.ep_size == 1:
-            self.ep_size = world_size
-            logger.info("--enable-expert-parallel: auto-setting ep_size=%s", world_size)
+            self.ep_size = stage_world_size
+            logger.info(
+                f"--enable-expert-parallel: auto-setting ep_size={stage_world_size!s}",
+            )
 
-        # MoE parallel sizes default to consuming the full world size unless
+        # MoE parallel sizes default to consuming the full stage world unless
         # the user overrides them explicitly.
         moe_ep_size = 1 if self.ep_size is None else self.ep_size
         moe_tp_size = (
-            world_size // moe_ep_size if self.moe_tp_size is None else self.moe_tp_size
+            stage_world_size // moe_ep_size
+            if self.moe_tp_size is None
+            else self.moe_tp_size
         )
         moe_dp_size = None
+
+        # The colocated multimodal encoder lives inside each attention TP
+        # group. ``weights`` preserves the legacy weight-TP layout; ``data``
+        # replicates the encoder weights and assigns whole multimodal items to
+        # the ranks in that group.
+        if self.mm_encoder_tp_mode not in ("weights", "data"):
+            raise ValueError(
+                "mm_encoder_tp_mode must be one of {'weights', 'data'}, got "
+                f"{self.mm_encoder_tp_mode!r}"
+            )
+        if self.mm_encoder_tp_mode == "data":
+            vision_tp_size = 1
+            vision_dp_size = attn_tp_size
+        else:
+            vision_tp_size = attn_tp_size
+            vision_dp_size = 1
 
         self.mapping = Mapping(
             world_size=world_size,
             attn_tp_size=attn_tp_size,
             attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
+            attn_dcp_size=self.decode_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             moe_dp_size=moe_dp_size,
+            vision_tp_size=vision_tp_size,
+            vision_dp_size=vision_dp_size,
+            pp_size=pp_size,
+            pp_layer_partition=self.pp_layer_partition,
             nprocs_per_node=nprocs_per_node,
             nnodes=nnodes,
             base_gpu_id=self.base_gpu_id,
@@ -509,10 +691,26 @@ class ServerArgs:
         )
 
         # Impl constraints:
+        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
+            raise ValueError("DCP cache transfer does not yet support PD")
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
-        logger.info("Parallelism configuration:\n%s", self.mapping)
+        if self.mm_encoder_tp_mode == "data":
+            if self.disaggregation_mode not in ("null", "prefill"):
+                raise ValueError(
+                    "--mm-encoder-tp-mode data currently requires "
+                    "--disaggregation-mode null (aggregate serving) or prefill"
+                )
+            if self.mapping.nnodes != 1:
+                logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
+            if self.mapping.has_attn_cp:
+                raise ValueError(
+                    "--mm-encoder-tp-mode data does not currently support "
+                    "attention context parallelism"
+                )
+
+        logger.info(f"Parallelism configuration:\n{self.mapping!s}")
 
     def resolve_cache(self):
         # Handle KVStore settings.
@@ -528,7 +726,7 @@ class ServerArgs:
             self.drafter_attention_backend = self.attention_backend
 
         if (
-            self.speculative_algorithm == "MTP"
+            self.speculative_algorithm in ("MTP", "DSPARK")
             and self.speculative_draft_model_path is None
         ):
             self.draft_model_path_use_base = True
@@ -542,16 +740,18 @@ class ServerArgs:
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
             expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
             if self.speculative_num_steps == ServerArgs.speculative_num_steps:
                 self.speculative_num_steps = expected_steps
             elif self.speculative_num_steps != expected_steps:
                 raise ValueError(
-                    "DFLASH requires speculative_num_steps to equal "
+                    f"{self.speculative_algorithm} requires "
+                    "speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
-                    f"{self.speculative_num_draft_tokens=}."
+                    f"{self.speculative_num_draft_tokens=}. "
+                    f"{BLOCK_SPEC_RULES}"
                 )
 
         if self.eagle3_layers_to_capture is not None:
@@ -559,7 +759,7 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Hoist the PD-decode topk == 1 check to startup.
+        # Only chain speculative decoding is supported.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
             raise ValueError(
                 "speculative_eagle_topk > 1 (tree spec) is not currently "
@@ -584,21 +784,120 @@ class ServerArgs:
             self.comm_fusion_max_num_tokens = -1
             self.enable_allreduce_fusion = False
             logger.info(
-                "allreduce is forbidden due to different attn_tp_size: %s and dense_tp_size: %s!",
-                self.mapping.attn.tp_size,
-                self.mapping.dense.tp_size,
+                "allreduce is forbidden due to different attn_tp_size: "
+                f"{self.mapping.attn.tp_size!s} and dense_tp_size: "
+                f"{self.mapping.dense.tp_size!s}!",
             )
 
+    def resolve_numerics(self):
+        """Fold the ``--numerics`` envelope into the individual switches.
+
+        ``rl-bitwise`` is the RL rollout contract: within one deployment the
+        same request produces bitwise-identical tokens and logprobs across
+        runs and regardless of batch composition. The umbrella only ever
+        tightens settings — a switch a user already set stays set — and each
+        derived switch remains individually available for auto mode.
+        Runs after ``resolve_communication`` so it can veto the fused
+        all-reduce that resolver auto-enables.
+        """
+        if self.numerics == "auto":
+            return
+        if self.numerics != "rl-bitwise":
+            raise ValueError(
+                f"--numerics must be auto or rl-bitwise, got {self.numerics!r}"
+            )
+        # Collectives: rank-ordered NCCL instead of the symmetric-memory and
+        # trtllm fused paths, and the all-reduce becomes an all-gather with a
+        # fixed-rank-order fp32 fold: NCCL's ring chunks by message size, so
+        # a plain NCCL sum is run-stable but not batch-size-invariant.
+        self.force_deterministic_rsag = True
+        self.batch_invariant_collectives = True
+        self.enable_allreduce_fusion = False
+        self.comm_fusion_max_num_tokens = -1
+        # Kernels: heuristic tactics only (autotune picks shape-dependent
+        # tactics), no TF32, and no programmatic dependent launches.
+        self.disable_autotune = True
+        self.disable_tf32 = True
+        self.disable_pdl = True
+        # MoE: the batch-invariant grouped leaves. Only the auto default is
+        # folded; an explicitly chosen backend stands (and must then honour
+        # the contract itself).
+        if self.moe_backend == "auto":
+            self.moe_backend = "aok"
+
     def resolve_disaggregation(self):
-        # PD disaggregation
-        if self.disaggregation_mode == "prefill":
+        # Pipeline parallelism is a prefill-node-only capability: the chunk
+        # pipeline needs the P role's structural guarantees (no decode token
+        # feedback, non-overlap loop).
+        if self.pipeline_parallel_size > 1:
+            # Debug escape hatch: run PP without PD to validate the stage
+            # pipeline numerically (prefill + first token only — decode
+            # autoregression is NOT correct with in-flight depth > 0).
+            pp_debug = os.environ.get("TS_PP_DEBUG_ALLOW_NON_PREFILL") == "1"
+            if self.disaggregation_mode != "prefill" and not pp_debug:
+                raise ValueError(
+                    "--pipeline-parallel-size > 1 requires "
+                    "--disaggregation-mode prefill; PP is a prefill-node "
+                    "chunk-pipeline feature"
+                )
+            if pp_debug and self.disaggregation_mode == "null":
+                logger.warning(
+                    "TS_PP_DEBUG_ALLOW_NON_PREFILL=1: running PP without PD "
+                    "for pipeline validation; only prefill/first-token output "
+                    "is meaningful"
+                )
+            # A pipeline stage threads its boundary state through an eager
+            # stage forward (ModelExecutor._run_target_forward); no graph
+            # subsystem captures that, so every stage runs eager.
             self.enforce_eager = True
-            logger.warning("CUDA graph is disabled for prefill server")
-        elif self.disaggregation_mode == "decode":
+            logger.info("CUDA graph is disabled under pipeline parallelism")
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "--pipeline-parallel-size > 1 with attention DP is not "
+                    "supported yet"
+                )
+            if self.speculative_algorithm is not None:
+                if (
+                    self.speculative_algorithm != "DSPARK"
+                    or self.disaggregation_mode != "prefill"
+                ):
+                    raise ValueError(
+                        "--pipeline-parallel-size > 1 supports speculation only "
+                        "as DSPARK context production on a prefill server"
+                    )
+                # Current CachePD / draft layout limits rather than PP limits:
+                # CachePD has no CP partition contract, and the draft reduces
+                # its attention-TP embedding partials over the dense TP group.
+                if (
+                    self.mapping.attn.cp_size != 1
+                    or self.mapping.dense.tp_group != self.mapping.attn.tp_group
+                ):
+                    raise ValueError(
+                        "Pipeline DSPARK requires attention CP=1 and matching "
+                        "dense/attention TP groups"
+                    )
+            if (
+                self.pp_layer_partition is not None
+                and len(self.pp_layer_partition) != self.pipeline_parallel_size
+            ):
+                raise ValueError(
+                    f"--pp-layer-partition {self.pp_layer_partition} has "
+                    f"{len(self.pp_layer_partition)} entries but "
+                    f"--pipeline-parallel-size is {self.pipeline_parallel_size}"
+                )
+        elif self.pp_layer_partition is not None:
+            raise ValueError(
+                "--pp-layer-partition requires --pipeline-parallel-size > 1"
+            )
+        # PD disaggregation. The prefill role keeps the ordinary graph flags:
+        # it never runs a decode step, so the decode graph has nothing to
+        # capture (ModelExecutorConfig.prefill_only), while its extend
+        # forwards replay the prefill graph like any server's.
+        if self.disaggregation_mode == "decode":
             # Prefix caching stays configurable for decode servers.
             logger.info(
-                "enable_prefix_caching=%r for decode server",
-                self.enable_prefix_caching,
+                f"enable_prefix_caching={self.enable_prefix_caching!r} for decode "
+                "server",
             )
         elif self.disaggregation_mode == "encode":
             # Encode server: vision tower only, no LM / KV pool / prefix cache.
@@ -610,9 +909,6 @@ class ServerArgs:
                     "multiple independent encode servers for horizontal scale."
                 )
             self.enable_prefix_caching = False
-
-        # Prefill graph disable logic is handled by AttnInitializer.modify_args
-        # after the attention backend is resolved.
 
         if (
             self.disaggregation_mode == "prefill"
@@ -626,37 +922,51 @@ class ServerArgs:
                 )
 
     def _handle_kvstore(self):
-        if self.disaggregation_mode in ("decode", "encode"):
+        if self.disaggregation_mode == "encode":
             self.enable_kvstore = False
             logger.info(
-                "%s instance has set enable_kvstore to False!",
-                self.disaggregation_mode,
+                f"{self.disaggregation_mode!s} instance has set enable_kvstore to "
+                "False!",
             )
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
-        if self.kvstore_storage_backend == "mooncake":
-            if self.kvstore_mem_layout == "layer_first":
-                self.kvstore_mem_layout = "page_first"
-                logger.warning(
-                    "Mooncake storage backend does not support layer_first layout, switching to %s layout",
-                    self.kvstore_mem_layout,
-                )
-
-            if self.kvstore_io_backend == "direct":
-                self.kvstore_io_backend = "kernel"
-                logger.warning(
-                    "Mooncake storage backend uses page_first layout, which requires kernel io backend"
-                )
+        if self.kvstore_storage_backend is not None and not self.enable_kvstore:
+            raise ValueError(
+                "L3 storage (--kvstore-storage-backend) requires Host L2; "
+                "unset --disable-kvstore"
+            )
 
     def validate_cache_options(self):
-        if self.enable_kvstore and not self.enable_prefix_caching:
+        # Runs after _handle_kvstore() has applied the KVStore default, so the
+        # check sees the effective setting rather than the pre-resolution flag.
+        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
+            raise ValueError(
+                "DCP cache transfer does not yet support KVStore; "
+                "use --disable-kvstore."
+            )
+        # Same-checkpoint DSpark's KVStore support depends on where the draft
+        # keeps its context; the engine decides once the draft config resolves
+        # (resolve_dspark_prefix_replay_tokens).
+        if (
+            self.enable_kvstore
+            and not self.enable_prefix_caching
+            and self.disaggregation_mode != "decode"
+        ):
             raise ValueError(
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 
     def validate(self):
+        if self.low_latency_max_num_tokens_per_gpu <= 0:
+            raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
+        if self.device == "npu":
+            if not self.disable_prefill_graph:
+                raise ValueError("NPU execution requires --disable-prefill-graph")
+            if not self.disable_pdl:
+                raise ValueError("NPU execution requires --disable-pdl")
+
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -756,6 +1066,41 @@ class ServerArgs:
             help="Skip vision/audio encoders on a multimodal checkpoint and "
             "run text-only. Multimodal requests are rejected.",
         )
+        parser.add_argument(
+            "--zmq-msgpack",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.zmq_msgpack,
+            help="Drive the scheduler directly from SMG over the msgpack ZMQ "
+            "wire instead of the Python tokenizer_manager (pickle IPC). SMG "
+            "binds the handshake/input/output sockets; the scheduler connects "
+            "in. Pair with --skip-tokenizer-init.",
+        )
+        parser.add_argument(
+            "--data-parallel-address",
+            type=_nonempty_str,
+            default=ServerArgs.data_parallel_address,
+            help="Host of the frontend-bound handshake ROUTER the scheduler "
+            "connects to under --zmq-msgpack (default "
+            f"{ServerArgs.data_parallel_address}).",
+        )
+        parser.add_argument(
+            "--data-parallel-rpc-port",
+            type=_uint16,
+            default=ServerArgs.data_parallel_rpc_port,
+            help="Port of the frontend-bound handshake ROUTER (default "
+            f"{ServerArgs.data_parallel_rpc_port}, outside the smg frontend's "
+            "derived-port band 20000..=29999). `smg serve --backend "
+            "tokenspeed --connection-mode zmq` passes an explicit port "
+            "derived from the worker's ipc:// URL instead.",
+        )
+        parser.add_argument(
+            "--zmq-engine-index",
+            type=_uint16,
+            default=ServerArgs.zmq_engine_index,
+            help="This engine's index under --zmq-msgpack; used as the two-byte "
+            "little-endian ZMQ routing identity SMG addresses it by "
+            "(0..65535).",
+        )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(
             "--load-format",
@@ -765,6 +1110,7 @@ class ServerArgs:
                 "auto",
                 "pt",
                 "safetensors",
+                "instanttensor",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -775,6 +1121,9 @@ class ServerArgs:
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
+            "via distributed loading, pipelined prefetching, and direct I/O "
+            "(with optional GPUDirect Storage support). "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
@@ -803,8 +1152,12 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8" is an alias for "fp8_e4m3".',
+            choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
+            help='Data type for kv cache storage. "auto" will use model data type. '
+            '"bfloat16" explicitly selects BF16 storage. "fp8" is an alias for '
+            '"fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
+            "requires --block-size 128 with an MHA attention backend.",
         )
         parser.add_argument(
             "--kv-cache-quant-method",
@@ -846,7 +1199,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda"],
+            choices=["cuda", "npu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -900,10 +1253,14 @@ class ServerArgs:
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
         )
         parser.add_argument(
-            "--block-size",
-            metavar="BLOCK_SIZE",
+            "--prefix-granularity",
+            "--block-size",  # deprecated alias
+            dest="prefix_granularity",
+            metavar="PREFIX_GRANULARITY",
             type=int,
-            default=ServerArgs.block_size,
+            default=ServerArgs.prefix_granularity,
+            help="Scheduler prefix granularity in tokens: the identity "
+            "boundary of cache reuse. (--block-size is a deprecated alias.)",
         )
 
         # KVStore
@@ -932,36 +1289,22 @@ class ServerArgs:
             help="The IO backend for KVStore transfer between CPU and GPU.",
         )
         parser.add_argument(
-            "--kvstore-mem-layout",
-            type=str,
-            choices=[
-                "layer_first",
-                "page_first",
-                "page_head",
-            ],
-            default=ServerArgs.kvstore_mem_layout,
-            help="The layout of the KVStore host memory pool.",
-        )
-        parser.add_argument(
             "--kvstore-storage-backend",
             type=str,
-            choices=["mooncake"],
+            choices=["mooncake", "memory"],
             default=ServerArgs.kvstore_storage_backend,
-            help="The storage backend for KVStore. "
-            "Built-in backends: mooncake. "
-            "For dynamic backend, use --kvstore-storage-backend-extra-config to specify: "
-            "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="L3 store under compact Host (flat) KV. "
+            "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'memory' is an in-process dict for tests. Requires Host L2 "
+            "(do not pass --disable-kvstore).",
         )
         parser.add_argument(
             "--kvstore-storage-backend-extra-config",
             type=str,
             default=ServerArgs.kvstore_storage_backend_extra_config,
-            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
-        )
-        parser.add_argument(
-            "--enable-mla-l1-5-cache",
-            action="store_true",
-            help="Enable MLA L1.5 cache in disaggregation paths.",
+            help="JSON object of extra L3 backend settings. For mooncake: "
+            "master_server_address, local_hostname, metadata_server, "
+            "global_segment_size, protocol, device_name, tenant_id.",
         )
         # Mamba Cache
         parser.add_argument(
@@ -971,62 +1314,6 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="It is used to tune mamba ssm dtype",
         )
-        parser.add_argument(
-            "--mamba-track-interval",
-            type=int,
-            default=ServerArgs.mamba_track_interval,
-            help="The interval to track the mamba state during decode.",
-        )
-        parser.add_argument(
-            "--max-mamba-cache-size",
-            type=int,
-            default=ServerArgs.max_mamba_cache_size,
-            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
-        )
-        parser.add_argument(
-            "--mamba-full-memory-ratio",
-            type=float,
-            default=ServerArgs.mamba_full_memory_ratio,
-            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
-        )
-        parser.add_argument(
-            "--enable-mamba-l2",
-            action="store_true",
-            help="Enable host-memory L2 cache for Mamba state slots.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-slots",
-            type=int,
-            default=ServerArgs.mamba_l2_host_slots,
-            help="Number of host Mamba L2 slots. If 0, derive from --mamba-l2-host-gb or --mamba-l2-ratio.",
-        )
-        parser.add_argument(
-            "--mamba-l2-ratio",
-            type=float,
-            default=ServerArgs.mamba_l2_ratio,
-            help="Mamba host L2 slot ratio relative to device Mamba slots when host slots are not explicit.",
-        )
-        parser.add_argument(
-            "--mamba-l2-layout",
-            type=str,
-            choices=["layer_first"],
-            default=ServerArgs.mamba_l2_layout,
-            help="Mamba host L2 memory layout.",
-        )
-        parser.add_argument(
-            "--mamba-l2-io-backend",
-            type=str,
-            choices=["direct", "kernel"],
-            default=ServerArgs.mamba_l2_io_backend,
-            help="IO backend for Mamba L2 host/device transfers.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-gb",
-            type=int,
-            default=ServerArgs.mamba_l2_host_gb,
-            help="Mamba L2 host memory budget in GiB. Overrides --mamba-l2-ratio when host slots are not explicit.",
-        )
-
         parser.add_argument(
             "--max-prefill-tokens",
             metavar="MAX_PREFILL_TOKENS",
@@ -1091,12 +1378,6 @@ class ServerArgs:
             help="The logging level of all loggers.",
         )
         parser.add_argument(
-            "--log-level-http",
-            type=str,
-            default=ServerArgs.log_level_http,
-            help="The logging level of HTTP server. If not set, reuse --log-level by default.",
-        )
-        parser.add_argument(
             "--enable-log-requests",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_requests,
@@ -1147,18 +1428,6 @@ class ServerArgs:
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
         )
-        # API related
-        parser.add_argument(
-            "--api-key",
-            type=str,
-            default=ServerArgs.api_key,
-            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
-        )
-        parser.add_argument(
-            "--enable-cache-report",
-            action="store_true",
-            help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
-        )
         parser.add_argument(
             "--kv-events-config",
             type=str,
@@ -1179,6 +1448,24 @@ class ServerArgs:
             help="The data parallelism size. If not set, inferred from world_size and attn_tp_size.",
         )
         parser.add_argument(
+            "--pipeline-parallel-size",
+            metavar="PIPELINE_PARALLEL_SIZE",
+            type=int,
+            default=ServerArgs.pipeline_parallel_size,
+            help="Number of pipeline stages for prefill chunk pipelining. "
+            "Only supported with --disaggregation-mode prefill.",
+        )
+        parser.add_argument(
+            "--pp-layer-partition",
+            metavar="PP_LAYER_PARTITION",
+            type=lambda arg: tuple(int(v) for v in arg.split(",")),
+            default=ServerArgs.pp_layer_partition,
+            help="Explicit per-stage layer counts for pipeline parallelism, "
+            'front to back, e.g. "8,11,11,8". Must have one entry per stage '
+            "and sum to the model's layer count. Default: even split with "
+            "the remainder on the front stages.",
+        )
+        parser.add_argument(
             "--load-balance-method",
             type=str,
             default=ServerArgs.load_balance_method,
@@ -1193,7 +1480,8 @@ class ServerArgs:
             "--load-watch-interval",
             type=float,
             default=ServerArgs.load_watch_interval,
-            help="The interval of load watching in seconds.",
+            help="Heartbeat compatibility interval for load snapshots in seconds. "
+            "Changed load values publish immediately without debounce.",
         )
 
         # Expert parallelism
@@ -1251,10 +1539,34 @@ class ServerArgs:
             help="Enable EPLB algorithm",
         )
         parser.add_argument(
+            "--dense-gemm-backend",
+            type=str,
+            default=ServerArgs.dense_gemm_backend,
+            choices=["auto", "trtllm_cutedsl"],
+            help="Backend for standard 128x128 block-FP8 dense linears. "
+            "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
+            "weights and FP32 scales without requantization. "
+            "Other quantization formats and routed experts are unchanged.",
+        )
+        parser.add_argument(
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, aok "
+            "(the batch-invariant leaves; --numerics rl-bitwise folds auto to "
+            "it)",
+        )
+        parser.add_argument(
+            "--moe-mxfp4-fp8-activation",
+            action="store_true",
+            help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
+            "FlashInfer cutlass W4A8 Humming MoE: about 1.8x faster than the "
+            "default W4A16 path, a few percent of relative error on the expert "
+            "outputs; validate the served model before relying on it). Applies to "
+            "every MXFP4 expert layer, target and draft; the MoE plan fails at "
+            "startup where the selected backend has no FP8-activation kernel for "
+            "the layer.",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1268,7 +1580,9 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            help="MoE all-to-all backend: none, deepep, etc.",
+            choices=["none", "agrs", "deepep", "flashinfer"],
+            help="MoE communication backend. agrs and flashinfer explicitly select "
+            "the Kimi-K3 attention-DP transport; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1287,13 +1601,20 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes. Derived from SLURM_STEP_NUM_NODES when unset.",
         )
         parser.add_argument(
-            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The node rank. Derived from SLURM_NODEID when unset.",
         )
 
         # Model override args
@@ -1307,36 +1628,65 @@ class ServerArgs:
         parser.add_argument(
             "--preferred-sampling-params",
             type=str,
-            help="json-formatted sampling settings that will be returned in /get_model_info",
+            help="Default sampling settings as JSON for SMG's gRPC GetModelInfo response.",
         )
 
-        # Kernel backend
-        attention_backend_choices = [
-            "mha",
-            "mla",
-            "fa3",
-            "fa4",
-            "triton",
-            "flashinfer",
-            "trtllm",
-            "trtllm_mla",
-            "flashmla",
-            "tokenspeed_mla",
-            "hybrid_linear_attn",
-        ]
+        # Kernel backend. Names are validated against the backend registry
+        # after plugin discovery, so plugins can add their own.
+        attention_backend_names = (
+            "mha, mla, fa3, fa4, triton, gluon, flashinfer, trtllm, trtllm_mla, "
+            "flashmla, tokenspeed_mla, hybrid_linear_attn"
+        )
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=attention_backend_choices,
             default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers.",
+            help="Choose the kernels for attention layers: "
+            f"{attention_backend_names}, or a name a plugin registers. 'gluon' "
+            "forces registered Gluon kernels for supported attention "
+            "architectures.",
+        )
+        parser.add_argument(
+            "--kda-backend",
+            type=str,
+            choices=["auto", "fla", "flashkda", "cutedsl_kda"],
+            default=ServerArgs.kda_backend,
+            help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
+            "this setting is ignored and compatible kernels are selected using "
+            "registry priority. On NVIDIA, 'auto' selects the fastest available "
+            "backend "
+            "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
+            "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
+            "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
+            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
             type=str,
-            choices=attention_backend_choices,
-            help="Attention backend for drafter model in speculative decoding. "
-            "If not specified, uses the same backend as the main model (attention_backend).",
+            help="Attention backend for drafter model in speculative decoding "
+            f"({attention_backend_names}, or a plugin's). If not specified, uses "
+            "the same backend as the main model (attention_backend).",
+        )
+        parser.add_argument(
+            "--skip-softmax-threshold",
+            type=float,
+            default=ServerArgs.skip_softmax_threshold,
+            help="BLASST skip-softmax sparsity threshold for the gluon MHA "
+            "prefill kernel (gfx950 only). A K/V block is skipped only when "
+            "every row in the query tile has exp(block_max_score - "
+            "running_max) below this threshold. 0.0 (default) is exact "
+            "dense attention; the skip rate for a given threshold must be "
+            "calibrated per model and sequence length. Only takes effect "
+            "when every request in the batch has a zero-length cached "
+            "prefix and the planner routes the batch to prefill; if any "
+            "request in the batch has a cache hit, or the backend's "
+            "registered prefill kernel does not clear the planner's "
+            "performance cutoff (as with FP8/MXFP8 KV cache and the triton "
+            "backend), the whole batch falls through to the KV-cache-extend "
+            "path, which never reaches this kernel and silently ignores the "
+            "threshold. Backends that do reach kernel selection raise an "
+            "error there if they lack gluon skip-softmax support, rather "
+            "than silently ignoring it.",
         )
         parser.add_argument(
             "--sampling-backend",
@@ -1426,6 +1776,40 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--engram-host-table",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.engram_host_table,
+            help=(
+                "DeepSeek V4.1 Engram: store the two FP8 n-gram tables in host "
+                "memory and gather rows through UVA. Frees HBM for KV cache. "
+                "See --engram-host-table-layout. Requires enough host RAM."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-dir",
+            type=str,
+            default=ServerArgs.engram_host_table_dir,
+            help=(
+                "Directory for shared Engram mmap files. Default: /dev/shm "
+                "when it has enough free space, otherwise /scratch or /tmp. "
+                "Used only with --engram-host-table-layout shared. Docker often "
+                "caps /dev/shm at 32-64 GiB, too small for a full V4.1 table."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-layout",
+            type=str,
+            choices=["auto", "shared", "sharded"],
+            default=ServerArgs.engram_host_table_layout,
+            help=(
+                "Host Engram layout when --engram-host-table is set. shared: one "
+                "full copy per node, skip the lookup all-reduce. sharded: each "
+                "attention-TP rank holds a host shard and keeps the all-reduce "
+                "(anonymous mapping, huge-page friendly). auto: sharded when "
+                "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
             "--grammar-backend",
             type=str,
             choices=["xgrammar", "none"],
@@ -1492,8 +1876,9 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP", "DFLASH"],
-            help="Speculative algorithm.",
+            help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
+            "DSPARK; plugins may register more (validated after plugin "
+            "discovery).",
         )
         parser.add_argument(
             "--speculative-draft-model-path",
@@ -1526,6 +1911,12 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
+            "--enable-replay-ssm",
+            action="store_true",
+            default=ServerArgs.enable_replay_ssm,
+            help="Enable ReplaySSM for supported Qwen GDN target verification.",
+        )
+        parser.add_argument(
             "--enable-output-logprobs",
             action="store_true",
             default=ServerArgs.enable_output_logprobs,
@@ -1552,7 +1943,7 @@ class ServerArgs:
             help="Enable prefix caching.",
         )
         prefix_cache_group.add_argument(
-            "--no-enable-prefix-caching",
+            "--disable-prefix-caching",
             dest="enable_prefix_caching",
             action="store_false",
             help="Disable prefix caching.",
@@ -1568,24 +1959,27 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
+            "--disable-autotune",
+            "--disable-flashinfer-autotune",
+            action="store_true",
+            help="Skip the startup kernel-tuning pass; tunable kernels use each "
+            "library's heuristic tactics instead. Speeds up startup for "
+            "debugging at the cost of serving performance.",
+        )
+        parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
         )
         parser.add_argument(
-            "--enable-nccl-nvls",
+            "--disable-nccl-nvls",
             action="store_true",
-            help="Enable NCCL NVLS for prefill heavy requests when available.",
+            help="Disable NCCL NVLS even when an MNNVL-capable fabric is detected.",
         )
         parser.add_argument(
-            "--enable-symm-mem",
+            "--disable-symm-mem",
             action="store_true",
-            help="Enable NCCL symmetric memory for fast collectives.",
-        )
-        parser.add_argument(
-            "--disable-custom-all-reduce",
-            action="store_true",
-            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+            help="Disable NCCL cuMem support even when an MNNVL-capable fabric is detected.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1618,6 +2012,13 @@ class ServerArgs:
             help="Disable cuda graph for prefill.",
         )
         parser.add_argument(
+            "--disable-kda-prefill-graph",
+            action="store_true",
+            help="Disable KDA prefill CUDA graphs while retaining ordinary "
+            "prefill and decode graph settings. Supported cutedsl_kda prefill "
+            "attention is included in prefill graphs by default.",
+        )
+        parser.add_argument(
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
@@ -1625,15 +2026,41 @@ class ServerArgs:
             "graph. Default (unset) = min(2048, chunked-prefill size); "
             "0 disables.",
         )
-        parser.add_argument(
-            "--prefill-graph-capture-sizes",
-            metavar="PREFILL_GRAPH_CAPTURE_SIZE",
+        prefill_token_sizes = parser.add_mutually_exclusive_group()
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-token-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
             type=int,
             nargs="+",
-            help="Explicit list of token-bucket sizes to capture for the "
-            "breakable prefill graph (like --cudagraph-capture-sizes for "
-            "decode). Unset: a relative-stride ladder bounding padded compute "
-            "at ~12.5%% of any size.",
+            help="Total input-token capacities per forward, summed across the "
+            "batch; not per-request sequence lengths. Shorter inputs are padded. "
+            "For pure prefill, count newly computed tokens, excluding cached "
+            "prefixes. Unset: a relative-stride ladder with ~12.5%% spacing, "
+            "subject to a 16-token minimum step and a 512-token maximum step.",
+        )
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
+            type=int,
+            nargs="+",
+            help="Compatibility alias for --prefill-graph-capture-token-sizes. "
+            "Specify only one spelling.",
+        )
+        parser.add_argument(
+            "--prefill-graph-capture-batch-sizes",
+            metavar="BS",
+            type=int,
+            nargs="+",
+            help="Request capacities for inline prefill attention capture; "
+            "replay rounds up to the smallest fitting captured batch size. "
+            "Unset: the minimum request count that fits each token bucket within "
+            "the model context. KDA uses fixed checkpoint slots, so each token "
+            "bucket needs one inline variant per configured request count. "
+            "Adding request counts increases capture time and memory. "
+            "This does not replace the scheduler's --max-num-seqs limit. "
+            "Batches without a fitting capacity retain the ordinary attention breaks.",
         )
         parser.add_argument(
             "--enable-nan-detection",
@@ -1653,28 +2080,17 @@ class ServerArgs:
             "TOKENSPEED_NVTX=1.",
         )
         parser.add_argument(
-            "--enable-p2p-check",
-            action="store_true",
-            help="Enable the full GPU P2P access check, otherwise trust the driver's P2P report.",
-        )
-        parser.add_argument(
-            "--triton-attention-reduce-in-fp32",
-            action="store_true",
-            help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels.",
-        )
-        parser.add_argument(
-            "--delete-ckpt-after-loading",
-            action="store_true",
-            help="Delete the model checkpoint after loading the model.",
-        )
-        parser.add_argument(
-            "--weight-loader-prefetch-checkpoints",
-            action="store_true",
+            "--disable-weight-loader-prefetch-checkpoints",
+            dest="weight_loader_prefetch_checkpoints",
+            action="store_false",
+            default=ServerArgs.weight_loader_prefetch_checkpoints,
             help=(
-                "Prefetch safetensors checkpoint shards into OS page cache before "
-                "loading. Local ranks split the shard list to reduce repeated reads "
-                "from shared filesystems."
+                "Disable prefetching safetensors checkpoint shards into the OS "
+                "page cache. Prefetch is enabled by default: shards are read "
+                "sequentially a bounded window ahead of weight loading "
+                "(min(80 GiB, 25%% of available host memory)), so weight copies "
+                "hit the cache at streaming bandwidth instead of demand-faulting "
+                "cold pages from shared filesystems."
             ),
         )
         parser.add_argument(
@@ -1689,24 +2105,10 @@ class ServerArgs:
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
         parser.add_argument(
-            "--enable-custom-logit-processor",
+            "--disable-cudagraph-memory-reserve",
             action="store_true",
-            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
         )
-        # Server warmups
-        parser.add_argument(
-            "--skip-server-warmup",
-            action="store_true",
-            help="If set, skip warmup.",
-        )
-        parser.add_argument(
-            "--warmups",
-            type=str,
-            required=False,
-            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
-            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
-        )
-
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp",
@@ -1729,10 +2131,18 @@ class ServerArgs:
             help="Specify tp size for attn part",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            type=int,
+            default=ServerArgs.decode_context_parallel_size,
+            help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
+        )
+        parser.add_argument(
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
-            help="Specify tp size for dense part, default equals nprocs-per-node, if non dp_attn && combine_dense mode, this parameter will be overridden by attn_tp_size",
+            help="Specify tp size for dense part. Defaults to the attention "
+            "replica width (attn_tp_size x attn_cp_size): the full world without "
+            "DP attention, one replica with it.",
         )
         parser.add_argument(
             "--moe-tp-size",
@@ -1755,7 +2165,26 @@ class ServerArgs:
         parser.add_argument(
             "--force-deterministic-rsag",
             action="store_true",
-            help="Enable force deterministic rsag.",
+            help="Use NCCL collectives instead of Triton symmetric-memory "
+            "all-reduce/gather/scatter.",
+        )
+        parser.add_argument(
+            "--batch-invariant-collectives",
+            action="store_true",
+            help="Run every all-reduce as an all-gather plus a fixed-rank-order "
+            "fp32 fold. NCCL sums are run-stable but chunk by message size, so "
+            "they are not batch-size-invariant; the fold is. Costs world_size "
+            "times the all-reduce traffic. Folded in by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--numerics",
+            type=str,
+            choices=["auto", "rl-bitwise"],
+            default=ServerArgs.numerics,
+            help="Numerics envelope. rl-bitwise folds the determinism "
+            "switches (deterministic collectives, no autotune/TF32/PDL, no "
+            "fused all-reduce) so outputs and logprobs are bitwise identical "
+            "across runs and batch compositions within one deployment.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",
@@ -1767,7 +2196,8 @@ class ServerArgs:
             "--low-latency-max-num-tokens-per-gpu",
             type=int,
             default=ServerArgs.low_latency_max_num_tokens_per_gpu,
-            help="Low latency max num tokens per gpu",
+            help="DeepEP low-latency send capacity per rank. Defaults to 256; "
+            "set explicitly to cover the largest batch sent through low latency.",
         )
 
         parser.add_argument(
@@ -1793,6 +2223,18 @@ class ServerArgs:
             choices=mm_attention_backend_choices,
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
+        )
+        parser.add_argument(
+            "--mm-encoder-tp-mode",
+            type=str,
+            choices=["weights", "data"],
+            default=ServerArgs.mm_encoder_tp_mode,
+            help=(
+                "Multimodal encoder parallelism within each attention TP "
+                "group. 'weights' shards encoder weights with TP (default); "
+                "'data' replicates encoder weights and distributes whole "
+                "multimodal items across the TP ranks."
+            ),
         )
         # Disaggregation
         parser.add_argument(
@@ -1823,7 +2265,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "mooncake_async"],
+            choices=["mooncake"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1847,14 +2289,7 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
-        # RL online weight sync (always on / ungated).
-        parser.add_argument(
-            "--weight-transfer-config",
-            type=str,
-            default=ServerArgs.weight_transfer_config,
-            help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
-            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
-        )
+        # SGLang-compatible RL control app.
         parser.add_argument(
             "--rl-control-port",
             type=int,
@@ -1862,6 +2297,12 @@ class ServerArgs:
             help="Port for the in-engine RL control-plane HTTP app (weight sync, "
             "pause/resume, memory occupation). Normally allocated automatically "
             "by the `ts serve` orchestrator.",
+        )
+        parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Initial model-weight version stamped into generation metadata.",
         )
 
     @classmethod
@@ -1906,13 +2347,10 @@ class ServerArgs:
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
 
-    def get_weight_transfer_config(self):
-        """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
-        from tokenspeed.runtime.engine.weight_transfer.config import (
-            WeightTransferConfig,
-        )
-
-        return WeightTransferConfig.from_json(self.weight_transfer_config)
+    def zmq_handshake_endpoint(self) -> str:
+        """The frontend handshake endpoint dialed under ``--zmq-msgpack``,
+        composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
+        return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
@@ -1946,6 +2384,9 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
+    # The resolved rendezvous address after moving past busy local ports.
+    dist_init_addr: str
+
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
@@ -1976,6 +2417,12 @@ class PortArgs:
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+        elif server_args.dist_init_addr is None:
+            raise ValueError(
+                f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
+                "and could not be derived from the launcher environment. "
+                "Example: --dist-init-addr <head-node-ip>:20000"
+            )
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
         if len(dist_init_addr) != 2:
@@ -1986,12 +2433,18 @@ class PortArgs:
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
 
-        # Scan forward until we find a port cluster where all derived ports are free.
-        # This handles the case where a previous engine instance left ports in
-        # TIME_WAIT or its child processes haven't fully terminated yet.
-        # Note: the port at offset +1 (formerly detokenizer_port) is intentionally
-        # skipped so the rest of the port layout stays stable for any external
-        # tooling that indexed off the historical port cluster.
+        # Scan forward until we find a port cluster where all derived ports are
+        # free. This handles the case where a previous engine instance left
+        # ports in TIME_WAIT or its child processes haven't fully terminated
+        # yet. Note: the port at offset +1 (formerly detokenizer_port) is
+        # intentionally skipped so the rest of the port layout stays stable for
+        # any external tooling that indexed off the historical port cluster.
+        #
+        # The whole cluster is bound on node 0 alone, so scanning is only
+        # meaningful there: is_port_available binds the local wildcard, and a
+        # follower moving its own base would simply address ports the head
+        # never bound. Multi-node therefore takes the cluster as derived and
+        # reports a conflict instead of relocating it.
         while True:
             port_base = dist_init_port + 1
             rpc_port = port_base + 2
@@ -2002,17 +2455,26 @@ class PortArgs:
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
             rpc_ipc_port = scheduler_input_port + 1
-            if all(
-                is_port_available(p)
-                for p in [
-                    dist_init_port,
-                    port_base,
-                    rpc_port,
-                    metrics_ipc_port,
-                    scheduler_input_port,
-                    rpc_ipc_port,
-                ]
-            ):
+            cluster = [
+                dist_init_port,
+                port_base,
+                rpc_port,
+                metrics_ipc_port,
+                scheduler_input_port,
+                rpc_ipc_port,
+            ]
+            if server_args.mapping.nnodes > 1:
+                if server_args.node_rank == 0:
+                    busy = [p for p in cluster if not is_port_available(p)]
+                    if busy:
+                        raise ValueError(
+                            f"control-plane ports {busy} are already in use on the "
+                            "head node. Every node derives this cluster from "
+                            "--dist-init-addr, so it cannot be moved on one node "
+                            "alone; restart with a different --dist-init-addr port."
+                        )
+                break
+            if all(is_port_available(p) for p in cluster):
                 break
             dist_init_port += 10
 
@@ -2020,6 +2482,7 @@ class PortArgs:
             tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
             scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
             nccl_port=port,
+            dist_init_addr=f"{dist_init_host}:{dist_init_port}",
             rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
             metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
             tokenizer_worker_ipc_name=None,

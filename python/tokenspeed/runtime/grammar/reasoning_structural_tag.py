@@ -56,12 +56,50 @@ from typing import Any
 _REASONING_PARSER_TO_XGRAMMAR_MODEL: dict[str, str] = {
     "deepseek_r1": "deepseek_r1",
     "deepseek_v31": "deepseek_v3_2",
+    "deepseek_v41": "deepseek_v3_2",
     "kimi": "kimi",
     "kimi_k25": "kimi",
     "minimax": "minimax",
     "qwen3": "qwen_3",
     "qwen3_thinking": "qwen_3",
+    "glm45": "glm_4_7",
 }
+
+
+def _structural_tag_for_inkling(content_format: Any) -> str:
+    """Build Inkling's reasoning/content structural tag.
+
+    The prompt already ends with ``<|message_model|>``. Generation should then
+    contain zero or more reasoning blocks followed by the constrained answer
+    inside the text content block.
+    """
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        SequenceFormat,
+        StarFormat,
+        StructuralTag,
+        TagFormat,
+    )
+
+    reasoning_block = TagFormat(
+        begin="<|content_thinking|>",
+        content=AnyTextFormat(),
+        end="<|end_message|>",
+    )
+    response_block = TagFormat(
+        begin="<|content_text|>",
+        content=content_format,
+        end="<|end_message|>",
+    )
+    tag = StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                StarFormat(content=reasoning_block),
+                response_block,
+            ]
+        )
+    )
+    return tag.model_dump_json(by_alias=True)
 
 
 def structural_tag_for_reasoning_response(
@@ -76,6 +114,9 @@ def structural_tag_for_reasoning_response(
     Returns ``None`` if ``reasoning_parser`` has no xgrammar mapping —
     the caller should leave the user's constraint unchanged in that case.
     """
+    if reasoning_parser == "inkling":
+        return _structural_tag_for_inkling(content_format)
+
     model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
     if model is None:
         return None

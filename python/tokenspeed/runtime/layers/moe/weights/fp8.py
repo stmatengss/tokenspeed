@@ -24,10 +24,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
-from tokenspeed.runtime.layers.moe.weights.loaders import (
-    make_weight_loader,
-    round_up,
-)
+from tokenspeed.runtime.layers.moe.weights.loaders import make_weight_loader, round_up
 from tokenspeed.runtime.utils import set_weight_attrs
 
 
@@ -39,12 +36,13 @@ def create_fp8_block_scale_inverses(
     block_shape: tuple[int, int],
 ) -> None:
     block_n, block_k = block_shape
+    scale_dtype = layer.quant_config.weight_scale_dtype
     w13_weight_scale = torch.nn.Parameter(
         torch.ones(
             spec.num_local_experts,
             2 * round_up(intermediate_size_per_partition, block_n) // block_n,
             round_up(spec.hidden_size, block_k) // block_k,
-            dtype=torch.float32,
+            dtype=scale_dtype,
         ),
         requires_grad=False,
     )
@@ -53,12 +51,30 @@ def create_fp8_block_scale_inverses(
             spec.num_local_experts,
             round_up(spec.hidden_size, block_n) // block_n,
             round_up(intermediate_size_per_partition, block_k) // block_k,
-            dtype=torch.float32,
+            dtype=scale_dtype,
         ),
         requires_grad=False,
     )
     layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
     layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+
+    if (
+        not layer.quant_config.is_checkpoint_fp8_serialized
+        and scale_dtype == torch.float32
+    ):
+        for weight_name, scale in (
+            ("w13_weight", w13_weight_scale),
+            ("w2_weight", w2_weight_scale),
+        ):
+            weight = getattr(layer, weight_name, None)
+            if weight is not None:
+                set_weight_attrs(
+                    weight,
+                    {
+                        "block_scale_inv": scale,
+                        "block_scale_shape": (block_n, block_k),
+                    },
+                )
 
     weight_loader = make_weight_loader(spec)
     set_weight_attrs(w13_weight_scale, {"weight_loader": weight_loader})

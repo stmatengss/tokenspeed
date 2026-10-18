@@ -61,7 +61,7 @@ class InputProcessor:
         # model can't emit ``<think>…</think>`` before the JSON.
         if "json_schema" not in sampling:
             return
-        reasoning_parser = getattr(self.engine.server_args, "reasoning_parser", None)
+        reasoning_parser = self.engine.server_args.reasoning_parser
         if not reasoning_parser:
             return
         try:
@@ -71,10 +71,9 @@ class InputProcessor:
             wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
         except Exception as exc:
             self.engine.logger.warning(
-                "reasoning-parser=%s: failed to wrap json_schema (%s); "
+                f"reasoning-parser={reasoning_parser!s}: failed to wrap json_schema ("
+                f"{exc!s}); "
                 "falling back.",
-                reasoning_parser,
-                exc,
             )
             return
         if wrapped is None:
@@ -91,6 +90,91 @@ class InputProcessor:
         """
         if isinstance(obj, EmbeddingReqInput) and self.engine.is_generation:
             raise ValueError("Embedding and rerank model requests are not supported.")
+        self._validate_data_parallel_rank(obj)
+
+    def _validate_data_parallel_rank(
+        self, obj: GenerateReqInput | EmbeddingReqInput
+    ) -> None:
+        """Validate the attention-DP hard pin on every ingress.
+
+        This is the single choke point all GenerateReqInput paths traverse
+        (Engine API, the SMG gRPC servicer, batch fan-out), unlike
+        ``entrypoints/engine.py`` whose checks the servicer bypasses. Runs
+        before ``normalize_batch_and_arguments``, so fields may be scalar
+        or list.
+
+        Semantics:
+        - non-integer pins (bool/float/str) are a caller error and raise on
+          EVERY engine shape — checked first, before the mode branches below.
+        - engines without attention DP: the pin is meaningless; drop it.
+        - disaggregation engines: the bootstrap_room residue is the
+          authoritative rank carrier on BOTH the prefill and decode sides
+          (pd/mooncake must re-derive the same rank from the room), so the
+          pin is dropped; a conflicting pin is logged, never rejected —
+          rejecting would turn gateway/room version skew into a 400 storm.
+        - colocated attention-DP engines: an out-of-range pin is a caller
+          error and raises (surfacing as a request-level failure).
+        """
+        ranks = getattr(obj, "data_parallel_rank", None)
+        if ranks is None:
+            return
+        rank_list = ranks if isinstance(ranks, list) else [ranks]
+        for rank in rank_list:
+            # bool is an int subclass; both bool and float pins would pass a
+            # bare range compare and then fail the int|None typed msgpack
+            # decode inside the DP controller's dispatch loop.
+            if rank is not None and (
+                not isinstance(rank, int) or isinstance(rank, bool)
+            ):
+                raise ValueError(f"data_parallel_rank must be an int, got {rank!r}")
+
+        server_args = self.engine.server_args
+        mapping = server_args.mapping
+        if not mapping.has_attn_dp:
+            obj.data_parallel_rank = None
+            return
+        dp_size = mapping.attn.dp_size
+
+        if server_args.disaggregation_mode != "null":
+            rooms = obj.bootstrap_room
+            room_list = rooms if isinstance(rooms, list) else [rooms]
+            # Broadcast whichever side is scalar so a scalar pin is checked
+            # against EVERY room residue (and vice versa), then pad the
+            # shorter side with None — zip truncation would silently skip
+            # conflicts past the shorter list, and a rank with no room to
+            # check against is itself a conflict signal.
+            width = max(len(rank_list), len(room_list), 1)
+            if len(rank_list) == 1:
+                rank_list = rank_list * width
+            if len(room_list) == 1:
+                room_list = room_list * width
+            rank_list = rank_list + [None] * (width - len(rank_list))
+            room_list = room_list + [None] * (width - len(room_list))
+            for rank, room in zip(rank_list, room_list):
+                if rank is None:
+                    continue
+                # A non-int room (gateway format bug) is unverifiable — take
+                # the warn+drop path, never raise: on disaggregation engines
+                # a pin must not turn room skew into request rejections.
+                if (
+                    not isinstance(room, int)
+                    or isinstance(room, bool)
+                    or room % dp_size != rank
+                ):
+                    self.engine.logger.warning(
+                        f"data_parallel_rank={rank!s} conflicts with bootstrap_room "
+                        f"residue (room={room!s}, dp_size={dp_size:d}); the room stays "
+                        "authoritative on disaggregation engines — pin ignored.",
+                    )
+                    break
+            obj.data_parallel_rank = None
+            return
+
+        for rank in rank_list:
+            if rank is not None and not 0 <= rank < dp_size:
+                raise ValueError(
+                    f"data_parallel_rank must be in [0, {dp_size}), got {rank}"
+                )
 
     async def tokenize_batch(
         self,
@@ -119,7 +203,7 @@ class InputProcessor:
             if self.engine.server_args.enable_prefix_caching:
                 raise ValueError(
                     "input_embeds is provided while prefix caching is enabled. "
-                    "Please add `--no-enable-prefix-caching` when you launch the server "
+                    "Please add `--disable-prefix-caching` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
             input_embeds = obj.input_embeds
@@ -136,6 +220,15 @@ class InputProcessor:
             isinstance(obj, GenerateReqInput)
             and obj.precomputed_multimodal_inputs is not None
         )
+        if (
+            precomputed_mm
+            and self.engine.server_args.disaggregation_mode == "decode"
+            and self.engine.server_args.language_model_only
+            and self.engine.model_config.is_multimodal
+        ):
+            # Decode only needs the expanded prompt length to size its remote-KV
+            # destination; it never executes the multimodal prefill.
+            precomputed_mm = False
         if precomputed_mm:
             # Gateway-side preprocess path (e.g. SMG): mm tensors are already
             # built by an upstream preprocessor and the input_ids carry the
@@ -143,7 +236,7 @@ class InputProcessor:
             # We still need to run pad_input_tokens so the engine's
             # MultimodalEmbedder can plan encoder-token scatter ranges from each
             # item's offsets — the bare placeholder token alone would not
-            # encode per-item uniqueness needed by the radix prefix layer.
+            # encode per-item uniqueness needed by the single-table prefix layer.
             if not self.engine.model_config.is_multimodal_active:
                 raise ValueError(
                     "precomputed_multimodal_inputs is provided for a text-only model."
@@ -158,13 +251,18 @@ class InputProcessor:
             # the un-padded input_ids (so get_rope_index can still locate the
             # image regions) BEFORE pad_input_tokens substitutes per-image
             # pad_value over the placeholders, then pad for the embed splice.
+            input_ids_list = None
+            if input_ids is not None:
+                input_ids_list = (
+                    input_ids if isinstance(input_ids, list) else list(input_ids)
+                )
             if (
-                input_ids is not None
+                input_ids_list is not None
                 and getattr(multimodal_inputs, "mrope_positions", None) is None
             ):
                 mrope_positions, mrope_position_delta = compute_mrope_positions(
                     self.engine.model_config.hf_config,
-                    list(input_ids),
+                    input_ids_list,
                     multimodal_inputs.mm_items,
                 )
                 multimodal_inputs.mrope_positions = mrope_positions
@@ -173,9 +271,9 @@ class InputProcessor:
                     multimodal_inputs.mrope_position_delta_scalar = int(
                         mrope_position_delta.flatten()[0].item()
                     )
-            if input_ids is not None:
-                input_ids_unpadded = list(input_ids)
-                input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
+            if input_ids_list is not None:
+                input_ids_unpadded = input_ids_list
+                input_ids = pad_input_tokens(input_ids_list, multimodal_inputs)
 
         if self.engine.is_generation:
             session_params = (
@@ -183,10 +281,13 @@ class InputProcessor:
             )
 
         input_token_num = len(input_ids) if input_ids is not None else 0
-        if input_token_num >= self.engine.context_len:
+        max_req_input_len = self.engine.max_req_input_len
+        if max_req_input_len is None:
+            max_req_input_len = self.engine.context_len - 1
+        if input_token_num > max_req_input_len:
             raise ValueError(
-                f"The input ({input_token_num} tokens) is longer than the "
-                f"model's context length ({self.engine.context_len} tokens)."
+                f"The input ({input_token_num} tokens) exceeds the engine's "
+                f"maximum input length ({max_req_input_len} tokens)."
             )
 
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
@@ -198,13 +299,12 @@ class InputProcessor:
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
         elif max_new_tokens + input_token_num >= self.engine.context_len:
             self.engine.logger.warning(
-                "Requested(rid=%s) token count exceeds the model's maximum context length of %s tokens. You requested a total of %s tokens: %s tokens from the input messages and %s tokens for the completion. The max_new_tokens will be truncated to %s.",
-                obj.rid,
-                self.engine.context_len,
-                max_new_tokens + input_token_num,
-                input_token_num,
-                max_new_tokens,
-                adjusted_max_new_tokens,
+                f"Requested(rid={obj.rid!s}) token count exceeds the model's maximum "
+                f"context length of {self.engine.context_len!s} tokens. You requested a"
+                f" total of {max_new_tokens + input_token_num!s} tokens: "
+                f"{input_token_num!s} tokens from the input messages and "
+                f"{max_new_tokens!s} tokens for the completion. The max_new_tokens will"
+                f" be truncated to {adjusted_max_new_tokens!s}.",
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
 
@@ -252,18 +352,19 @@ class InputProcessor:
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(
-                obj.rid,
-                input_text,
-                input_ids,
-                sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
-                obj.stream,
+                rid=obj.rid,
+                input_text=input_text,
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                logprob_start_len=logprob_start_len,
+                top_logprobs_num=top_logprobs_num,
+                token_ids_logprob=token_ids_logprob,
+                stream=obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
+                data_parallel_rank=obj.data_parallel_rank,
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
@@ -276,9 +377,9 @@ class InputProcessor:
             )
 
         return TokenizedEmbeddingReqInput(
-            obj.rid,
-            input_text,
-            input_ids,
-            sampling_params,
+            rid=obj.rid,
+            input_text=input_text,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
             created_time=time.time(),
         )

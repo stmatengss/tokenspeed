@@ -46,6 +46,12 @@ class MooncakeTransferEngine:
         self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
 
     def register(self, ptr, length):
+        """Register ``ptr`` with Mooncake.
+
+        Returns:
+            0 on success, nonzero on failure. KV-arena registration may ignore
+            the result; pack scratch must check it before swapping buffers.
+        """
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception:
@@ -53,7 +59,8 @@ class MooncakeTransferEngine:
             ret_value = -1
 
         if ret_value != 0:
-            logger.debug("Mooncake memory registration %s failed.", ptr)
+            logger.debug(f"Mooncake memory registration {ptr!s} failed.")
+        return ret_value
 
     def deregister(self, ptr):
         try:
@@ -63,7 +70,7 @@ class MooncakeTransferEngine:
             ret_value = -1
 
         if ret_value != 0:
-            logger.debug("Mooncake memory deregistration %s failed.", ptr)
+            logger.debug(f"Mooncake memory deregistration {ptr!s} failed.")
 
     def initialize(
         self,
@@ -98,10 +105,8 @@ class MooncakeTransferEngine:
         if ret < 0:
             # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
             logger.debug(
-                "Failed to transfer data from %s to %s - %s.",
-                buffer,
-                session_id,
-                peer_buffer_address,
+                f"Failed to transfer data from {buffer!s} to {session_id!s} - "
+                f"{peer_buffer_address!s}.",
             )
 
         return ret
@@ -129,10 +134,8 @@ class MooncakeTransferEngine:
 
         if ret < 0:
             logger.debug(
-                "Failed to batch transfer data. Buffers: %s, Session: %s, Peer addresses: %s",
-                buffers,
-                session_id,
-                peer_buffer_addresses,
+                f"Failed to batch transfer data. Buffers: {buffers!s}, Session: "
+                f"{session_id!s}, Peer addresses: {peer_buffer_addresses!s}",
             )
         return ret
 

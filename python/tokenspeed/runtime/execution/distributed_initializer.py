@@ -21,7 +21,6 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -81,7 +80,6 @@ class DistributedConfig:
     max_num_tokens: int = 0
 
     # Feature flags
-    disable_custom_all_reduce: bool = False
     force_deterministic_rsag: bool = False
 
     # The full Mapping object for pg_manager initialization
@@ -111,7 +109,7 @@ class DistributedConfig:
             moe_ep_size=mapping.moe.ep_size,
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
-            dist_init_addr=server_args.dist_init_addr,
+            dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
                 if server_args.distributed_timeout_seconds is not None
@@ -121,7 +119,6 @@ class DistributedConfig:
             nprocs_per_node=mapping.nprocs_per_node,
             hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
-            disable_custom_all_reduce=server_args.disable_custom_all_reduce,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
             mapping=mapping,
         )
@@ -132,8 +129,8 @@ class DistributedInitializer:
     def initialize(config: DistributedConfig) -> float:
         torch.get_device_module(config.device).set_device(config.gpu_id)
         logger.info(
-            "Init torch distributed begin. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init torch distributed begin. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         if config.device == "cuda":
             maybe_set_numa_aware_cpu_affinity(config.gpu_id)
@@ -141,6 +138,8 @@ class DistributedInitializer:
         # Determine backend
         if config.device == "cuda":
             backend = "nccl"
+        elif config.device == "npu":
+            backend = "hccl"
         else:
             raise ValueError(f"Unsupported device: {config.device}")
 
@@ -150,11 +149,11 @@ class DistributedInitializer:
         else:
             dist_init_method = f"tcp://127.0.0.1:{config.nccl_port}"
 
-        # Device-scoped NCCL init is only required and tested on AMD.
+        # Pass the device so PyTorch binds the process group to it (eager NCCL
+        # init) instead of inferring it later — this also mutes the c10d
+        # "barrier(): using the device under current context" warning.
         device_id = (
-            torch.device(config.device, config.gpu_id)
-            if current_platform().is_amd
-            else None
+            None if backend == "hccl" else torch.device(config.device, config.gpu_id)
         )
 
         # Initialize distributed via the mapping-based process group manager
@@ -166,20 +165,70 @@ class DistributedInitializer:
             device_id=device_id,
         )
         pg_manager.init_process_group(config.mapping.world_group)
+        pg_manager.init_process_group(config.mapping.attn.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
+        # A DCP group of one is still the group the decode path collectives
+        # address; init_process_group is idempotent and handles size 1.
+        pg_manager.init_process_group(config.mapping.attn.dcp_group)
+        pg_manager.init_process_group(config.mapping.attn.dp_group)
+        if config.mapping.has_attn_cp:
+            # Context-parallel ranks own different token blocks but must
+            # agree on L3 prefix hits before admit. ENABLE_CP folds attn TP
+            # into CP, so attn.tp_group is size 1 and this group is the
+            # replica's cache-owning set inside a stage.
+            pg_manager.init_process_group(config.mapping.attn.cp_group)
+        # No-op at the default linear_attn.tp == attn.tp (same group,
+        # idempotent).
+        pg_manager.init_process_group(config.mapping.linear_attn.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+        if config.mapping.has_pp:
+            # Cross-stage group for hidden-state P2P (nccl) and small control
+            # broadcasts like the sampled first token (gloo).
+            pg_manager.init_process_group(config.mapping.pp_group)
+
+        from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+        gather_fabric_map()
+
+        # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
+        if config.hidden_size > 0:
+            from tokenspeed.runtime.distributed.comm_backend import (
+                get_global_backend,
+            )
+
+            backend = get_global_backend()
+            trtllm_ar = getattr(backend, "trtllm_ar", None)
+            if trtllm_ar is not None:
+                # One-shot window; configure_group widens cross-node groups.
+                max_oneshot_tokens = max(
+                    1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
+                )
+                for group in {
+                    config.mapping.attn.tp_group,
+                    config.mapping.moe.tp_ep_group,
+                }:
+                    if len(group) > 1:
+                        ok = trtllm_ar.configure_group(
+                            rank=group.index(config.mapping.rank),
+                            group=group,
+                            max_token_num=max_oneshot_tokens,
+                            hidden_dim=config.hidden_size,
+                        )
+                        logger.info(
+                            f"trtllm one-shot all-reduce for group {group!s}: "
+                            f"{('enabled' if ok else 'unavailable (NCCL fallback)')!s}",
+                        )
 
         logger.info(
-            "Init comm buff end. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init comm buff end. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         mapping = config.mapping
         logger.info(
-            "Current Process distributed state:  global rank: %s  attn_tp_rank: %s  attn_dp_rank: %s",
-            mapping.rank,
-            mapping.attn.tp_rank,
-            mapping.attn.dp_rank,
+            f"Current Process distributed state:  global rank: {mapping.rank!s}  "
+            f"attn_tp_rank: {mapping.attn.tp_rank!s}  attn_dp_rank: "
+            f"{mapping.attn.dp_rank!s}",
         )
 
         # Get minimum available GPU memory across all ranks

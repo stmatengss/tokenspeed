@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @functools.cache
@@ -47,7 +48,7 @@ def moe_finalize_fuse_shared(
     expert_weights: torch.Tensor,
     shared_output: Optional[torch.Tensor],
     top_k: int,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Fused MoE finalize + optional shared-output residual (bf16, SM>=90).
 
@@ -55,6 +56,14 @@ def moe_finalize_fuse_shared(
 
         out[t] = Σ_k expert_weights[t, k] * gemm2_out[permuted_idx(t, k)]
                + shared_output[t]                      # if non-null
+
+    Shared-expert-sink form: when ``expert_weights`` has ``top_k + S``
+    columns (S > 0), ``shared_output`` must be the un-weighted per-expert
+    outputs ``[S, num_tokens, hidden_dim]`` and the tail columns are
+    applied here instead::
+
+        out[t] = Σ_k w[t, k] * gemm2_out[permuted_idx(t, k)]
+               + Σ_s w[t, top_k + s] * shared_output[s, t]
 
     Replaces the flashinfer built-in finalize kernel + the native
     ``routed + shared`` tensor add. The caller is responsible for ensuring
@@ -72,14 +81,19 @@ def moe_finalize_fuse_shared(
             with ``do_finalize=False``.
         expanded_idx_to_permuted_idx: ``[num_tokens * top_k]`` int32 —
             permute map (``-1`` means "drop this slot").
-        expert_weights: ``[num_tokens, top_k]`` float32 or bfloat16 — per-token
-            topk weights, already scaled. DSv3/K2.5 trtllm backends use
-            float32 (``_routing_logits_dtype = torch.float32``); other
-            backends use bf16. The kernel is templated on this dtype.
-        shared_output: ``[num_tokens, hidden_dim]`` bf16 or ``None`` —
-            per-token residual to fold into the finalize.
+        expert_weights: ``[num_tokens, top_k]`` or ``[num_tokens, top_k + S]``
+            float32 or bfloat16 — per-token weights, already scaled. Columns
+            beyond ``top_k`` are shared-expert-sink weights (``S <= 8``).
+            DSv3/K2.5 trtllm backends use float32
+            (``_routing_logits_dtype = torch.float32``); other backends use
+            bf16. The kernel is templated on this dtype.
+        shared_output: ``[num_tokens, hidden_dim]`` bf16 residual (added
+            verbatim; only valid with ``top_k``-column weights),
+            ``[S, num_tokens, hidden_dim]`` bf16 un-weighted shared-expert
+            outputs (weighted by the tail columns), or ``None``.
         top_k: top-k count (must be ``<= 64``).
-        enable_pdl: honor upstream/downstream PDL if True.
+        enable_pdl: honor upstream/downstream PDL. Uses the platform default
+            when omitted.
 
     Returns:
         ``[num_tokens, hidden_dim]`` bf16.
@@ -89,17 +103,24 @@ def moe_finalize_fuse_shared(
     assert expanded_idx_to_permuted_idx.dtype == torch.int32
     assert gemm2_out.dim() == 2
     assert expert_weights.dim() == 2
-    num_tokens, top_k_check = expert_weights.shape
-    assert top_k_check == top_k
+    num_tokens, num_weight_cols = expert_weights.shape
+    num_shared = num_weight_cols - top_k
+    assert num_shared >= 0
     hidden_dim = gemm2_out.shape[1]
     # hiddenDim = out.shape[-1]; caller may want a trimmed hidden_dim if
     # padding was applied on the permuted side.
     if shared_output is not None:
         assert shared_output.dtype == torch.bfloat16
-        assert shared_output.dim() == 2
-        assert shared_output.shape[0] == num_tokens
-        hidden_dim = shared_output.shape[1]
+        if num_shared == 0:
+            assert shared_output.dim() == 2
+            assert shared_output.shape[0] == num_tokens
+        else:
+            assert shared_output.dim() == 3
+            assert shared_output.shape[:2] == (num_shared, num_tokens)
+        hidden_dim = shared_output.shape[-1]
         assert hidden_dim <= gemm2_out.shape[1]
+    else:
+        assert num_shared == 0, "shared weight columns require shared_output"
 
     out = torch.empty(
         num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
@@ -114,6 +135,7 @@ def moe_finalize_fuse_shared(
     if shared_output is None:
         shared_output = gemm2_out.new_empty((0, 0), dtype=torch.bfloat16)
 
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     mod = _load_moe_finalize_fuse_shared_module()
     mod.moe_finalize_fuse_shared(
         out,

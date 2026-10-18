@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable as _Iterable
 
+import tokenspeed_kernel
 import torch
 import torch.nn as nn
 import torch.nn.functional as _F
@@ -36,7 +37,7 @@ from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
 from tokenspeed.runtime.execution.context import ForwardContext as _ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode as _get_is_capture_mode,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm as _RMSNorm
@@ -82,7 +83,6 @@ from tokenspeed.runtime.moe.expert_location import (
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled as _pdl_enabled
 
 _longcat_logger = get_colorful_logger(__name__)
 _longcat_platform = _current_platform()
@@ -187,12 +187,20 @@ class _RuntimeLongcatRouter(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # The classifier's logits feed expert selection, so they must be
+            # batch-invariant or top-k flips at near-ties. cuBLAS and the
+            # dsv3 router kernel tile by shape; the aok leaf does not.
+            return tokenspeed_kernel.mm(
+                hidden_states.float(),
+                self.classifier.weight.float(),
+                override="aok",
+            )
         if _longcat_is_hopper_plus and hidden_states.shape[0] > 0:
             return _dsv3_router_gemm(
                 hidden_states,
                 self.classifier.weight,
                 out_dtype=torch.float32,
-                enable_pdl=_pdl_enabled(),
             )
         return _F.linear(hidden_states.float(), self.classifier.weight.float(), None)
 
@@ -247,6 +255,10 @@ class _RuntimeLongcatMoE(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             zero_expert_type=config.zero_expert_type,
+            zero_expert_num=config.zero_expert_num,
+            # LongCat applies its own zero-expert routing to gated SiLU experts.
+            activation="swiglu",
+            routing_mode="precomputed_topk",
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
@@ -345,7 +357,6 @@ class _RuntimeLongcatMoE(nn.Module):
                 expert_weights,
                 zero_expert_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=_pdl_enabled(),
             )
 
         if zero_expert_output is not None:
@@ -500,7 +511,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: _ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
@@ -523,7 +533,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.moe_comm,
         )
         hidden_states, residual = self.moe_comm.post_attn_reduce_norm(
@@ -556,7 +565,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.branch_comm[1],
         )
         hidden_states, residual = self.branch_comm[1].post_attn_reduce_norm(
@@ -620,7 +628,6 @@ class _RuntimeLongcatModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: _ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is not None:
@@ -643,7 +650,6 @@ class _RuntimeLongcatModel(nn.Module):
                     positions,
                     hidden_states,
                     ctx,
-                    out_cache_loc,
                     residual,
                 )
 
@@ -725,7 +731,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             return None
         if name.endswith(_LONGCAT_OPTIONAL_MISSING_WEIGHT_SUFFIXES):
             return None
-        _longcat_logger.warning("The %s is not in the model.", name)
+        _longcat_logger.warning(f"The {name!s} is not in the model.")
         return None
 
     def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]):

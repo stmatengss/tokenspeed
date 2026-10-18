@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import (
+    fp8_quantize_dequantize,
     quantize_fp8,
     quantize_fp8_with_scale,
     quantize_mxfp4,
@@ -30,9 +31,9 @@ from tokenspeed_kernel import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
-from tokenspeed_kernel.platform import current_platform
 
-FP8_E4M3_FNUZ_MAX = 240.0
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_FINFO = torch.finfo(_FP8_DTYPE)
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -61,6 +62,77 @@ def _dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return out * scale_values.repeat_interleave(32, dim=-1)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_fp8_quantize_dequantize_ue8m0(
+    device: str,
+    dtype: torch.dtype,
+    group_size: int,
+    require,
+) -> None:
+    require("quantization", "fp8_quantize_dequantize", "triton", dtype, "x")
+    torch.manual_seed(41)
+    base = torch.randn(3, 2, group_size * 3 + 17, device=device, dtype=dtype)
+    x = base[..., : group_size * 3]
+    assert not x.is_contiguous()
+    blocks = x.float().unflatten(-1, (-1, group_size))
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scales = torch.exp2(torch.ceil(torch.log2(absmax / 448.0)))
+    expected = (
+        torch.clamp(blocks / scales, -448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .float()
+        .mul(scales)
+        .flatten(-2)
+        .to(dtype)
+    )
+
+    actual = fp8_quantize_dequantize(
+        x,
+        group_size=group_size,
+        scale_encoding="ue8m0",
+        override=None,
+        solution="triton",
+    )
+    torch.cuda.synchronize()
+
+    assert actual.shape == x.shape
+    assert actual.dtype == x.dtype
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fp8_quantize_dequantize_cuda_graph_replay(device: str, require) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "fp8_quantize_dequantize", "triton", dtype, "x")
+    x = torch.randn(8, 384, device=device, dtype=dtype)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp8_quantize_dequantize(
+            x,
+            group_size=128,
+            scale_encoding="ue8m0",
+            override=None,
+            solution="triton",
+        )
+
+    x.copy_(torch.linspace(-9.0, 9.0, x.numel(), device=device).reshape_as(x))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    blocks = x.float().unflatten(-1, (-1, 128))
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scales = torch.exp2(torch.ceil(torch.log2(absmax / 448.0)))
+    expected = (
+        torch.clamp(blocks / scales, -448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .float()
+        .mul(scales)
+        .flatten(-2)
+        .to(dtype)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("solution", ["triton"])
 @pytest.mark.parametrize(
     "shape",
@@ -84,14 +156,13 @@ def test_quantize_fp8_pure_cast_bf16(
     require("quantization", "fp8", solution, dtype, "x")
 
     x = torch.randn(shape, device=device, dtype=dtype) * 50
-    fp8 = current_platform().fp8e4m3fn
-    ref = x.to(fp8.dtype)
+    ref = x.to(_FP8_DTYPE)
 
     out = quantize_fp8(x, solution=solution)
     torch.cuda.synchronize()
 
     assert out.shape == ref.shape
-    assert out.dtype == ref.dtype
+    assert out.dtype == _FP8_DTYPE
     assert _bitwise_equal(out, ref)
 
 
@@ -160,8 +231,7 @@ def test_quantize_fp8_strided_slice(
     v = kv[..., qk_nope:]
     assert not v.is_contiguous()
 
-    fp8 = current_platform().fp8e4m3fn
-    ref = v.to(fp8.dtype)
+    ref = v.to(_FP8_DTYPE)
 
     out = quantize_fp8(v, solution=solution)
     torch.cuda.synchronize()
@@ -182,10 +252,11 @@ def test_quantize_fp8_scale_float(
     require("quantization", "fp8", solution, dtype, "x")
 
     x = torch.randn(2048, 512, device=device, dtype=dtype) * 100
-    fp8 = current_platform().fp8e4m3fn
     inv_scale = 1.0 / scale
     ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
+        (x.to(torch.float32) * inv_scale)
+        .clamp(min=_FP8_FINFO.min, max=_FP8_FINFO.max)
+        .to(_FP8_DTYPE)
     )
 
     out = quantize_fp8(x, scale=scale, solution=solution)
@@ -206,10 +277,11 @@ def test_quantize_fp8_scale_tensor(
 
     x = torch.randn(8, 2880, device=device, dtype=dtype) * 100
     scale = torch.tensor([0.125], device=device, dtype=torch.float32)
-    fp8 = current_platform().fp8e4m3fn
     inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
     ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
+        (x.to(torch.float32) * inv_scale)
+        .clamp(min=_FP8_FINFO.min, max=_FP8_FINFO.max)
+        .to(_FP8_DTYPE)
     )
 
     out = quantize_fp8(x, scale=scale, solution=solution)
@@ -242,39 +314,10 @@ def test_pure_cast_non_pow2_n(device: str, n: int) -> None:
     assert _bitwise_equal(out, ref)
 
 
-@pytest.mark.skipif(
-    not current_platform().is_cdna3,
-    reason="float8_e4m3fnuz (tl.float8e4b8) is only supported on AMD CDNA3",
-)
-def test_pure_cast_e4m3fnuz(device: str) -> None:
-    """CDNA3-specific fp8 dtype (bias=8). The Triton cast must saturate to
-    ``±240`` to match ``x.to(torch.float8_e4m3fnuz)``."""
-    torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e4m3fnuz)
-    out = fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
-    torch.cuda.synchronize()
-    assert out.dtype == torch.float8_e4m3fnuz
-    assert _bitwise_equal(out, ref)
-
-
-@pytest.mark.skipif(
-    not current_platform().is_cdna3,
-    reason="float8_e4m3fnuz (tl.float8e4b8) is only supported on AMD CDNA3",
-)
-@pytest.mark.parametrize("scale", [2.0, 0.5, 7.5])
-def test_scaled_cast_e4m3fnuz_matches_reference(device: str, scale: float) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 100
-    inv_scale = 1.0 / scale
-    ref = (
-        (x.to(torch.float32) * inv_scale)
-        .clamp(-FP8_E4M3_FNUZ_MAX, FP8_E4M3_FNUZ_MAX)
-        .to(torch.float8_e4m3fnuz)
-    )
-    out = fp8_quantize(x, scale=scale, fp8_dtype=torch.float8_e4m3fnuz)
-    torch.cuda.synchronize()
-    assert _bitwise_equal(out, ref)
+def test_fp8_quantize_rejects_e4m3fnuz(device: str) -> None:
+    x = torch.empty(1, device=device, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="unsupported fp8 dtype"):
+        fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
 
 
 @pytest.mark.parametrize("solution", ["trtllm"])
@@ -290,8 +333,6 @@ def test_quantize_fp8_with_scale_tensor_and_token(
     require("quantization", "fp8_with_scale", solution, dtype, "x")
 
     x = torch.randn(16, 128, device=device, dtype=dtype) * 10
-    fp8 = current_platform().fp8e4m3fn
-
     out, scale = quantize_fp8_with_scale(
         x,
         granularity=granularity,
@@ -300,7 +341,7 @@ def test_quantize_fp8_with_scale_tensor_and_token(
     torch.cuda.synchronize()
 
     assert out.shape == x.shape
-    assert out.dtype == fp8.dtype
+    assert out.dtype == _FP8_DTYPE
     assert scale.dtype == torch.float32
     if granularity == "tensor":
         assert scale.shape == (1,)
@@ -308,10 +349,14 @@ def test_quantize_fp8_with_scale_tensor_and_token(
         assert scale.shape == (x.shape[0], 1)
 
 
-@pytest.mark.parametrize("solution", ["trtllm", "triton"])
+@pytest.mark.parametrize(
+    "solution,group_size",
+    [("trtllm", 128), ("triton", 128), ("triton", 32)],
+)
 def test_quantize_fp8_with_scale_token_group(
     device: str,
     solution: str,
+    group_size: int,
     require,
 ) -> None:
     torch.manual_seed(5)
@@ -319,20 +364,21 @@ def test_quantize_fp8_with_scale_token_group(
     require("quantization", "fp8_with_scale", solution, dtype, "x")
 
     x = torch.randn(16, 256, device=device, dtype=dtype) * 10
-    fp8 = current_platform().fp8e4m3fn
-
     out, scale = quantize_fp8_with_scale(
         x,
         granularity="token_group",
-        group_size=128,
+        group_size=group_size,
         solution=solution,
     )
     torch.cuda.synchronize()
 
     assert out.shape == x.shape
-    assert out.dtype == fp8.dtype
+    assert out.dtype == _FP8_DTYPE
     assert scale.dtype == torch.float32
-    assert scale.numel() > 0
+    expected_num_scales = x.shape[0] * (x.shape[1] // group_size)
+    assert scale.numel() == expected_num_scales
+    if solution == "triton":
+        assert scale.shape == (x.shape[0], x.shape[1] // group_size)
 
 
 @pytest.mark.parametrize("solution", ["flashinfer"])

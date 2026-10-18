@@ -27,17 +27,18 @@ TokenSpeed-specific behavior explicitly.
 | `--hf-overrides` | JSON model config overrides. |
 | `--host` | HTTP bind host. |
 | `--port` | HTTP bind port. |
-| `--api-key` | API key for the server. |
+| `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Chat template name or path. |
 | `--gpu-memory-utilization` | GPU memory fraction used for weights and KV cache. |
 | `--max-num-seqs` | Maximum concurrent sequences. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` | Enable prefix cache reuse. |
-| `--no-enable-prefix-caching` | Disable prefix cache reuse. |
-| `--enforce-eager` | Disable CUDA graph execution. |
-| `--max-cudagraph-capture-size` | Largest CUDA graph capture size. |
+| `--disable-prefix-caching` | Disable prefix cache reuse. |
+| `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
+| `--max-cudagraph-capture-size` | Largest decode device-graph capture size. |
 | `--tensor-parallel-size`, `--tp` | Set attention tensor parallel size. |
 | `--data-parallel-size` | Data parallel size. |
+| `--mm-encoder-tp-mode` | Select multimodal encoder weight TP (`weights`) or item data parallelism (`data`). |
 | `--enable-expert-parallel` | Enable expert parallelism. |
 | `--speculative-config` | JSON speculative decoding config. |
 | `--kv-events-config` | JSON KV cache event publisher config; the vLLM-style `enable_kv_cache_events` field is accepted and defaults to ZMQ when enabled. |

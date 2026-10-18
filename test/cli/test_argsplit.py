@@ -66,10 +66,15 @@ def test_user_host_port_go_to_gateway_only():
 
 
 def test_chat_template_overrides_to_gateway_only():
-    """Both prepare_server_args and smg accept this flag; spec says gateway."""
     r = _split(["--chat-template", "/some/template.jinja"])
     assert r.engine == []
     assert r.gateway == ["--chat-template", "/some/template.jinja"]
+
+
+def test_api_key_routes_to_gateway():
+    r = _split(["--model", "test/model", "--api-key", "test-key"])
+    assert r.engine == ["--model", "test/model"]
+    assert r.gateway == ["--model", "test/model", "--api-key", "test-key"]
 
 
 def test_tool_call_parser_overrides_to_gateway_only():
@@ -109,6 +114,25 @@ def test_dp_sampling_routes_to_engine():
     r = _split(["--dp-sampling"])
     assert r.engine == ["--dp-sampling"]
     assert r.gateway == []
+
+
+def test_kda_prefill_graph_routes_to_engine():
+    r = _split(["--disable-kda-prefill-graph"])
+    assert r.engine == ["--disable-kda-prefill-graph"]
+    assert r.gateway == []
+
+
+def test_multi_value_capture_sizes_route_to_engine():
+    """nargs='+' engine flags: every bare value belongs to the flag, not argv."""
+    for flag in (
+        "--cudagraph-capture-sizes",
+        "--prefill-graph-capture-sizes",
+        "--prefill-graph-capture-token-sizes",
+        "--prefill-graph-capture-batch-sizes",
+    ):
+        r = _split([flag, "288", "320", "--dp-sampling"])
+        assert r.engine == [flag, "288", "320", "--dp-sampling"]
+        assert r.gateway == []
 
 
 def test_unknown_flag_falls_through_to_gateway():

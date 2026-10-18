@@ -27,6 +27,7 @@ import json
 import os
 import signal
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,7 +40,15 @@ from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
+    DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    GRPC_MAX_MESSAGE_BYTES_ENV,
+    INKLING_ATTENTION_BACKEND,
+    INKLING_REASONING_PARSER,
+    INKLING_TOOL_CALL_PARSER,
+    KIMI_K3_REASONING_PARSER,
+    KIMI_K3_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
+    _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
     _gateway_args_with_default_port,
@@ -47,10 +56,12 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
+    _get_from_args,
     _is_deepseek_v4_model,
+    _is_inkling_model,
+    _is_kimi_k3_model,
     _prewarm_hf_tokenizer,
-    _user_host_port_from_gateway_args,
-    _user_model_id,
+    _set_default_grpc_max_message_bytes,
     run_smg,
 )
 
@@ -68,18 +79,34 @@ def _make_proc(returncode: int | None = None) -> MagicMock:
     return proc
 
 
+def test_grpc_max_message_bytes_default_is_set_when_absent(monkeypatch):
+    monkeypatch.delenv(GRPC_MAX_MESSAGE_BYTES_ENV, raising=False)
+
+    _set_default_grpc_max_message_bytes()
+
+    assert os.environ[GRPC_MAX_MESSAGE_BYTES_ENV] == DEFAULT_GRPC_MAX_MESSAGE_BYTES
+
+
+def test_grpc_max_message_bytes_preserves_explicit_user_value(monkeypatch):
+    monkeypatch.setenv(GRPC_MAX_MESSAGE_BYTES_ENV, "1048576")
+
+    _set_default_grpc_max_message_bytes()
+
+    assert os.environ[GRPC_MAX_MESSAGE_BYTES_ENV] == "1048576"
+
+
 def test_gateway_args_default_port_is_8000():
     gateway_args = _gateway_args_with_default_port(["--model", "/tmp/x"])
 
     assert gateway_args == ["--model", "/tmp/x", "--port", "8000"]
-    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8000)
+    assert _get_from_args(gateway_args, "--port") == "8000"
 
 
 def test_gateway_args_preserve_user_port():
     gateway_args = _gateway_args_with_default_port(["--port", "8413"])
 
     assert gateway_args == ["--port", "8413"]
-    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
+    assert _get_from_args(gateway_args, "--port") == "8413"
 
 
 def test_gateway_args_default_reasoning_parser_is_passthrough():
@@ -111,10 +138,10 @@ def test_gateway_args_preserve_user_policy():
 def test_gateway_args_defaults_include_port_and_reasoning_parser():
     gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
 
-    # The Prometheus port is a freshly allocated free port (see
-    # test_gateway_args_default_prometheus_port_is_free_port), so assert the
-    # fixed prefix exactly and the trailing port slot structurally.
-    assert gateway_args[:-1] == [
+    # No --prometheus-port here: run_smg allocates it right before
+    # spawn_gateway so the port cannot be lost during engine startup (see
+    # test_run_smg_allocates_prometheus_port_at_gateway_spawn).
+    assert gateway_args == [
         "--model",
         "/tmp/x",
         "--port",
@@ -123,15 +150,14 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "passthrough",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
         "--policy",
         "passthrough",
         "--tokenizer-cache-enable-l0",
         "--tokenizer-cache-enable-l1",
         "--log-level",
         "warn",
-        "--prometheus-port",
     ]
-    assert gateway_args[-1].isdigit()
 
 
 def test_gateway_args_defaults_inject_passthrough_policy():
@@ -187,6 +213,60 @@ def test_gateway_args_preserve_user_prometheus_port():
     assert gateway_args == ["--prometheus-port", "29000"]
 
 
+def test_free_port_returns_first_sample_outside_ephemeral_range(monkeypatch):
+    """No retry needed when the first sample already clears the range."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    calls = iter([8413])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 8413
+
+
+def test_free_port_retries_out_of_ephemeral_range(monkeypatch):
+    """A sample landing inside the ephemeral range is resampled."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    # First two samples land inside the ephemeral range; the third clears it.
+    calls = iter([40000, 41000, 9000])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 9000
+
+
+def test_free_port_gives_up_after_max_attempts(monkeypatch):
+    """Never loops forever: after a bounded number of attempts, return
+    whatever the last sample was rather than retrying indefinitely."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    always_ephemeral = iter([40000, 41000, 42000, 43000, 44000, 45000, 46000])
+    call_count = {"n": 0}
+
+    def fake_get_free_port():
+        call_count["n"] += 1
+        return next(always_ephemeral)
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", fake_get_free_port)
+
+    port = _free_port_avoiding_ephemeral_range()
+
+    assert port == 44000  # 5th and last attempt
+    assert call_count["n"] == 5
+
+
+def test_free_port_skips_ephemeral_check_when_range_unknown(monkeypatch):
+    """Non-Linux hosts (no /proc/sys/net/ipv4/ip_local_port_range) degrade
+    to a plain get_free_port() call -- no retries, no crash."""
+    monkeypatch.setattr("tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: None)
+    calls = iter([40000])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 40000
+
+
 def test_smg_disable_flags_appended_when_absent():
     gateway_args = _gateway_args_with_smg_disable_defaults(["--model", "/tmp/x"])
 
@@ -195,6 +275,7 @@ def test_smg_disable_flags_appended_when_absent():
         "/tmp/x",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
     ]
 
 
@@ -207,29 +288,111 @@ def test_smg_disable_flags_not_duplicated():
     assert gateway_args == [
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
     ]
 
 
-def test_smg_disable_flag_set_covers_both():
+def test_smg_disable_defaults_turn_off_load_monitoring():
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--model", "/tmp/x"])
+
+    assert gateway_args.count("--disable-load-monitoring") == 1
+
+
+def test_smg_disable_flag_set_covers_all_three():
     assert _DEFAULT_SMG_DISABLE_FLAGS == (
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
     )
 
 
-def test_user_model_id_extracts_value():
+def test_cache_aware_policy_keeps_load_monitoring():
+    # cache_aware's imbalance/overload triggers feed on the worker load
+    # monitor; injecting the disable flag would leave them silently dead.
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--policy", "cache_aware"])
+
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+    assert "--disable-retries" in gateway_args
+
+
+def test_cache_aware_policy_equals_form_keeps_load_monitoring():
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--policy=cache_aware"])
+
+    assert "--disable-load-monitoring" not in gateway_args
+
+
+def test_operator_policy_is_last_wins():
+    # clap/argparse are last-wins on duplicated flags; the cache_aware
+    # detection must key off the value the gateway will actually use.
+    from tokenspeed.cli.serve_smg import _operator_policy
+
     assert (
-        _user_model_id(["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"])
+        _operator_policy(["--policy", "cache_aware", "--policy", "round_robin"])
+        == "round_robin"
+    )
+    assert (
+        _operator_policy(["--policy", "round_robin", "--policy=cache_aware"])
+        == "cache_aware"
+    )
+
+
+def test_gateway_defaults_pipeline_for_cache_aware():
+    # Pipeline-level guarantee: explicit cache_aware keeps load monitoring,
+    # keeps the other disable defaults, does not duplicate --policy, and does
+    # NOT auto-inject --dp-aware (wheel-pin lockstep is the operator's call).
+    gateway_args = _gateway_args_with_defaults(
+        ["--model", "/tmp/x", "--policy", "cache_aware"]
+    )
+
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+    assert "--disable-retries" in gateway_args
+    assert "--dp-aware" not in gateway_args
+    assert gateway_args.count("--policy") == 1
+    idx = gateway_args.index("--policy")
+    assert gateway_args[idx + 1] == "cache_aware"
+
+
+def test_gateway_defaults_pipeline_for_cache_aware_equals_form():
+    # --policy=cache_aware must suppress the passthrough default too: the
+    # default-policy injection and the cache_aware detection have to agree on
+    # flag spelling, or clap's last-wins silently reverts the operator's
+    # policy to passthrough while load monitoring stays on.
+    gateway_args = _gateway_args_with_defaults(
+        ["--model", "/tmp/x", "--policy=cache_aware"]
+    )
+
+    # No bare "--policy <value>" pair may be appended; the operator's
+    # equals-form token must stay the only policy on the line. (A bare
+    # "passthrough" value may legitimately appear as the reasoning parser.)
+    assert "--policy" not in gateway_args
+    assert "--policy=passthrough" not in gateway_args
+    assert gateway_args.count("--policy=cache_aware") == 1
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+
+
+def test_get_from_args_extracts_value():
+    assert (
+        _get_from_args(
+            ["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"], "--model"
+        )
         == "nvidia/Qwen3.5-397B-A17B-NVFP4"
     )
 
 
-def test_user_model_id_returns_none_when_absent():
-    assert _user_model_id(["--port", "8000"]) is None
+def test_get_from_args_returns_none_when_absent():
+    assert _get_from_args(["--port", "8000"], "--model") is None
 
 
-def test_user_model_id_returns_none_when_model_lacks_value():
-    assert _user_model_id(["--model"]) is None
+def test_get_from_args_returns_none_when_flag_lacks_value():
+    assert _get_from_args(["--model"], "--model") is None
+
+
+def test_get_from_args_takes_the_last_occurrence():
+    """Last-wins matches argparse, so appending a flag overrides an earlier one."""
+    assert _get_from_args(["--port", "8000", "--port", "8413"], "--port") == "8413"
 
 
 def test_deepseek_v4_model_id_gets_default_parsers():
@@ -344,6 +507,218 @@ def test_local_deepseek_v4_config_is_detected(tmp_path):
     assert _is_deepseek_v4_model(str(tmp_path))
 
 
+def _make_kimi_k3_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_k3",
+                "architectures": ["KimiK3ForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def test_kimi_k3_model_is_detected_from_id_or_local_config(tmp_path):
+    assert _is_kimi_k3_model("moonshotai/Kimi-K3")
+    assert _is_kimi_k3_model(_make_kimi_k3_model_dir(tmp_path))
+    assert not _is_kimi_k3_model("deepseek-ai/DeepSeek-V4-Flash")
+    assert not _is_kimi_k3_model(None)
+
+
+def test_kimi_k3_model_gets_default_parsers(tmp_path):
+    model = _make_kimi_k3_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        KIMI_K3_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        KIMI_K3_REASONING_PARSER,
+        "--tool-call-parser",
+        KIMI_K3_TOOL_CALL_PARSER,
+    ]
+
+
+def test_kimi_k3_parser_defaults_preserve_explicit_values(tmp_path):
+    model = _make_kimi_k3_model_dir(tmp_path)
+    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
+    gateway_args = [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--tool-call-parser",
+        "custom_tools",
+    ]
+
+    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
+        engine_args,
+        gateway_args,
+    )
+
+
+def _make_inkling_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "inkling_mm_model",
+                "architectures": ["InklingForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def test_local_inkling_config_is_detected(tmp_path):
+    assert _is_inkling_model(_make_inkling_model_dir(tmp_path))
+    assert not _is_inkling_model("deepseek-ai/DeepSeek-V4-Flash")
+    assert not _is_inkling_model(None)
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_remote_inkling_model_ids_get_defaults():
+    for model in ("org/Inkling-Chat",):
+        engine_args, gateway_args = _args_with_default_model_parsers(
+            ["--model", model],
+            ["--model", model],
+        )
+        assert engine_args[engine_args.index("--reasoning-parser") + 1] == (
+            INKLING_REASONING_PARSER
+        )
+        assert engine_args[engine_args.index("--attention-backend") + 1] == (
+            INKLING_ATTENTION_BACKEND
+        )
+        assert (
+            gateway_args[gateway_args.index("--reasoning-parser") + 1]
+            == INKLING_REASONING_PARSER
+        )
+        assert (
+            gateway_args[gateway_args.index("--tool-call-parser") + 1]
+            == INKLING_TOOL_CALL_PARSER
+        )
+        assert "--chat-template" not in gateway_args
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_inkling_model_gets_default_parsers_without_overriding_checkpoint_template(
+    tmp_path,
+):
+    model = _make_inkling_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        INKLING_REASONING_PARSER,
+        "--attention-backend",
+        INKLING_ATTENTION_BACKEND,
+    ]
+    assert gateway_args[:2] == ["--model", model]
+    assert "--chat-template" not in gateway_args
+    reasoning_idx = gateway_args.index("--reasoning-parser")
+    assert gateway_args[reasoning_idx + 1] == INKLING_REASONING_PARSER
+    tool_idx = gateway_args.index("--tool-call-parser")
+    assert gateway_args[tool_idx + 1] == INKLING_TOOL_CALL_PARSER
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_inkling_defaults_preserve_explicit_user_values(tmp_path):
+    model = _make_inkling_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--attention-backend",
+            INKLING_ATTENTION_BACKEND,
+            "--enable-prefix-caching",
+        ],
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--tool-call-parser",
+            "custom_tools",
+            "--chat-template",
+            "/tmp/custom.jinja",
+        ],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--attention-backend",
+        INKLING_ATTENTION_BACKEND,
+        "--enable-prefix-caching",
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--tool-call-parser",
+        "custom_tools",
+        "--chat-template",
+        "/tmp/custom.jinja",
+    ]
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_inkling_rejects_incompatible_attention_backend(tmp_path):
+    model = _make_inkling_model_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="requires --attention-backend fa4"):
+        _args_with_default_model_parsers(
+            ["--model", model, "--attention-backend", "fa3"],
+            ["--model", model],
+        )
+
+
+def test_inkling_preserves_enabled_prefix_caching(tmp_path):
+    model = _make_inkling_model_dir(tmp_path)
+
+    engine_args, _ = _args_with_default_model_parsers(
+        ["--model", model, "--enable-prefix-caching"],
+        ["--model", model],
+    )
+
+    assert "--enable-prefix-caching" in engine_args
+    assert "--disable-prefix-caching" not in engine_args
+
+
 def test_prewarm_skips_local_path(tmp_path):
     with patch(
         "huggingface_hub.snapshot_download", side_effect=AssertionError("must not call")
@@ -368,6 +743,7 @@ def test_prewarm_fetches_tokenizer_artifacts_for_hf_id():
     # avoid pulling weight files (no `*.safetensors` etc.).
     patterns = set(kwargs["allow_patterns"])
     assert "tokenizer*" in patterns
+    assert "chat_template*" in patterns
     assert "*.json" in patterns
 
 
@@ -456,6 +832,54 @@ async def test_gateway_first_then_engine_on_clean_shutdown():
         )
     assert call_order == ["gateway", "engine"]
     assert rc == 0
+
+
+@pytest.mark.asyncio
+async def test_run_smg_allocates_prometheus_port_at_gateway_spawn():
+    """The metrics port is injected by run_smg right before spawn_gateway:
+    a port allocated at argv-build time can be reclaimed as an ephemeral
+    source port while the engine starts up."""
+    engine = _make_proc(returncode=0)
+    gateway = _make_proc(returncode=0)
+
+    startup_done = asyncio.Event()
+
+    async def wait_then_zero():
+        await startup_done.wait()
+        return 0
+
+    engine.wait = AsyncMock(side_effect=wait_then_zero)
+    gateway.wait = AsyncMock(side_effect=wait_then_zero)
+
+    async def probe_then_schedule_release(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, startup_done.set)
+
+    opts = OrchestratorOpts(engine_startup_timeout=10, gateway_startup_timeout=10)
+    spawn_gateway_mock = AsyncMock(return_value=gateway)
+    with patch(
+        "tokenspeed.cli.serve_smg.spawn_engine", AsyncMock(return_value=engine)
+    ), patch("tokenspeed.cli.serve_smg.spawn_gateway", spawn_gateway_mock), patch(
+        "tokenspeed.cli.serve_smg.wait_grpc_serving", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg.wait_http_ready",
+        side_effect=probe_then_schedule_release,
+    ), patch(
+        "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ):
+        rc = await run_smg(
+            engine_args=[],
+            gateway_args=["--model", "/tmp/x"],
+            opts=opts,
+            user_host="127.0.0.1",
+            user_port=8000,
+        )
+
+    assert rc == 0
+    spawned_args = spawn_gateway_mock.await_args.args[0]
+    idx = spawned_args.index("--prometheus-port")
+    assert spawned_args[idx + 1].isdigit()
+    assert 1 <= int(spawned_args[idx + 1]) <= 65535
 
 
 @pytest.mark.asyncio
@@ -652,6 +1076,7 @@ async def test_gateway_exit_during_probe_fails_fast():
 def test_run_smg_from_args_sets_process_title(monkeypatch):
     """Orchestrator sets proc title to 'ts-serve' so pgrep -f ts-serve finds it."""
     captured = {}
+    monkeypatch.delenv(GRPC_MAX_MESSAGE_BYTES_ENV, raising=False)
 
     def fake_run(*a, **kw):
         return 0
@@ -674,6 +1099,7 @@ def test_run_smg_from_args_sets_process_title(monkeypatch):
     except SystemExit:
         pass
     assert captured.get("title") == "ts-serve"
+    assert os.environ[GRPC_MAX_MESSAGE_BYTES_ENV] == DEFAULT_GRPC_MAX_MESSAGE_BYTES
 
 
 def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):

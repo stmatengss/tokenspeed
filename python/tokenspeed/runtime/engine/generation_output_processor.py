@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     )
 
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 logger = get_colorful_logger(__name__)
 
@@ -215,6 +214,14 @@ class RequestState:
             mm.mrope_positions, target_len - current_len
         )
 
+    def has_pending_multimodal_features(self) -> bool:
+        mm = self.multimodal_inputs
+        return (
+            mm is not None
+            and hasattr(mm, "has_pending_shm_features")
+            and mm.has_pending_shm_features()
+        )
+
     def release_pending_multimodal_features(self) -> None:
         mm = self.multimodal_inputs
         if mm is not None and hasattr(mm, "release_shm_features"):
@@ -227,11 +234,12 @@ class RequestState:
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        all_ids = self.prompt_input_ids_unpadded + self.output_ids
-        return (
-            all_ids[self._surr_offset :],
-            self._read_offset - self._surr_offset,
-        )
+        # Slice before concatenating: decode needs only the surrounding prompt
+        # suffix, not a copy of the entire cached prompt on every output token.
+        prompt = self.prompt_input_ids_unpadded
+        offset = self._surr_offset
+        decode_ids = prompt[offset:] + self.output_ids[max(offset - len(prompt), 0) :]
+        return decode_ids, self._read_offset - offset
 
     def check_finished(self, skip_grammar_termination: bool = False):
 
@@ -320,8 +328,10 @@ class OutputProcesser:
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
         enable_log_request_stats: bool = False,
+        physical_context_len: int | None = None,
         *,
         metrics: EngineMetrics,
+        defer_to_device=None,
     ) -> None:
         # BatchTokenIDOut is pushed directly to
         # ``send_to_tokenizer`` (AsyncLLM's input socket). The
@@ -334,6 +344,14 @@ class OutputProcesser:
         self.attn_tp_rank = attn_tp_rank
         self.spec_algorithm = spec_algorithm
         self.spec_num_tokens = spec_num_tokens
+        # Tripwire bound: per-request buffers (page tables, draft tables) are
+        # sized for this physical extent, and spec verify may legitimately
+        # commit up to it for a finished request lingering one overlap step.
+        # Committing PAST it means the one-lingering-step assumption broke
+        # (scheduler eviction timing, overlap depth) — the next KV write would
+        # go out of bounds and hang the attention kernel, so fail loudly here
+        # instead. None disables the check.
+        self.physical_context_len = physical_context_len
         self.stream_interval = stream_interval
         self.metrics = metrics
         self.enable_log_request_stats = enable_log_request_stats
@@ -347,15 +365,67 @@ class OutputProcesser:
         # handles. Entries for rids that never register are swept by TTL
         # to keep this bounded across a long-running server.
         self.pending_aborts: dict[str, float] = {}
+        # ``DeviceHandle.run_multimodal_work``, or None where there is no
+        # data plane (unit tests, CPU-only harnesses).
+        self._defer_to_device = defer_to_device
+
+    def _release_multimodal_features(self, request_state: RequestState) -> None:
+        """Release a request's SHM features once no forward can still read them.
+
+        The embedder consumes ``feature_shm`` inside the forward, and at
+        in-flight depth >= 1 a queued forward can still contain the request
+        this commit finishes — so the release rides the data plane's FIFO,
+        behind it.
+
+        Args:
+            request_state: The finished/aborted request's state.
+        """
+        if self._defer_to_device is None or not (
+            request_state.has_pending_multimodal_features()
+        ):
+            request_state.release_pending_multimodal_features()
+            return
+        self._defer_to_device(
+            request_state.release_pending_multimodal_features, wait=False
+        )
+
+    def _check_physical_extent(
+        self, rid, request_state: RequestState, output_length: int
+    ) -> None:
+        """Raise if a decode step committed past the physical KV extent.
+
+        Verify may legitimately commit up to physical_context_len for a
+        finished request lingering one overlap step; every per-request table
+        is sized for exactly that. Going PAST it means the one-lingering-step
+        assumption broke (scheduler eviction timing, overlap depth) and the
+        next KV write would run out of bounds and hang the attention kernel —
+        fail loudly here instead.
+        """
+        if self.physical_context_len is None:
+            return
+        total_tokens = (
+            len(request_state.prompt_input_ids)
+            + len(request_state.output_ids)
+            + output_length
+        )
+        if total_tokens > self.physical_context_len:
+            raise RuntimeError(
+                "Committed token count exceeds the physical KV extent for "
+                f"request {rid}: prompt+output reaches {total_tokens} > "
+                f"physical_context_len={self.physical_context_len}. A "
+                "finished request lingered more than one overlap step past "
+                "context_len (see _SPEC_OVERSHOOT_SPANS in server_args.py); "
+                "the next KV write would run out of bounds and hang the "
+                "attention kernel."
+            )
 
     def log_accept_length(self, rid, request_state: RequestState):
         # When --enable-log-request-stats is on, the richer RequestStats line (which
         # already carries acc_len) replaces this one — see _log_request_stats.
         if self.attn_tp_rank == 0 and not self.enable_log_request_stats:
             logger.info(
-                "Req: %s Finish! Accept_num_tokens_avg: %s",
-                rid,
-                request_state.accept_draft_tokens,
+                f"Req: {rid!s} Finish! Accept_num_tokens_avg: "
+                f"{request_state.accept_draft_tokens!s}",
             )
 
     def _log_request_stats(
@@ -370,7 +440,7 @@ class OutputProcesser:
         stats = RequestStats.from_state(rs, self.spec_algorithm, self.spec_num_tokens)
         # Fused into the scheduler's per-request finish line (supersedes the
         # Accept_num_tokens_avg variant in log_accept_length).
-        logger.info("Req: %s Finish! %s", rid, stats)
+        logger.info(f"Req: {rid!s} Finish! {stats!s}")
 
     def sweep_pending_aborts(self) -> None:
         """Drop TTL-expired entries from ``pending_aborts``.
@@ -433,7 +503,7 @@ class OutputProcesser:
             state.finished_output = False
             self.stream_output([rid], [state])
         finally:
-            state.release_pending_multimodal_features()
+            self._release_multimodal_features(state)
             self.rid_to_state.pop(rid, None)
             # This path replaces register() for grammar-aborted rids —
             # drop any queued abort marker so pending_aborts doesn't leak
@@ -522,8 +592,6 @@ class OutputProcesser:
     ) -> None:
         if not self.metrics.enabled:
             return
-        if forward_op.num_extends() > 0:
-            return
         if self.spec_algorithm is None or self.spec_num_tokens is None:
             return
         if model_execution_results.output_lengths is None:
@@ -537,28 +605,34 @@ class OutputProcesser:
             self.metrics.record_spec_decode_step(
                 num_decode_slots=num_slots,
                 accepted_draft_tokens=accepted_draft_tokens,
-                draft_width=self.spec_num_tokens,
+                draft_width=self.spec_num_tokens - 1,
             )
 
-    def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:
-        for rid, prefix_len in zip(rids, extend_prefix_lens):
+    def add_cached_tokens(
+        self,
+        rids: list[str],
+        extend_prefix_lens: list[int],
+        extend_replay_lens: list[int],
+    ) -> None:
+        # Replayed rows re-feed cached positions: the hit reaches to the end of
+        # the replay window, not to where the model input starts.
+        for rid, prefix_len, replay_len in zip(
+            rids, extend_prefix_lens, extend_replay_lens
+        ):
             if rs := self.rid_to_state.get(rid):
-                rs.cached_tokens += max(0, prefix_len - rs.computed_length)
+                rs.cached_tokens += max(0, prefix_len + replay_len - rs.computed_length)
 
     def post_process_forward_op(
         self,
         forward_op,
         model_execution_results: ModelExecutionResult,
-        is_prefill_instance: bool = False,
-        on_first_token=None,
+        is_prefill_instance: bool,
     ):
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,
+            forward_op.extend_replay_lens,
         )
-        with nvtx_range("commit:sync", color="red"):
-            model_execution_results.sync()
-
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
         # Wait briefly for the next step's build hostfunc to advance
@@ -608,17 +682,17 @@ class OutputProcesser:
             if model_execution_results.output_nan_flags is not None
             else None
         )
+        output_lengths_list = model_execution_results.output_lengths.tolist()
+        output_tokens_list = model_execution_results.output_tokens.tolist()
         # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
-        # After a flat retract the victim's generated tokens are rebased into the
+        # After a retract the victim's generated tokens are rebased into the
         # prefill window (RebasePrefill), so this can exceed the original prompt
         # length that RequestState.prefill_finished compares against.
-        prefill_lengths = getattr(forward_op, "prefill_lengths", None)
+        prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
-            output_length = model_execution_results.output_lengths[i].item()
-            model_output_ids = model_execution_results.output_tokens.tolist()[
-                pt : pt + output_length
-            ]
+            output_length = output_lengths_list[i]
+            model_output_ids = output_tokens_list[pt : pt + output_length]
             model_output_logprobs = (
                 output_logprobs_list[pt : pt + output_length]
                 if output_logprobs_list is not None
@@ -638,14 +712,18 @@ class OutputProcesser:
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # flat retract; C++ owes no result and the sampled token is garbage).
+            # retract; C++ owes no token and the sampled one is garbage).
             # Fresh requests: prefill_length == prompt length, same as the gate below.
             if (
                 not is_decode_slot
-                and prefill_lengths is not None
                 and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
                 < prefill_lengths[i]
             ):
+                # It owes no token, but the chunk's KV has landed -- report
+                # that much, so the scheduler stops counting a forward
+                # against these pages and may retract the request if the
+                # next round needs them.
+                request_changes.append(make_extend_result_event(rid))
                 continue
 
             # Do not output chunking result
@@ -672,35 +750,40 @@ class OutputProcesser:
                 self.metrics.record_nan_abort()
                 if self.attn_tp_rank == 0:
                     logger.warning(
-                        "Req %s terminated: NaN detected in logits (or an"
+                        f"Req {rid!s} terminated: NaN detected in logits (or an"
                         " out-of-vocab sample escaped the sampler);"
                         " isolating it from the batch.",
-                        rid,
                     )
 
-            # Notify caller of first output token (used by prefill node to hand off
-            # bootstrap token and speculative candidates to the KV transfer layer).
-            # NaN-terminated requests skip the handoff: their KV is suspect.
-            if on_first_token is not None and model_output_ids and not nan_detected:
-                bootstrap_token = int(model_output_ids[0])
-                spec_candidate_ids = None
-                if model_execution_results.next_input_ids is not None and i < len(
-                    model_execution_results.next_input_ids
+            # P-side final chunk: the drafter candidates join the chunk's
+            # ExtendResult, so the scheduler's remote-decode operation is
+            # self-contained (the bootstrap token itself is new_ids[0], which
+            # the scheduler reads back as LastToken). NaN-terminated requests
+            # abort at the scheduler below instead: their KV is suspect and
+            # must never transfer.
+            spec_candidate_ids = None
+            if (
+                is_prefill_instance
+                and model_output_ids
+                and not nan_detected
+                and model_execution_results.next_input_ids is not None
+                and i < len(model_execution_results.next_input_ids)
+            ):
+                spec_candidate_ids = [
+                    int(x) for x in model_execution_results.next_input_ids[i].tolist()
+                ]
+                if spec_candidate_ids and spec_candidate_ids[0] != int(
+                    model_output_ids[0]
                 ):
-                    spec_candidate_ids = [
-                        int(x)
-                        for x in model_execution_results.next_input_ids[i].tolist()
-                    ]
-
-                on_first_token(
-                    rid,
-                    forward_op.request_pool_indices[i],
-                    bootstrap_token,
-                    spec_candidate_ids,
-                )
+                    raise RuntimeError(
+                        "Prefill bootstrap token mismatch: sampled token "
+                        f"{int(model_output_ids[0])} != speculative candidate "
+                        f"{spec_candidate_ids[0]} for request {rid}"
+                    )
 
             if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
+                self._check_physical_extent(rid, request_state, output_length)
 
             # With the capturable grammar pipeline the matcher is
             # advanced by the hostfunc; here we just read which token
@@ -752,22 +835,53 @@ class OutputProcesser:
             if request_state.output_ids:
                 request_state.stats.mark_first_token(stats_now)
 
+            # Numerical corruption outranks every other ending: this KV must
+            # never be reused or transferred, whatever else is true of the
+            # request. Abort (not Finish) keeps it out of the prefix caches,
+            # and on a P node it also stops the scheduler from emitting the
+            # remote decode that would ship the suspect pages to the peer --
+            # the peer's receiver then fails through the transfer layer
+            # instead of waiting for KV that never comes.
+            if is_prefill_instance and nan_detected:
+                request_changes.append(
+                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                )
+                request_changes.append(make_abort_event(rid))
+                self._log_request_stats(rid, request_state, stats_now)
+                self._release_multimodal_features(request_state)
+                self.rid_to_state.pop(rid)
+                continue
+
             # For aborted requests, skip output to detokenizer (the tokenizer
             # manager already cleaned up), just notify the scheduler to finish.
             # Exception: pause-initiated aborts (abort_notify_client) leave a
             # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
-                request_changes.append(make_extend_result_event(rid, new_ids))
-                request_changes.append(make_finish_event(rid))
+                request_changes.append(
+                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                )
+                if is_prefill_instance:
+                    # PD owns these pages until SucceededEvent or FailedEvent
+                    # fences the transfer. Keep the request state alive so the
+                    # KV transfer can finish before the scheduler releases it.
+                    continue
+                # Abort (vs Finish) keeps corrupted KV out of the prefix
+                # caches -- an ending the client asked for does not make the
+                # numbers trustworthy.
+                request_changes.append(
+                    make_abort_event(rid) if nan_detected else make_finish_event(rid)
+                )
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
                 self._log_request_stats(rid, request_state, stats_now)
-                request_state.release_pending_multimodal_features()
+                self._release_multimodal_features(request_state)
                 self.rid_to_state.pop(rid)
                 continue
 
-            request_changes.append(make_extend_result_event(rid, new_ids))
+            request_changes.append(
+                make_extend_result_event(rid, new_ids, spec_candidate_ids)
+            )
             if is_prefill_instance:
                 # Prefill instances: never stream intermediate output to detokenizer.
                 # The finish packet is sent exactly once by finish_prefill_request()
@@ -783,7 +897,7 @@ class OutputProcesser:
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )
                 self._log_request_stats(rid, request_state, stats_now)
-                request_state.release_pending_multimodal_features()
+                self._release_multimodal_features(request_state)
                 self.rid_to_state.pop(rid)
             else:
                 stream_out_rids.append(rid)
@@ -796,12 +910,20 @@ class OutputProcesser:
         self.stream_output(stream_out_rids, stream_out_states)
         return request_changes
 
-    def on_remote_prefill_done(self, req_id: str, bootstrap_token: int) -> None:
+    def on_remote_prefill_done(
+        self, req_id: str, bootstrap_token: int, cached_tokens: int
+    ) -> None:
         """Record the bootstrap token on a decode-node request (RemotePrefillDoneEvent).
 
         The bootstrap_token is the first real output token produced by the prefill node.
         It is appended to output_ids so the decode side starts generation from the
         correct position.
+
+        A constrained request also advances its matcher here. Prefill and decode
+        each compiled their own matcher for the request, and this token is the
+        only one the decode node never samples itself: without accepting it here
+        the matcher would mask every decode step from a state one token behind
+        the text it is constraining.
 
         bootstrap_token == -1 means the prefill side did not (or could not) supply a
         token (e.g. it was generated on a rank whose ZMQ message arrived after the
@@ -809,20 +931,60 @@ class OutputProcesser:
         """
         if req_id not in self.rid_to_state:
             return
+        state = self.rid_to_state[req_id]
+        # P and D reuse overlapping leading prefixes; never sum their hits.
+        state.cached_tokens = max(state.cached_tokens, cached_tokens)
         if bootstrap_token == -1:
             logger.warning(
-                "[on_remote_prefill_done] rid=%s received bootstrap_token=-1, skipping append to output_ids",
-                req_id,
+                f"[on_remote_prefill_done] rid={req_id!s} received bootstrap_token=-1, "
+                "skipping append to output_ids",
             )
+            if state.grammar is not None:
+                # Nothing will ever bring this matcher in sync, and masking
+                # from a stale state corrupts the output more quietly than
+                # not masking at all. Drop it, loudly.
+                logger.warning(
+                    f"[on_remote_prefill_done] rid={req_id!s} lost its bootstrap token;"
+                    " "
+                    "structured output is no longer enforced for it",
+                )
+                state.grammar = None
             return
-        state = self.rid_to_state[req_id]
         state.output_ids.append(bootstrap_token)
+        if state.grammar is not None:
+            state.grammar.accept_token(bootstrap_token)
         state.check_finished()
+
+    def finish_remote_prefill_only_request(self, req_id: str) -> list:
+        """Finish after remote prefill when no decode step is needed.
+
+        A PD Prefill computes the first real output token.  A one-token
+        request is therefore already complete when Decode receives
+        ``RemotePrefillDoneEvent`` and must not be scheduled for an additional
+        decode forward. An aborted request follows the same transport fence
+        before its scheduler Abort is emitted.
+        """
+        state = self.rid_to_state.get(req_id)
+        if state is None or not state.finished:
+            return []
+
+        now = time.time()
+        state.stats.mark_prefill_done(now)
+        if not state.to_abort:
+            state.stats.mark_first_token(now)
+        self._log_request_stats(req_id, state, now)
+        if not state.to_abort or state.abort_notify_client:
+            self.stream_output([req_id], [state])
+        self._release_multimodal_features(state)
+        self.rid_to_state.pop(req_id)
+        return [
+            make_abort_event(req_id) if state.to_abort else make_finish_event(req_id)
+        ]
 
     def finish_prefill_request(self, req_id: str) -> list:
         """Finish a prefill-instance request when KV transfer succeeds (SucceededEvent).
 
-        Called by event_loop._process_kv_transfer_events at the correct moment — the
+        Called by PdTransferHooks.poll_transfer_events at the correct moment — the
         SucceededEvent itself drives the C++ FSM transition Decoding → Finished,
         so we must NOT emit an additional make_finish_event here.
 
@@ -835,7 +997,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return []
         rs = self.rid_to_state.pop(req_id)
-        rs.release_pending_multimodal_features()
+        self._release_multimodal_features(rs)
 
         # Ensure a finish reason is set so TokenizerManager marks the request done.
         if not rs.finished:
@@ -844,7 +1006,8 @@ class OutputProcesser:
         # PD prefill node's terminal path (the other finish/abort logging lives in
         # post_process_forward_op). Self-guarded, so a no-op when the flag is off.
         self._log_request_stats(req_id, rs, time.time())
-        self.stream_output([req_id], [rs])
+        if not rs.to_abort or rs.abort_notify_client:
+            self.stream_output([req_id], [rs])
         # SucceededEvent already finishes the C++ FSM; no extra FinishEvent needed
         return []
 

@@ -26,18 +26,107 @@ from typing import TYPE_CHECKING
 
 import tokenspeed.runtime.layers.attention.backends  # noqa: F401  # trigger register_backend() calls
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.model_executor import (
     ModelExecutor,
     ModelExecutorConfig,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+
+
+def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
+    """Return EAGLE3 capture ids from a draft config, including K3 text config.
+
+    K3 wraps the language configuration in ``text_config``.  Draft exports may
+    place ``eagle_config`` either on that text config or on the top-level
+    wrapper, so inspect both without falling back to the target's defaults.
+    """
+    candidates = [hf_config]
+    text_config = (
+        hf_config.get("text_config")
+        if isinstance(hf_config, dict)
+        else getattr(hf_config, "text_config", None)
+    )
+    if text_config is not None:
+        candidates.append(text_config)
+
+    for config in candidates:
+        if isinstance(config, dict):
+            eagle_config = config.get("eagle_config")
+            direct_ids = config.get("eagle_aux_hidden_state_layer_ids")
+        else:
+            eagle_config = getattr(config, "eagle_config", None)
+            direct_ids = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
+        if isinstance(eagle_config, dict):
+            ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+        elif eagle_config is not None:
+            ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
+        else:
+            ids = direct_ids
+        if ids:
+            return list(ids)
+    return None
+
+
+def configure_draft_target(
+    server_args: ServerArgs,
+    model_runner: ModelRunner,
+    draft_model_runner: ModelRunner,
+) -> None:
+    """Model-to-model wiring that must happen right after both models load.
+
+    Runs before create_attn_components profiles free memory for the KV-cache
+    budget, so weights the draft shares with the target (embed/LM head) are
+    released before profiling instead of being double-counted.
+    """
+    draft_model = draft_model_runner.model
+    DrafterImpl = get_drafter_impl(server_args.speculative_algorithm, draft_model)
+    if (
+        draft_model_runner.model_config.requires_request_token_history
+        and not DrafterImpl.supports_request_token_history
+    ):
+        raise NotImplementedError(
+            f"draft model requires request-token history, but drafter "
+            f"{DrafterImpl.__name__} does not thread it through its forwards"
+        )
+    if server_args.speculative_algorithm in ("DFLASH", "DSPARK"):
+        if not isinstance(draft_model, TargetCaptureConfigurator):
+            raise TypeError(
+                f"{type(draft_model).__name__} must implement TargetCaptureConfigurator "
+                f"for {server_args.speculative_algorithm}."
+            )
+        draft_model.configure_target(
+            model_runner.model, model_runner.model_config.hf_text_config
+        )
+    if DrafterImpl.shares_target_embed_head:
+        embed, head = model_runner.model.get_embed_and_head()
+        draft_model = draft_model_runner.model
+        module_setter = getattr(type(draft_model), "set_embed_and_head_module", None)
+        if module_setter is not None:
+            lm_head = getattr(model_runner.model, "lm_head", None)
+            if lm_head is None:
+                raise ValueError(
+                    "Draft model requires the target's complete lm_head module."
+                )
+            module_setter(draft_model, embed, lm_head)
+        else:
+            draft_model.set_embed_and_head(embed, head)
+    if server_args.speculative_algorithm == "EAGLE3" and hasattr(
+        model_runner.model, "set_eagle3_layers_to_capture"
+    ):
+        # capture the layers the draft was trained on, not the default
+        aux_layer_ids = server_args.eagle3_layers_to_capture or _eagle_aux_layer_ids(
+            draft_model_runner.model_config.hf_config
+        )
+        model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
 
 
 def create_model_runner(
@@ -64,6 +153,8 @@ def create_model_runner(
             global_rank=global_rank,
             is_draft_worker=True,
         )
+        if server_args.speculative_algorithm is not None:
+            configure_draft_target(server_args, model_runner, draft_model_runner)
 
     return model_runner, draft_model_runner
 
@@ -73,11 +164,10 @@ def create_model_executor(
     config: ModelExecutorConfig,
     model_runner: ModelRunner,
     attn_backend: AttentionBackend,
-    token_to_kv_pool: BaseTokenToKVPool,
+    token_to_kv_pool: CachePool,
     draft_model_runner: ModelRunner | None = None,
     draft_attn_backend: AttentionBackend | None = None,
-    draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
-    mamba_pool: object | None = None,
+    draft_token_to_kv_pool: CachePool | None = None,
 ) -> ModelExecutor:
     """Create the model executor with its sampler configuration."""
     if server_args.enable_nvtx:
@@ -109,5 +199,4 @@ def create_model_executor(
         draft_model_runner=draft_model_runner,
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
-        mamba_pool=mamba_pool,
     )

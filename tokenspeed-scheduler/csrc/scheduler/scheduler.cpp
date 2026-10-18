@@ -24,493 +24,468 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <iterator>
-#include <map>
-#include <memory>
-#include <numeric>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include <spdlog/spdlog.h>
 
-#include "fsm/cache_states.h"
-#include "fsm/forward_events.h"
+#include "core/token_container.h"
+#include "cache/tier/transfer.h"
 #include "fsm/forward_states.h"
-#include "resource/kv_prefix_cache/kv_prefix_cache.h"
-#include "resource/radix_tree/radix_tree.h"
-#include "resource/radix_tree/tree_node.h"
-#include "scheduler/execution_event.h"
-#include "scheduler/operations/cache.h"
-#include "scheduler/page_hasher.h"
-#include "scheduler/request.h"
-#include "scheduler/request_spec.h"
-#include "scheduler/types.h"
+#include "scheduler/capacity_model.h"
+#include "scheduler/operations/forward.h"
+#include "scheduler/operations/group_demands.h"
+#include "cache/prefix/prefix_hasher.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
+namespace {
+
+std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
+    return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
+}
+
+std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
+    std::vector<std::int32_t> slots_per_group;
+    slots_per_group.reserve(config.cache_groups.size());
+    for (const CacheGroupConfig& group : config.cache_groups) {
+        slots_per_group.push_back(group.cache_blocks_per_lcm_block);
+    }
+    return slots_per_group;
+}
+
+// config_ is the first member, so routing it through this helper validates the
+// configuration before any pool or the coordinator is built off it.
+SchedulerConfig validated(SchedulerConfig config) {
+    config.Validate();
+    return config;
+}
+
+CacheKey eventKey(const CacheKey& key) {
+    // External events describe one scheduler-level boundary. Fold every
+    // group/child offset behind that boundary into the same accounting key.
+    return CacheKey{
+        .namespace_id = key.namespace_id,
+        .group_id = 0,
+        .content_hash = key.content_hash,
+    };
+}
+
+}  // namespace
+
 Scheduler::Scheduler(SchedulerConfig config)
-    : config_{std::move(config)},
-      device_allocator_{config_.block_size, config_.device_allocator.total_pages},
-      host_allocator_{config_.block_size, config_.host_allocator.total_pages},
-      mamba_allocator_{},
-      kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage, config_.disable_prefix_cache},
-      req_pool_allocator_{config_.max_batch_size}
-#if TOKENSPEED_FLAT_KVCACHE
-      ,
-      block_pool_{config_.device_allocator.total_pages},
-      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_,
-                                   config_.FlatStreamingSinkEnabled() ? &flat_host_pool_ : nullptr)},
-      flat_group_ids_{[&] {
-          std::vector<std::string> ids;
-          ids.reserve(config_.paged_cache_groups.size());
-          for (const auto& g : config_.paged_cache_groups) {
-              ids.push_back(g.group_id);
-          }
-          return ids;
-      }()}
-#endif
-{
-    if (config_.decode_input_tokens < 0) {
-        throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
+    : config_{validated(std::move(config))},
+      req_pool_allocator_{config_.max_batch_size},
+      block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
+      host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
+                                   config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
+                                   config_.StreamsDeviceCacheToHost())},
+      tier_transfers_{coordinator_} {
+    // config_.Validate() already ran; the body only derives state from it.
+    cache_group_ids_.reserve(config_.cache_groups.size());
+    for (const CacheGroupConfig& group : config_.cache_groups) {
+        cache_group_ids_.push_back(group.group_id);
     }
-    if (config_.overlap_schedule_depth < 0 || config_.overlap_schedule_depth > 1) {
-        throw std::invalid_argument("Scheduler: overlap_schedule_depth must be 0 or 1");
-    }
-    if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
-        throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
-    }
-    if (auto* env = std::getenv("SPDLOG_LEVEL")) {
-        std::string level_str{env};
-        spdlog::level::level_enum level = spdlog::level::from_str(level_str);
-        spdlog::set_level(level);
-    }
+    max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
-        kv_prefix_cache_.SetKvEventSink([this](KvCacheEvent event) { kv_events_.push_back(std::move(event)); });
-    }
-    const bool has_mamba_pool = config_.enable_mamba && config_.mamba_pool_total_chunks > 0;
-    if (has_mamba_pool) {
-        mamba_allocator_.emplace(config_.mamba_pool_total_chunks);
-    }
-    const bool has_mamba_l2_pool = has_mamba_pool && config_.enable_mamba_l2 && config_.mamba_l2_host_slots > 0;
-    if (has_mamba_l2_pool) {
-        mamba_host_allocator_.emplace(config_.mamba_l2_host_slots);
+        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
+            markKvEventBoundaryForReconcile(eventKey(key));
+        });
     }
 
-    // Construct HybridPrefixCache when any adjunct/paged-cache feature is configured.
-    // Role::kD skips Mamba but still participates in paged-cache transport.
-    const bool has_mamba_adjunct = has_mamba_pool && config_.role != Role::kD;
-    const bool has_prefix_cache_adjunct = config_.prefix_cache_adjunct.has_value();
-    const bool has_paged_cache_groups = !config_.paged_cache_groups.empty();
-    if (has_mamba_adjunct || has_prefix_cache_adjunct || has_paged_cache_groups) {
-        MambaChunkAllocator* mamba_ptr = has_mamba_adjunct ? &*mamba_allocator_ : nullptr;
-        MambaHostAllocator* mamba_host_ptr = has_mamba_l2_pool ? &*mamba_host_allocator_ : nullptr;
-        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size, mamba_host_ptr);
-        kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
-            [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
-        kv_prefix_cache_.GetHostManager().SetEvictionCallback(
-            [this](TreeNode* node) { hybrid_prefix_cache_->OnKVHostEvict(node); });
-        // Prune frees TreeNodes (including empty ancestors) outside the per-tier
-        // eviction callbacks; un-register them from the adjunct sets before the
-        // node is destroyed so mamba_leaves_ / paged-cache membership never
-        // dangles.
-        kv_prefix_cache_.GetRadixTree().SetNodeDestroyCallback(
-            [this](TreeNode* node) { hybrid_prefix_cache_->OnNodeDestroyed(node); });
-
-        for (const auto& cfg : config_.paged_cache_groups) {
-            PagedCacheGroupConfig copy = cfg;
-            copy.Validate();
-            hybrid_prefix_cache_->RegisterPagedCacheGroup(std::make_unique<PagedCacheGroupAllocator>(std::move(copy)));
-        }
-
-        if (has_prefix_cache_adjunct) {
-            const auto& spec = *config_.prefix_cache_adjunct;
-            if (spec.required_groups.empty()) {
-                throw std::invalid_argument("Scheduler: prefix_cache_adjunct.required_groups must be non-empty");
-            }
-            // HybridPrefixCache derives history alignment from the registered
-            // group configs; we still build the sliding-window map here.
-            std::unordered_map<std::string, std::int32_t> sliding_window_per_group;
-            for (const auto& gid : spec.required_groups) {
-                const PagedCacheGroupConfig* cfg = nullptr;
-                for (const auto& g : config_.paged_cache_groups) {
-                    if (g.group_id == gid) {
-                        cfg = &g;
-                        break;
-                    }
-                }
-                if (cfg == nullptr) {
-                    throw std::invalid_argument("Scheduler: prefix_cache_adjunct required group_id '" + gid +
-                                                "' not found in paged_cache_groups");
-                }
-                if (cfg->retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
-                    if (!cfg->sliding_window_tokens.has_value() || *cfg->sliding_window_tokens <= 0) {
-                        throw std::invalid_argument("Scheduler: prefix_cache_adjunct sliding group '" + gid +
-                                                    "' must declare positive sliding_window_tokens");
-                    }
-                    sliding_window_per_group.emplace(gid, *cfg->sliding_window_tokens);
-                }
-            }
-            hybrid_prefix_cache_->EnablePagedCacheAdjunct(spec.required_groups, std::move(sliding_window_per_group));
-        }
+    if (const char* level = std::getenv("SPDLOG_LEVEL")) {
+        spdlog::set_level(spdlog::level::from_str(level));
     }
+}
+
+Request* Scheduler::findRequest(const std::string& request_id) {
+    const auto it = requests_by_id_.find(request_id);
+    return it == requests_by_id_.end() ? nullptr : it->second;
+}
+
+bool Scheduler::pdTransferInFlight(const Request& request) const {
+    switch (config_.role) {
+        case Role::kD:
+            return request.Is<fsm::RemotePrefilling>();
+        case Role::kP:
+            return request.HoldsPages();
+        case Role::kFused:
+            return false;
+    }
+    return false;
+}
+
+bool Scheduler::PdTransferPinned(const std::string& request_id) const {
+    const auto it = requests_by_id_.find(request_id);
+    return it != requests_by_id_.end() && pdTransferInFlight(*it->second);
+}
+
+std::size_t Scheduler::groupIndex(const std::string& group_id) const {
+    const auto it = std::ranges::find(cache_group_ids_, group_id);
+    if (it == cache_group_ids_.end()) {
+        throw std::out_of_range("Scheduler: unknown cache group '" + group_id + "'");
+    }
+    return static_cast<std::size_t>(std::distance(cache_group_ids_.begin(), it));
 }
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
+    // An event reports the net change since the last drain: a boundary is
+    // published exactly while every child block of it is cached. Mutations
+    // mark boundaries in whatever order the coordinator touches pages, so the
+    // batch is sorted by chain depth: removals leaf-first, then Stored
+    // parent-first, because consumers resolve a Stored event's
+    // parent_block_hash against what they have already received.
+    std::vector<std::pair<std::int32_t, KvCacheEvent>> removed;
+    std::vector<std::pair<std::int32_t, KvCacheEvent>> stored;
+    for (const CacheKey& boundary : std::exchange(kv_event_boundaries_to_reconcile_, {})) {
+        const auto it = kv_event_boundaries_.find(boundary);
+        FatalCheck(it != kv_event_boundaries_.end(),
+                   "KV event boundary marked for reconcile lost its token descriptor");
+        KvEventBoundary& event_boundary = it->second;
+        event_boundary.needs_reconcile = false;
+        const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
+        const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
+        if (complete && !event_boundary.published) {
+            stored.emplace_back(event_boundary.depth, event_boundary.stored);
+        } else if (!complete && event_boundary.published) {
+            removed.emplace_back(event_boundary.depth,
+                                 KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        }
+        event_boundary.published = complete;
+        if (residency == CacheCoordinator::BoundaryResidency::kNone) {
+            kv_event_boundaries_.erase(it);
+        }
+    }
+    std::stable_sort(removed.begin(), removed.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::stable_sort(stored.begin(), stored.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     std::vector<KvCacheEvent> events;
-    events.swap(kv_events_);
+    events.reserve(removed.size() + stored.size());
+    for (auto& [depth, event] : removed) {
+        events.push_back(std::move(event));
+    }
+    for (auto& [depth, event] : stored) {
+        events.push_back(std::move(event));
+    }
     return events;
 }
 
-std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match) {
-    const std::int32_t block_size = config_.block_size;
-    const std::size_t num_pages = input_tokens.size() / block_size;
-    std::vector<std::span<const std::int32_t>> token_pages;
-    token_pages.reserve(num_pages);
-    for (std::size_t i = 0; i < num_pages; ++i) {
-        token_pages.emplace_back(input_tokens.data() + i * block_size, block_size);
-    }
-    if (!apply_match) {
-        return ComputePagedHashes(token_pages, "");
-    }
-    MatchResult result = kv_prefix_cache_.Match(token_pages);
-    const std::int32_t host_matched = result.host.DepthInPage();
-    if (host_matched >= static_cast<std::int32_t>(num_pages)) {
-        return {};
-    }
-    const auto& hashes = result.host.last_node->PageHashes();
-    std::string prior = hashes.empty() ? std::string{} : hashes.back();
+bool Scheduler::ClearL1Cache() {
+    return clearCache(false);
+}
 
-    return ComputePagedHashes(
-        std::vector<std::span<const std::int32_t>>(token_pages.begin() + host_matched, token_pages.end()), prior);
+bool Scheduler::ClearCache() {
+    return clearCache(true);
+}
+
+bool Scheduler::CanClearCache() const {
+    return cacheIsClearable(true);
+}
+
+bool Scheduler::cacheIsClearable(bool include_host) const {
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    if (has_pd_transfers || has_tier_transfers) {
+        return false;
+    }
+    return coordinator_.CacheIsClearable(include_host);
+}
+
+bool Scheduler::clearCache(bool include_host) {
+    // A live request's pages are protected by their pins, and the coordinator
+    // completes its pin check before mutating anything -- so residency is not
+    // this function's business. What IS its business are the writers the pins
+    // do not cover: an asynchronous transfer still landing into a cached
+    // block would race a clear that succeeded on the pin check alone.
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    if (has_pd_transfers || has_tier_transfers) {
+        spdlog::info("[Scheduler] flush L1 cache rejected: pd_transfers={} tier_transfers={}", has_pd_transfers,
+                     has_tier_transfers);
+        return false;
+    }
+    const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
+    if (!cleared) {
+        spdlog::info("[Scheduler] flush {}cache rejected: cached blocks are still pinned", include_host ? "" : "L1 ");
+        return false;
+    }
+    spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
+    return true;
+}
+
+void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+                                           std::int32_t first_page) {
+    if (!config_.enable_kv_cache_events) {
+        return;
+    }
+    _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
+            "KV event page range is invalid");
+    const std::vector<std::span<const std::int32_t>> token_pages = request.FullPrefixPages(false);
+    _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
+
+    KvEventHashProgress& progress = kv_event_hash_progress_[request.Id()];
+    for (std::size_t i = progress.block_hashes.size(); i < prefix_hashes.size(); ++i) {
+        const std::optional<std::uint64_t> parent_hash =
+            i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
+        progress.block_hashes.push_back(HashKvBlock(token_pages[i], parent_hash));
+    }
+
+    for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
+        CacheKey key{.content_hash = prefix_hashes[i]};
+        const std::optional<std::uint64_t> parent_hash =
+            i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
+        KvBlockStoredEvent event{
+            .block_hashes = {progress.block_hashes[i]},
+            .parent_block_hash = parent_hash,
+            .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
+            .block_size = config_.prefix_granularity,
+        };
+        const auto [it, inserted] = kv_event_boundaries_.try_emplace(
+            key, KvEventBoundary{.stored = std::move(event), .depth = static_cast<std::int32_t>(i)});
+        FatalCheck(inserted || (it->second.stored.block_hashes.front() == progress.block_hashes[i] &&
+                                it->second.depth == static_cast<std::int32_t>(i)),
+                   "one cache content hash mapped to different KV event blocks");
+        // The next drain drops the descriptor if the publication never lands.
+        markKvEventBoundaryForReconcile(key);
+    }
+}
+
+void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
+    // Descriptors are erased only by DrainKvEvents, so every cache mutation of
+    // a registered boundary finds one here.
+    const auto it = kv_event_boundaries_.find(boundary);
+    FatalCheck(it != kv_event_boundaries_.end(), "cache mutation on a KV event boundary with no token descriptor");
+    if (!it->second.needs_reconcile) {
+        it->second.needs_reconcile = true;
+        kv_event_boundaries_to_reconcile_.push_back(boundary);
+    }
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
-#if TOKENSPEED_FLAT_KVCACHE
-    // The content-hash chain and base-slot indexing run at base (GCD) granularity; the
-    // coordinator folds base pages up to each group's block_size. Uniform block_size =>
-    // base == block_size.
-    const std::int32_t page_size = config_.BaseBlockSize();
-#else
-    const std::int32_t page_size = config_.block_size;
-#endif
-    for (const auto& spec : request_specs) {
-        auto req = std::make_unique<Request>(spec, page_size, config_.role);
-        requests_.emplace(spec.request_id, std::move(req));
+    std::unordered_set<std::string> request_ids;
+    request_ids.reserve(request_specs.size());
+    std::vector<std::unique_ptr<Request>> pending_requests;
+    pending_requests.reserve(request_specs.size());
+    for (const RequestSpec& spec : request_specs) {
+        if (spec.tokens.empty()) {
+            throw std::invalid_argument("Scheduler: request tokens must be non-empty");
+        }
+        if (requests_by_id_.contains(spec.request_id) || !request_ids.insert(spec.request_id).second) {
+            throw std::invalid_argument("Scheduler: duplicate request id '" + spec.request_id + "'");
+        }
+        if (spec.max_new_tokens < 0) {
+            throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
+        }
+        const std::int64_t generation_reserve =
+            config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
+        const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
+        if (token_limit > std::numeric_limits<std::int32_t>::max()) {
+            throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
+        }
+        if (token_limit > max_single_request_tokens_) {
+            throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
+        }
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }
+
+    requests_.reserve(requests_.size() + pending_requests.size());
+    for (std::size_t i = 0; i < request_specs.size(); ++i) {
+        const bool inserted = requests_by_id_.emplace(request_specs[i].request_id, pending_requests[i].get()).second;
+        FatalCheck(inserted, "validated request id became duplicate before insertion");
+        requests_.push_back(std::move(pending_requests[i]));
+    }
+}
+
+std::size_t Scheduler::BootstrappingSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Bootstrapping>(); }));
 }
 
 std::size_t Scheduler::WaitingSize() const {
-    std::size_t count = 0;
-    for (const auto& [id, req] : requests_) {
-        if (req->Is<fsm::Submitted>()) {
-            count++;
-        }
-    }
-    return count;
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
+    }));
 }
 
 std::size_t Scheduler::DecodingSize() const {
-    std::size_t count = 0;
-    for (const auto& [id, req] : requests_) {
-        if (req->Is<fsm::Decoding>()) {
-            count++;
-        }
-    }
-    return count;
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Decoding>(); }));
 }
 
 std::size_t Scheduler::PrefillSize() const {
-    std::size_t count = 0;
-    for (const auto& [id, req] : requests_) {
-        if (req->Is<fsm::Prefilling>() || req->Is<fsm::PrefillDone>()) {
-            count++;
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
+    }));
+}
+
+std::size_t Scheduler::RemotePrefillSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::RemotePrefilling>(); }));
+}
+
+std::size_t Scheduler::PdTransferSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); }));
+}
+
+std::int32_t Scheduler::ActiveLcmBlocks() const {
+    std::vector<std::span<const BlockTable>> request_tables;
+    request_tables.reserve(requests_.size());
+    for (const auto& request : requests_) {
+        if (!request->HoldsPages()) {
+            continue;
+        }
+        request_tables.emplace_back(request->BlockTablesRef());
+    }
+    return coordinator_.NumActiveLcmBlocks(request_tables);
+}
+
+std::int32_t Scheduler::CacheGroupTotalPages(const std::string& group_id) const {
+    return config_.cache_groups[groupIndex(group_id)].total_pages;
+}
+
+std::int32_t Scheduler::CacheGroupAvailablePages(const std::string& group_id) const {
+    return coordinator_.GroupAvailablePages(static_cast<std::int32_t>(groupIndex(group_id)));
+}
+
+std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const {
+    TokenContainer container(tokens);
+    std::vector<std::span<const std::int32_t>> prefix_pages =
+        container.FullPrefixPages(config_.prefix_granularity, false);
+    // The last prompt token is always recomputed. Admission probes the same
+    // (n - 1) / prefix_granularity candidate pages.
+    const std::int32_t candidate_prefix_pages =
+        std::max((static_cast<std::int32_t>(tokens.size()) - 1) / config_.prefix_granularity, 0);
+    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+    return ComputePrefixHashes(prefix_pages, "");
+}
+
+std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
+    std::vector<Request*> candidates;
+    candidates.reserve(requests_.size());
+    for (const auto& request : requests_) {
+        candidates.push_back(request.get());
+    }
+    Request* readmission = nextReadmission(candidates);
+
+    bool hol_blocks_new_prompts = false;
+    for (const auto& request : requests_) {
+        const auto* prefilling = request->GetIf<fsm::Prefilling>();
+        if (prefilling != nullptr) {
+            hol_blocks_new_prompts = true;
+            break;
         }
     }
-    return count;
-}
-
-std::size_t Scheduler::RetractedSize() const {
-    std::size_t count = 0;
-    for (const auto& [id, req] : requests_) {
-        if (req->Is<fsm::Retracting>() || req->Is<fsm::Retracted>()) {
-            count++;
-        }
+    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize());
+    const std::int32_t free_slots = config_.max_batch_size - occupied;
+    if (free_slots <= 0 && readmission == nullptr) {
+        return {};
     }
-    return count;
-}
 
-std::size_t Scheduler::AvailableKvPages() const {
-#if TOKENSPEED_FLAT_KVCACHE
-    // The flat path never draws from the radix device_allocator_, so reporting it would show a
-    // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat
-    // block is one pool row, interpreted at each group's own block_size. Block 0 is the
-    // never-allocated null placeholder, so an idle pool reports total_pages - 1.
-    return static_cast<std::size_t>(block_pool_.NumFreeBlocks());
-#else
-    return device_allocator_.AvailablePages();
-#endif
-}
-
-std::size_t Scheduler::ActiveKvPages() const {
-    // Distinct pages pinned by running requests, in the same units as AvailableKvPages():
-    // flat pool ids across ALL groups (a group-0 sample here understated the ratio that
-    // Python monitoring derives against the whole pool), radix device pages otherwise.
-    // The set dedups pages shared between requests via prefix hits.
-    std::unordered_set<std::int32_t> active_pages;
-    for (const auto& [_, req] : requests_) {
-        if (req->Is<fsm::Prefilling>() || req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>()) {
-            for (std::int32_t page : req->GetOccupiedPagesAllGroups()) {
-                active_pages.insert(page);
+    std::vector<std::string> hashes;
+    std::unordered_set<std::string> seen;
+    const auto append_hashes = [&](const Request& request) {
+        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(/*except_last=*/false);
+        const std::int32_t candidate_prefix_pages =
+            std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
+        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
+            if (seen.insert(content_hash).second) {
+                hashes.push_back(std::move(content_hash));
             }
         }
+    };
+    if (readmission != nullptr) {
+        append_hashes(*readmission);
     }
-    return active_pages.size();
-}
-
-std::vector<std::string> Scheduler::PagedCacheGroupIds() const {
-    if (!hybrid_prefix_cache_) return {};
-    return hybrid_prefix_cache_->PagedCacheGroupIds();
-}
-
-std::int32_t Scheduler::PagedCacheGroupTotalPages(const std::string& group_id) const {
-    if (!hybrid_prefix_cache_) {
-        throw std::out_of_range("Scheduler::PagedCacheGroupTotalPages: group_id not configured");
+    if (free_slots <= 0 || hol_blocks_new_prompts || AvailableLcmBlocks() <= 0) {
+        return hashes;
     }
-    return hybrid_prefix_cache_->PagedCacheGroupTotalPages(group_id);
-}
-
-std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_id) const {
-    if (!hybrid_prefix_cache_) {
-        throw std::out_of_range("Scheduler::PagedCacheGroupAvailablePages: group_id not configured");
+    std::int32_t remaining = free_slots;
+    if (readmission != nullptr) {
+        remaining = std::max(remaining - 1, 0);
     }
-    return hybrid_prefix_cache_->PagedCacheGroupAvailablePages(group_id);
-}
-
-std::int64_t Scheduler::PagedCacheGroupFailedAllocCount(const std::string& group_id) const {
-    if (!hybrid_prefix_cache_) {
-        throw std::out_of_range("Scheduler::PagedCacheGroupFailedAllocCount: group_id not configured");
-    }
-    return hybrid_prefix_cache_->PagedCacheGroupFailedAllocCount(group_id);
-}
-
-std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::string& request_id,
-                                                                 const std::string& group_id) const {
-    if (!hybrid_prefix_cache_) {
-        throw std::out_of_range("Scheduler::GetRequestPagedCachePageIds: group_id not configured");
-    }
-    return hybrid_prefix_cache_->GetRequestPagedCachePageIds(request_id, group_id);
-}
-
-std::int32_t Scheduler::GetRequestPagedCacheBaseLogicalPage(const std::string& request_id,
-                                                            const std::string& group_id) const {
-    if (!hybrid_prefix_cache_) {
-        throw std::out_of_range("Scheduler::GetRequestPagedCacheBaseLogicalPage: group_id not configured");
-    }
-    return hybrid_prefix_cache_->GetRequestPagedCacheBaseLogicalPage(request_id, group_id);
-}
-
-std::int32_t Scheduler::GetRequestTokenSize(const std::string& id) const {
-    auto it = requests_.find(id);
-    if (it == requests_.end()) {
-        return -1;
-    }
-    return it->second->TokenSize();
-}
-
-std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
-    std::unordered_map<std::string, std::unique_ptr<Request>>& requests) {
-    std::vector<WriteBackOperation> ops;
-    if (config_.disable_l2_cache) {
-        return ops;
-    }
-    for (auto& [id, req] : requests) {
-        if (!req->Is<fsm::Draining>()) continue;
-        const auto& pages_to_transfer = req->GetPagesToTransfer<fsm::Draining>();
-
-        if (!pages_to_transfer.empty()) {
-            cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
-            CacheOpSpec spec;
-            spec.request_id = id;
-            cache_op_tracker_[op_id] = std::move(spec);
-            ops.push_back(WriteBackOperation{
-                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
-            req->Apply(fsm::CommitDrainingEvent{});
-        } else {
-            req->Apply(fsm::AbortEvent{
-#if TOKENSPEED_FLAT_KVCACHE
-                &coordinator_
-#endif
-            });
+    for (Request* request : candidates) {
+        if (remaining <= 0) {
+            break;
+        }
+        if (request == readmission) {
+            continue;
+        }
+        if (request->Is<fsm::Submitted>()) {
+            append_hashes(*request);
+            --remaining;
+            continue;
+        }
+        const auto* retracted = request->GetIf<fsm::Retracted>();
+        if (retracted != nullptr && !retracted->HasRecoverableSnapshot()) {
+            append_hashes(*request);
+            --remaining;
         }
     }
-    return ops;
+    return hashes;
+}
+
+std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
+    const auto it = requests_by_id_.find(id);
+    return it == requests_by_id_.end() ? -1 : it->second->TokenSize();
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
-    ExecutionPlan plan;
-
-    std::vector<WriteBackOperation> write_back_ops;
-    write_back_ops = std::move(newWriteBackOperation(requests_));
-
-    if (hybrid_prefix_cache_) {
-        for (const auto& [id, req] : requests_) {
-            if (req->Is<fsm::Finished>()) {
-                hybrid_prefix_cache_->ReleaseRequest(id);
-            }
+    std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
+    std::erase_if(requests_, [this](const auto& request) {
+        if (!request->template Is<fsm::Finished>()) {
+            return false;
         }
-    }
-    std::erase_if(requests_, [](const auto& req) { return req.second->template Is<fsm::Finished>(); });
+        kv_event_hash_progress_.erase(request->Id());
+        requests_by_id_.erase(request->Id());
+        return true;
+    });
 
     std::vector<Request*> candidates;
-    for (auto& [id, req] : requests_) {
-        if (!req->Is<fsm::Draining>() && !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() &&
-            !req->Is<fsm::WritingBack>()) {
-            candidates.push_back(req.get());
+    candidates.reserve(requests_.size());
+    for (const auto& request : requests_) {
+        if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
+                             fsm::Retracted>()) {
+            candidates.push_back(request.get());
+        }
+    }
+    ExecutionPlan plan;
+    auto [forward_operations, load_back_operations] =
+        buildForwardOperations(plan, std::move(candidates), write_back_operations);
+
+    plan.With(ForwardBatch{std::move(forward_operations)});
+
+    if (config_.StreamsDeviceCacheToHost()) {
+        // Boundary publications of live requests: their owners hold the pages,
+        // and the ticket pins them until the ACK, so the copy stays off the
+        // forward's critical path.
+        if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck)) {
+            write_back_operations.push_back(std::move(*store));
         }
     }
 
-    auto [fwd_ops, cache_ops] = newForwardOperation(candidates);
-    plan.With(FlatForwardOperation{std::move(fwd_ops)});
-#if TOKENSPEED_FLAT_KVCACHE
-    plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
-#endif
-
-    // Merge retract write-backs (if any) into the Draining write-back list, then emit once.
-    if (auto* wb = std::get_if<std::vector<WriteBackOperation>>(&cache_ops)) {
-        write_back_ops.insert(write_back_ops.end(), std::make_move_iterator(wb->begin()),
-                              std::make_move_iterator(wb->end()));
+    if (!write_back_operations.empty()) {
+        plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
-#if TOKENSPEED_FLAT_KVCACHE
-    if (config_.FlatStreamingSinkEnabled()) {
-        // Streaming L2 sink: batch this round's newly-registered pages into one D2H op.
-        std::vector<TransferPair> pairs;
-        std::vector<FlatStoreTicket> tickets;
-        // Same-round twins register the same key twice (batch_keys catches them). Cross-round
-        // recurrence is rare but real: a device match can settle below a still-in-flight page after
-        // earlier chain / SWA-neighbor ops retire, and the request re-registers a key whose store is
-        // in flight. InFlight() drops it (load-bearing: else a key sits in two ops and Retire
-        // corrupts the ledger's key set).
-        std::unordered_set<std::string> batch_keys;
-        for (auto& cand : coordinator_.TakePendingStores()) {
-            if (flat_host_pool_.GetCachedBlock(cand.key) != nullptr || flat_store_ops_.InFlight(cand.key) ||
-                !batch_keys.insert(cand.key).second) {
-                cand.block = BlockRef{};  // duplicate: drop + unpin
-                continue;
-            }
-            CacheBlock* host_block = flat_host_pool_.AllocateBlock();
-            if (host_block == nullptr) {
-                cand.block = BlockRef{};  // host full: drop + unpin
-                continue;
-            }
-            pairs.push_back(TransferPair{CacheKind::kKV, cand.block->BlockId(), host_block->BlockId()});
-            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block),
-                                              BlockRef::Adopt(flat_host_pool_, host_block)});
-        }
-        if (!pairs.empty()) {
-            const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();
-            flat_store_ops_.Add(id, std::move(tickets));
-            write_back_ops.push_back(WriteBackOperation{id, std::move(pairs)});
-        }
-    }
-#endif
-    if (!write_back_ops.empty()) {
-        plan.With(CacheOperation{FlatWriteBackOperation{write_back_ops}});
-    }
-    if (auto* lb = std::get_if<std::vector<LoadBackOperation>>(&cache_ops)) {
-        if (!lb->empty()) {
-            plan.With(CacheOperation{FlatLoadBackOperation{*lb}});
-        }
-    }
-    if (std::getenv("DEBUG_MEM")) {
-        check_device_mem();
+    if (!load_back_operations.empty()) {
+        plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
     }
     return plan;
 }
 
-void Scheduler::check_device_mem() {
-    bool ok = true;
-    const std::int32_t total_device = device_allocator_.TotalPages() - 1;
-    std::unordered_map<std::string, std::vector<std::int32_t>> req_pages_map;
-    // page_id → (owner_req_id, state_name) for duplicate tail-page reporting
-    std::unordered_map<std::int32_t, std::pair<std::string, std::string>> page_owner;
-
-    for (auto& [id, req] : requests_) {
-        std::string state = req->StateName();
-        std::vector<std::int32_t> pages = req->GetLocalAllocatorPages();
-        if (pages.empty()) continue;
-        req_pages_map[id] = pages;
-
-        for (std::int32_t p : pages) {
-            auto [it, inserted] = page_owner.emplace(p, std::make_pair(id, state));
-            if (!inserted) {
-                spdlog::error("[check_mem] DEVICE TAIL PAGE OVERLAP: page={}  req1={}({})  req2={}({})", p,
-                              it->second.first, it->second.second, id, state);
-                ok = false;
-            }
-        }
-    }
-
-    // ── 2. Collect pages in radix tree ───────────────────────────────────────
-    auto tree_device_pages = kv_prefix_cache_.CollectAllPages<ResourceType::Device>();
-
-    // 2a. Check for duplicate page_ids inside the tree itself
-    for (auto& [page, cnt] : tree_device_pages) {
-        if (cnt > 1) {
-            spdlog::error("[check_mem] DEVICE TREE DUPLICATE: page={} appears {} times in radix tree", page, cnt);
-            ok = false;
-        }
-    }
-
-    std::int32_t tree_device_total = static_cast<std::int32_t>(tree_device_pages.size());
-
-    std::int32_t req_device_total = 0;
-    for (auto& [id, pages] : req_pages_map) req_device_total += static_cast<std::int32_t>(pages.size());
-
-    std::int32_t free_device = device_allocator_.AvailablePages();
-
-    if (tree_device_total + req_device_total + free_device != total_device) {
-        spdlog::error("[check_mem] DEVICE PAGE ACCOUNTING MISMATCH: tree={} req={} free={} sum={} total={}",
-                      tree_device_total, req_device_total, free_device,
-                      tree_device_total + req_device_total + free_device, total_device);
-        ok = false;
-    }
-
-    // ── 4. Per-request: page ids must be in [1, total] ────────────────────
-    // PageAllocator starts from page id 1 (0 is reserved as invalid/null).
-    for (auto& [id, pages] : req_pages_map) {
-        for (std::int32_t p : pages) {
-            if (p <= 0 || p > total_device) {
-                spdlog::error("[check_mem] INVALID DEVICE PAGE id={} for req={} (valid range [1,{}])", p, id,
-                              total_device);
-                ok = false;
-            }
-        }
-    }
-    for (auto& [p, cnt] : tree_device_pages) {
-        if (p <= 0 || p > total_device) {
-            spdlog::error("[check_mem] INVALID DEVICE PAGE id={} in radix tree (valid range [1,{}])", p, total_device);
-            ok = false;
-        }
-    }
-
-    // ── 5. Summary ────────────────────────────────────────────────────────────
-    if (!ok) {
-        throw std::runtime_error("Scheduler::CheckMem: device page accounting check failed");
-    }
-}
-
 void Scheduler::Advance(const ExecutionEvent& event) {
-    auto dispatch = [this](const auto& inner) { handleEvent(inner); };
     for (const auto& item : event.Events()) {
-        std::visit([&](const auto& outer) { std::visit(dispatch, outer); }, item);
+        std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
 }
 
